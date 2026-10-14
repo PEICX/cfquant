@@ -4019,13 +4019,30 @@ class TxTradeBridge(object):
         self.tx.push("event", event, client_id)
 
     def _call_variants(self, func, variants):
+        """按参数变体调用 QMT 函数。
+
+        签名可内省时先用 signature.bind 判定变体是否匹配，只有匹配的变体
+        才真正调用；函数体内抛出的 TypeError 直接上抛，避免把执行错误误判
+        为签名不匹配而对有副作用的函数（如 passorder 下单）重复调用。
+        签名不可内省的 C 函数保留原有的异常探测回退。
+        """
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            signature = None
         last_error = None
         for args, kwargs in variants:
+            if signature is not None:
+                try:
+                    signature.bind(*args, **kwargs)
+                except TypeError as e:
+                    last_error = e
+                    continue
+                return func(*args, **kwargs)
             try:
                 return func(*args, **kwargs)
             except TypeError as e:
                 last_error = e
-                continue
         if last_error:
             raise last_error
         return func()

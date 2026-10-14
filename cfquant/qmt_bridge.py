@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import inspect
 import os
 import queue
 import sys
@@ -843,10 +844,9 @@ class CfquantQmtBridge(object):
             raise NotImplementedError("当前QMT环境未找到passorder函数")
         strategy_name = params.get("strategy_name", "")
         previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name)
-        try:
-            result = passorder(*args, self.context)
-        except TypeError:
-            result = passorder(*args)
+        # 经 _call_variants 做签名预判：旧版 QMT 的 10 参 passorder 不会被
+        # 11 参形态误触发，新版下单后内部抛 TypeError 也不会被重试两次下单
+        result = self._call_variants(passorder, [(args + (self.context,), {}), (args, {})])
         if not self._is_failed_order_result(result):
             self._remember_order_request(
                 account_id,
@@ -1602,8 +1602,26 @@ class CfquantQmtBridge(object):
             self._log("cfquant TX推送失败 channel=%s result=%s" % (channel, result))
 
     def _call_variants(self, func, variants):
+        """按参数变体调用 QMT 函数。
+
+        签名可内省时先用 signature.bind 判定变体是否匹配，只有匹配的变体
+        才真正调用；函数体内抛出的 TypeError 直接上抛，避免把执行错误误判
+        为签名不匹配而对有副作用的函数（如 passorder 下单）重复调用。
+        签名不可内省的 C 函数保留原有的异常探测回退。
+        """
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            signature = None
         last_error = None
         for args, kwargs in variants:
+            if signature is not None:
+                try:
+                    signature.bind(*args, **kwargs)
+                except TypeError as e:
+                    last_error = e
+                    continue
+                return func(*args, **kwargs)
             try:
                 return func(*args, **kwargs)
             except TypeError as e:
