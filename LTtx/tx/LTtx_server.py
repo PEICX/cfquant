@@ -113,9 +113,9 @@ import hashlib
 import psutil
 import pandas_market_calendars as mcal
 
-# v2 二进制推送协议：hello 携带 "v":2 协商成功后，put 连接上的推送走二进制
-# 帧（首字节 \x01），投递帧带类型字节，value 不再做 JSON 逃逸；未协商或
-# 协商失败时自动回落原有 JSON 信封，新旧客户端/服务器可任意混用。
+# v2 二进制推送协议：put 连接上的推送一律走二进制帧（首字节 \x01），
+# 投递帧带类型字节，value 不再做 JSON 逃逸；get/put 等控制消息仍走 JSON
+# 信封（帧体首字节判别）。不保留旧 JSON 推送路径，需与新版客户端同步部署。
 _V2_PUSH_HEADER = struct.Struct("!BHI")  # func_id, who_len, value_len
 _V2_FUNC_PUSH = 1
 
@@ -295,15 +295,12 @@ def handle_connect(client,address):
                 send_msg(client,result)
             elif con_type == 'put_mode':
                 result = handle_connect_put(client,address,dict_data)
-                v2 = (dict_data.get('v') == 2)
-                if v2:
-                    result['v2'] = True
                 C_que = queue.Queue(maxsize=0)
                 C_que_push = queue.Queue(maxsize=0)
                 start_thread(target = main_handle_client_que,args=(client, C_que, C_que_push))
                 start_thread(target = main_push_data_que,args=(client, C_que_push))
                 send_msg(client,result)
-                start_thread(target = main_handle_msg_tx,args=(client,address,C_que,id_code,v2))
+                start_thread(target = main_handle_msg_tx,args=(client,address,C_que,id_code))
             elif con_type == 'push_mode':
                 who = dict_data['who']
                 if '@' not in who:
@@ -499,18 +496,11 @@ def get_str_time():
     return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
 
 
-def recv_data_from_tx(client):
-    recv_bytes = client.recv(8,socket.MSG_WAITALL)
-    bytes_len = struct.unpack("Q",recv_bytes)[0]
-    recv_data = client.recv(bytes_len,socket.MSG_WAITALL)
-    recv_data = json.loads(recv_data.decode('utf-8',errors='replace'))
-    return recv_data
-
 def recv_data_from_tx_v2(client):
-    """v2 put 连接的收包：二进制推送帧或回落 JSON 信封。
+    """put 连接的统一收包：二进制推送帧或 JSON 控制消息。
 
     帧体首字节区分：\\x01 为二进制推送头，其余（JSON 信封恒以 '{' 开头）
-    按原 JSON 路径解析，get/put/心跳等低频控制消息不受影响。
+    按原 JSON 路径解析，get/put 等低频控制消息不受影响。
     """
     recv_bytes = client.recv(8,socket.MSG_WAITALL)
     bytes_len = struct.unpack("Q",recv_bytes)[0]
@@ -569,14 +559,11 @@ def main_handle_push_plus(client):
                 dict_client_push_group[who]['que'].put((client,recv_data[0]))
     
 
-def main_handle_msg_tx(client,address,C_que,id_code,v2=False):
+def main_handle_msg_tx(client,address,C_que,id_code):
     sys_show_on(get_str_time()+':'+'客户端'+str(address)+'加入tx')
     while True:
         try:
-            if v2:
-                recv_data = recv_data_from_tx_v2(client)
-            else:
-                recv_data = recv_data_from_tx(client)
+            recv_data = recv_data_from_tx_v2(client)
             C_que.put(recv_data)
         except Exception as e:
             try:
@@ -602,17 +589,7 @@ def main_handle_client_que(client,C_que,C_que_push):
                     group['que'].put((client, value))
                 continue
             func = recv_data['func']
-            if func == 'push':
-                who = recv_data['who']
-                if who in dict_client_push_group:
-                    if len(dict_client_push_group[who]['group']) == 0:
-                        pass
-                    else:
-                        recv_data = recv_data['value']
-                        dict_client_push_group[who]['que'].put((client,recv_data))
-                else:
-                    pass
-            elif func == 'get':
+            if func == 'get':
                 var = recv_data['value']
                 result = handle_get(var)
                 C_que_push.put(result)
@@ -777,20 +754,15 @@ def main_heartbeat():
         time.sleep(5)
 
 def main_push_client(tem_que,client,id_code,who):
-    v2 = client in dict_client_push_v2
     while True:
         msg = tem_que.get()
         try:
-            if v2:
-                send_data_to_client_raw(client, msg)
-            else:
-                send_data_to_client(client, msg)
+            send_data_to_client_raw(client, msg)
         except Exception as e:
             msg = '%s:有broadcast客户端%s退出,退出原因%s'%(get_str_time(),dict_client_push[id_code]['address'],str(e))
             sys_show_on(msg)
             close_con(client)
             try:
-                dict_client_push_v2.discard(client)
                 del dict_connect_info[id_code]
                 # print(1)
                 del dict_client_que[client]
@@ -811,9 +783,6 @@ def handle_connect_push(con,address,who_list,pwd='520',dict_data={}):
     dict_client_push[id_code] = {'con':con,'address':address,'id_code':id_code}
     dict_data['con'] = con
     dict_connect_info[id_code] = dict_data
-    v2 = (dict_data.get('v') == 2)
-    if v2:
-        dict_client_push_v2.add(con)
     for who in who_list:
         if who in dict_client_push_group:
             if pwd == dict_client_push_group[who]['pwd']:
@@ -842,8 +811,6 @@ def handle_connect_push(con,address,who_list,pwd='520',dict_data={}):
             msg = '服务端发来信息：新信道%s创建成功'%(who)
             code = 0
         result = {'code':code,'msg':msg}
-    if v2 and result.get('code') == 0:
-        result['v2'] = True
     return result
 
 def main_txg_heartbeat(client):
@@ -1224,7 +1191,6 @@ make_dir()
 dict_client_que = {}
 dict_client_push = {}
 dict_client_push_group = {}
-dict_client_push_v2 = set()#v2 raw 投递的订阅连接
 dict_client = {}
 dict_client_status = {}
 dict_var = load_dict_var()#保存云变量

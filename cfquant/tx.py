@@ -20,9 +20,9 @@ import importlib
 import pandas as pd
 
 
-# v2 二进制推送协议：hello 携带 "v":2 且服务器回 v2:true 后，push/d_push 走
-# 二进制帧（value 不再做 JSON 逃逸），订阅端收到类型字节 + 裸 payload 的
-# 投递帧；协商失败自动回落原有 JSON 信封，兼容旧服务器。
+# v2 二进制推送协议：push/d_push 一律走二进制帧（value 不做 JSON 逃逸），
+# 订阅端收类型字节 + 裸 payload 的投递帧；get/put 等控制消息仍走 JSON 信封
+# （帧体首字节判别）。不兼容旧版 LTtx 服务器，需同步升级。
 _V2_PUSH_HEADER = struct.Struct("!BHI")  # func_id, who_len, value_len
 _V2_FUNC_PUSH = 1
 
@@ -105,7 +105,6 @@ class txl:
         self.txg_running = False
         self.__tx = False
         self.__tx_plus = False
-        self._tx_v2 = False#put 连接的 v2 二进制推送协商结果
         self.push_count = 0
         self.timeout = 2
         self.heartbeat = 1
@@ -138,7 +137,7 @@ class txl:
         '''
         启动对应的组件
         '''
-        threading.Thread(target = self.__main_log).start()   
+        threading.Thread(target = self.__main_log, daemon=True).start()
     
     
     def auto_import(self,package_name, import_name=None):        
@@ -246,7 +245,8 @@ class txl:
         self.clean_log()
         while self.run_on:
             try:
-                data = str(self.log_que.get())+'\n'
+                # 带超时轮询：run_on=False 后线程最多 1 秒退出，不再挂住短生命周期进程
+                data = str(self.log_que.get(timeout=1))+'\n'
                 if self.log_que.qsize() > 100:         
                     self.clean_log()
                     for i in range(100):
@@ -514,16 +514,14 @@ class txl:
                     tem_dict = {'con_type':'put_mode','tocken':self.tocken,
                                 'local_ip':self.local_ip,
                                 'current_file':self.current_file,'current_dir':self.current_dir,
-                                'v':2,
                                 }
                     self.sys_print(tem_dict)
                     client.sendall(json.dumps(tem_dict).encode('utf-8'))
                     if self.recv_msg_start_tx(client):
                         self.__tx = client
-                        self._tx_v2 = bool((getattr(self,'_last_start_reply',None) or {}).get('v2'))
-                        t0 = threading.Thread(target=self.main_tx_que)
+                        t0 = threading.Thread(target=self.main_tx_que, daemon=True)
                         t0.start()
-                        thp0 = threading.Thread(target = self.start_tx_hearbeat)
+                        thp0 = threading.Thread(target = self.start_tx_hearbeat, daemon=True)
                         thp0.start()
                         msg = 'start_tx连接成功,have fun'
                         self.sys_print(msg,show_force=True)
@@ -563,9 +561,9 @@ class txl:
                                 }
                     self.__tx_plus.sendall(json.dumps(tem_dict).encode('utf-8'))
                     if self.recv_msg_start_tx(client):
-                        t0 = threading.Thread(target=self.main_tx_que_plus)
+                        t0 = threading.Thread(target=self.main_tx_que_plus, daemon=True)
                         t0.start()
-                        thp0 = threading.Thread(target = self.start_tx_hearbeat_plus)
+                        thp0 = threading.Thread(target = self.start_tx_hearbeat_plus, daemon=True)
                         thp0.start()
                         break
                     else:
@@ -677,17 +675,15 @@ class txl:
                             'client_version':2,
                             'local_ip':self.local_ip,
                             'current_file':self.current_file,'current_dir':self.current_dir,
-                            'v':2,
                             }
                 client.send(json.dumps(tem_dict).encode('utf-8'))
                 if self.recv_msg_start_txg(client,timeout=1) == True:
-                    v2 = bool((getattr(self,'_last_txg_reply',None) or {}).get('v2'))
                     if who not in self.txg_dict:
                         self.txg = client
-                        self.txg_dict[who] = {'con':client,'txg_running':True,'v2':v2}
+                        self.txg_dict[who] = {'con':client,'txg_running':True}
                         msg = 'start_txg连接成功，订阅频道%s'%(who)
                         self.sys_print(msg,show_force=True)
-                        self.__start_thread(target = self.recv_msg_broadcast, args = (who,client,pwd,v2))
+                        self.__start_thread(target = self.recv_msg_broadcast, args = (who,client,pwd))
                         self.__start_thread(target = self.main_broadcast_heartbeat,args=(client, who, pwd))
                         break
                     else:
@@ -696,9 +692,8 @@ class txl:
                             msg = 'start_txg连接成功，订阅频道%s'%(who)
                             self.txg_dict[who]['con'] = client
                             self.txg_dict[who]['txg_running'] = True
-                            self.txg_dict[who]['v2'] = v2
                             self.sys_print(msg,show_force=True)
-                            self.__start_thread(target = self.recv_msg_broadcast, args = (who,client,pwd,v2))
+                            self.__start_thread(target = self.recv_msg_broadcast, args = (who,client,pwd))
                             self.__start_thread(target = self.main_broadcast_heartbeat,args=(client, who, pwd))
                             break
                         else:
@@ -848,7 +843,7 @@ class txl:
                     # 订阅特定主题
                     socket.setsockopt_string(zmq.SUBSCRIBE, channel)
             self.__ZMQ_broadcast = socket
-            threading.Thread(target = self.main_recv_msg_from_zmq).start()
+            threading.Thread(target = self.main_recv_msg_from_zmq, daemon=True).start()
         else:
             # code = -1
             msg = 'MQ_broadcast已经连接,请不要重复连接'
@@ -880,8 +875,7 @@ class txl:
                 break
             
     def __start_thread(self,target,args):
-        thp1 = threading.Thread(target=target,args=args)
-        # thp1.setDaemon(True)
+        thp1 = threading.Thread(target=target,args=args,daemon=True)
         thp1.start()        
       
     
@@ -889,7 +883,6 @@ class txl:
 
         data = client.recv(1024)
         dict_data = json.loads(data)
-        self._last_start_reply = dict_data
         code = dict_data['code']
         self.id_code = str(dict_data['id_code'])+'@'
         if 'server_version' in dict_data:
@@ -905,7 +898,6 @@ class txl:
             client.settimeout(timeout)
         data = client.recv(1024,)
         dict_data = json.loads(data)
-        self._last_txg_reply = dict_data
         code = dict_data['code']
         if timeout:
             client.settimeout(None)
@@ -1180,12 +1172,7 @@ class txl:
                 result = {'code':code,'msg':msg}
                 return result
             else:
-                if self._tx_v2 and who:
-                    self.tx_que.put(("v2", _build_v2_push_frame(who, '%s|%s'%(key,data))))
-                else:
-                    send_data = {'func':'push','value':'%s|%s'%(key,data),'who':who}
-                    msg = self.json.dumps(send_data)
-                    self.send_data(self.__tx,msg)
+                self.tx_que.put(("v2", _build_v2_push_frame(who, '%s|%s'%(key,data))))
 
         except Exception as e:
             raise ConnectionAbortedError('与服务器连接断开,push函数出错,请注意你传入的数据类型必须为字符串,请查看上方的报错内容>>>%s'%(e))
@@ -1268,23 +1255,9 @@ class txl:
         '''
         绕过多线程直接在当前线程进行消息推送，适合在QMT里直接调用
         '''
-        if self._tx_v2 and who:
-            frame = _build_v2_push_frame(who, '%s|%s'%(key,data))
-            try:
-                self.__tx.sendall(frame)
-            except:
-                if self.__tx == False:
-                    raise OSError('当前start_tx未执行，请先执行start_tx()')
-                else:
-                    raise OSError('网络不可达，请稍后重试')
-            return
-        send_data = {'func':'push','value':'%s|%s'%(key,data),'who':who}
-        msg = self.json.dumps(send_data)
-        data_len = len(msg)
-        struct_bytes = struct.pack('Q', data_len)
+        frame = _build_v2_push_frame(who, '%s|%s'%(key,data))
         try:
-            self.__tx.sendall(struct_bytes)
-            self.__tx.sendall(msg)
+            self.__tx.sendall(frame)
         except:
             if self.__tx == False:
                 raise OSError('当前start_tx未执行，请先执行start_tx()')
@@ -1328,21 +1301,14 @@ class txl:
                 self.tx_que_plus.put(old_msg)
                 break
     
-    def recv_msg_broadcast(self,who,client,pwd,v2=False):
+    def recv_msg_broadcast(self,who,client,pwd):
         while self.run_on:
             try:
-                if v2:
-                    value = _recv_v2_delivery(client)
-                    if value is None:
-                        self.__txg_heartbeat_time = time.time()
-                    elif '|' in value:
-                        self.Q.put(value)
-                else:
-                    recv_data = self.recv_data_from_tx(client)
-                    if '|' in recv_data:
-                        self.Q.put(recv_data)
-                    else:
-                        self.__txg_heartbeat_time = time.time()
+                value = _recv_v2_delivery(client)
+                if value is None:
+                    self.__txg_heartbeat_time = time.time()
+                elif '|' in value:
+                    self.Q.put(value)
             except Exception as e:
                 try:
                     self.close_connection(client,name='txg')         

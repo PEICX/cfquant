@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """LTtx v2 二进制推送协议测试。
 
-覆盖三块：
+推送一律走 v2 快路径（二进制帧 + raw 投递，不保留旧 JSON 推送路径）；
+get/put 等控制消息仍走 JSON 信封（帧体首字节判别）。
+
+覆盖：
 1. 帧结构与编解码（纯单元，不起服务器）
 2. 端到端：真实 LTtx_server.py 子进程 + 真实 cfquant.tx.txl 客户端
-   （v2 协商、push/订阅收发、d_push、同连接 get/put 的 JSON 复用）
-3. 互操作：旧客户端（hello 不带 v）× 新服务器自动回落 JSON 信封；
-   同信道混合 v1/v2 订阅者都能收到；客户端对"旧服务器"的协商回落。
+   （push/订阅收发、d_push、get/put 复用、大载荷、同信道 fan-out）
+3. 线程生命周期：run_on=False 后内部线程退出，懒脚本进程可正常结束
 
 服务器子进程用桩模块替代 psutil/pandas 等重依赖，避免测试触发 pip 安装；
 所有落盘目录通过环境变量隔离到 pytest 临时目录。
@@ -52,8 +54,7 @@ def _shutdown_client(client):
         client.close_tx()
     except Exception:
         pass
-    # txl.__main_log 在 run_on=False 后仍可能阻塞在 log_que.get() 上，
-    # 塞一个哨兵让它醒来复查循环条件后退出
+    # 唤醒 __main_log 线程：run_on=False 后它仍可能阻塞在 log_que.get()
     try:
         client.log_que.put("")
     except Exception:
@@ -167,14 +168,13 @@ def _bare_client(**attrs):
     client = tx_module.txl.__new__(tx_module.txl)
     client._txl__tx = object()  # 私有 __tx：非 False 即视为已连接
     client.tx_que = queue.Queue()
-    client._tx_v2 = False
     for key, value in attrs.items():
         setattr(client, key, value)
     return client
 
 
-def test_push_uses_v2_frame_when_negotiated():
-    client = _bare_client(_tx_v2=True)
+def test_push_always_uses_v2_frame():
+    client = _bare_client()
     client.push("event", '{"a":1}', "chan-1")
     item = client.tx_que.get_nowait()
     assert isinstance(item, tuple)
@@ -187,41 +187,8 @@ def test_push_uses_v2_frame_when_negotiated():
     func_id, who_len, value_len = _V2_PUSH_HEADER.unpack_from(body, 0)
     offset = _V2_PUSH_HEADER.size
     assert func_id == _V2_FUNC_PUSH
+    assert body[offset:offset + who_len].decode("utf-8") == "chan-1"
     assert body[offset + who_len:].decode("utf-8") == 'event|{"a":1}'
-
-
-def test_push_falls_back_to_json_envelope_without_v2():
-    client = _bare_client(_tx_v2=False, json=json, orjson_on=False)
-    client.push("event", '{"a":1}', "chan-1")
-    item = client.tx_que.get_nowait()
-    assert not isinstance(item, tuple)
-    msg = json.loads(item.decode("utf-8"))
-    assert msg["func"] == "push"
-    assert msg["who"] == "chan-1"
-    assert msg["value"] == 'event|{"a":1}'
-
-
-def test_push_v2_with_none_who_keeps_legacy_semantics():
-    # who=None 在旧协议里被服务器静默丢弃，v2 分支应回落 JSON 信封保持同语义
-    client = _bare_client(_tx_v2=True, json=json, orjson_on=False)
-    client.push("event", '{"a":1}', None)
-    item = client.tx_que.get_nowait()
-    assert not isinstance(item, tuple)
-    msg = json.loads(item.decode("utf-8"))
-    assert msg["who"] is None
-
-
-def test_start_tx_negotiation_reply_capture():
-    a, b = socket.socketpair()
-    try:
-        client = tx_module.txl.__new__(tx_module.txl)
-        a.sendall(json.dumps({"code": 0, "id_code": 1}).encode("utf-8"))
-        assert client.recv_msg_start_tx(b) is True
-        assert client._last_start_reply["code"] == 0
-        assert not bool(client._last_start_reply.get("v2"))
-    finally:
-        a.close()
-        b.close()
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +196,8 @@ def test_start_tx_negotiation_reply_capture():
 # ---------------------------------------------------------------------------
 
 def test_v2_end_to_end_push_and_subscribe(tx_client):
-    assert tx_client._tx_v2 is True
     channel = "v2_e2e"
     tx_client.start_txg(channel)
-    assert tx_client.txg_dict[channel]["v2"] is True
     payload = '{"protocol":"cfquant","data":{"price": 10.5}}'
     tx_client.push("event", payload, channel)
     received = tx_client.Q.get(timeout=5)
@@ -247,7 +212,7 @@ def test_d_push_v2_end_to_end(tx_client):
 
 
 def test_v2_connection_keeps_json_rpc(tx_client):
-    # get/put/心跳等低频控制消息在 v2 连接上仍走 JSON 信封（首字节判别）
+    # get/put 等低频控制消息在 put 连接上仍走 JSON 信封（首字节判别）
     tx_client.put("cfquant_test_var", "42")
     # put 在服务器侧异步落入 dict_var，get 需要短暂重试；值经 JSON 往返后是 int
     deadline = time.time() + 5
@@ -268,119 +233,91 @@ def test_v2_push_with_large_unicode_payload(tx_client):
     assert tx_client.Q.get(timeout=5) == "event|" + payload
 
 
-# ---------------------------------------------------------------------------
-# 3. 互操作：新旧混用
-# ---------------------------------------------------------------------------
-
-def _recv_legacy_frame(sock, timeout=5.0):
-    sock.settimeout(timeout)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        header = sock.recv(8, socket.MSG_WAITALL)
-        size = struct.unpack("Q", header)[0]
-        body = sock.recv(size, socket.MSG_WAITALL)
-        data = json.loads(body.decode("utf-8"))
-        if isinstance(data, str) and "|" in data:
-            return data
-    raise AssertionError("no data frame received before timeout")
-
-
-def _connect_legacy_subscriber(port, channel):
-    sub = socket.create_connection(("127.0.0.1", port), timeout=5)
-    sub.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    hello = {"con_type": "push_mode", "who": channel, "pwd": "", "tocken": LTTX_TOKEN}
-    sub.sendall(json.dumps(hello).encode("utf-8"))
-    reply = json.loads(sub.recv(1024).decode("utf-8"))
-    assert reply["code"] == 0
-    assert "v2" not in reply
-    return sub
-
-
-def test_legacy_push_client_against_new_server(lttx_server):
+def test_multiple_subscribers_on_same_channel(lttx_server, tmp_path, monkeypatch):
+    """同信道多个订阅者（fan-out）都收到快路径投递。"""
+    monkeypatch.setenv("CFQUANT_TX_LOG_DIR", str(tmp_path / "logs"))
     port = lttx_server["port"]
-    put = socket.create_connection(("127.0.0.1", port), timeout=5)
-    put.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    hello = {"con_type": "put_mode", "tocken": LTTX_TOKEN, "local_ip": "127.0.0.1",
-             "current_file": "legacy", "current_dir": "/tmp"}
-    put.sendall(json.dumps(hello).encode("utf-8"))
-    reply = json.loads(put.recv(1024).decode("utf-8"))
-    assert reply["code"] == 0
-    assert "v2" not in reply
-
-    sub = _connect_legacy_subscriber(port, "legacy_chan")
+    sender = tx_module.txl("127.0.0.1", port, LTTX_TOKEN, show=False)
+    receiver = tx_module.txl("127.0.0.1", port, LTTX_TOKEN, show=False)
     try:
-        envelope = json.dumps({"func": "push", "value": "legacy_chan|legacy_hello", "who": "legacy_chan"})
-        put.sendall(struct.pack("Q", len(envelope)))
-        put.sendall(envelope.encode("utf-8"))
-        assert _recv_legacy_frame(sub) == "legacy_chan|legacy_hello"
+        sender.start_tx()
+        receiver.start_tx()
+        channel = "fanout_chan"
+        sender.start_txg(channel)
+        receiver.start_txg(channel)
+        sender.push("event", "fanout_payload", channel)
+        assert sender.Q.get(timeout=5) == "event|fanout_payload"
+        assert receiver.Q.get(timeout=5) == "event|fanout_payload"
     finally:
-        put.close()
-        sub.close()
+        _shutdown_client(sender)
+        _shutdown_client(receiver)
 
 
-def test_mixed_subscribers_on_same_channel(tx_client, lttx_server):
-    channel = "mixed_chan"
-    tx_client.start_txg(channel)  # v2 订阅者
-    sub = _connect_legacy_subscriber(lttx_server["port"], channel)  # v1 订阅者
+# ---------------------------------------------------------------------------
+# 3. 线程生命周期：run_on=False 后内部线程必须退出，不挂住进程
+# ---------------------------------------------------------------------------
+
+def test_txl_log_thread_exits_after_run_on_false(monkeypatch, tmp_path):
+    """__main_log 曾用无超时 log_que.get()，run_on=False 后永不退出。"""
+    monkeypatch.setenv("CFQUANT_TX_LOG_DIR", str(tmp_path / "logs"))
+    before = set(threading.enumerate())
+    client = tx_module.txl("127.0.0.1", 1, LTTX_TOKEN, show=False)  # 不触发任何连接
     try:
-        tx_client.push("event", "mixed_payload", channel)
-        assert tx_client.Q.get(timeout=5) == "event|mixed_payload"
-        assert _recv_legacy_frame(sub) == "event|mixed_payload"
+        spawned = [t for t in threading.enumerate() if t not in before]
+        assert spawned, "txl 构造后应启动 __main_log 线程"
+        client.run_on = False
+        deadline = time.time() + 3
+        while time.time() < deadline and any(t.is_alive() for t in spawned):
+            time.sleep(0.05)
+        still_alive = [t.name for t in spawned if t.is_alive()]
+        assert not still_alive, "run_on=False 后线程未退出: %s" % still_alive
     finally:
-        sub.close()
-
-
-def test_client_falls_back_when_server_lacks_v2(monkeypatch, tmp_path):
-    """新客户端 × 旧服务器：hello 带 v:2 但回复无 v2 时回落 JSON 信封。"""
-    monkeypatch.setenv("CFQUANT_TX_LOG_DIR", str(tmp_path / "client_logs"))
-    srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    port = srv.getsockname()[1]
-    observed = {}
-
-    def fake_old_server():
-        conn, _ = srv.accept()
-        frames = []
+        client.run_on = False
         try:
-            hello = json.loads(conn.recv(1024).decode("utf-8"))
-            observed["hello_v"] = hello.get("v")
-            conn.sendall(json.dumps({"code": 0, "id_code": 7}).encode("utf-8"))
-            # 心跳线程可能先于测试自身的 push 发帧，循环读到目标帧为止
-            while len(frames) < 20:
-                header = conn.recv(8, socket.MSG_WAITALL)
-                if not header:
-                    break
-                size = struct.unpack("Q", header)[0]
-                body = conn.recv(size, socket.MSG_WAITALL)
-                frames.append(json.loads(body.decode("utf-8")))
-                if frames[-1].get("value") == "event|fallback":
-                    break
+            client.log_que.put("")
         except Exception:
             pass
-        finally:
-            observed["frames"] = frames
-            try:
-                conn.close()
-            except Exception:
-                pass
 
-    thread = threading.Thread(target=fake_old_server, daemon=True)
-    thread.start()
-    client = tx_module.txl("127.0.0.1", port, LTTX_TOKEN, show=False)
+
+def test_txl_internal_threads_are_daemon(lttx_server, tmp_path, monkeypatch):
+    """txl 内部线程应全部为 daemon，短生命周期进程退出不被阻塞。"""
+    monkeypatch.setenv("CFQUANT_TX_LOG_DIR", str(tmp_path / "logs"))
+    before = set(threading.enumerate())
+    client = tx_module.txl("127.0.0.1", lttx_server["port"], LTTX_TOKEN, show=False)
     try:
         client.start_tx()
-        assert client._tx_v2 is False  # 旧服务器不回 v2，自动回落
-        client.push("event", "fallback", "chan")
-        thread.join(timeout=5)
-        assert observed["hello_v"] == 2
-        frames = observed["frames"]
-        pushes = [f for f in frames if f.get("func") == "push"]
-        assert pushes, frames
-        assert any(f.get("value") == "event|fallback" for f in pushes)
-        # 所有帧都是 JSON 信封 dict，证明确实回落到了 v1 协议
-        assert all(isinstance(f, dict) for f in frames)
+        client.start_txg("daemon_check")
+        client.push("event", "x", "daemon_check")
+        assert client.Q.get(timeout=5) == "event|x"
+        spawned = [t for t in threading.enumerate() if t not in before]
+        assert spawned
+        non_daemon = [t.name for t in spawned if not t.daemon]
+        assert not non_daemon, "存在非 daemon 内部线程: %s" % non_daemon
     finally:
         _shutdown_client(client)
-        srv.close()
+
+
+def test_lazy_script_process_exits(lttx_server, tmp_path):
+    """模拟最懒的用法：不 close_tx、不清理，跑完就退出，进程必须正常结束。"""
+    script = tmp_path / "lazy_script.py"
+    script.write_text(
+        "import os, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "os.environ['CFQUANT_TX_LOG_DIR'] = %r\n"
+        "import cfquant.tx as tx\n"
+        "client = tx.txl('127.0.0.1', %d, 'LTtx', show=False)\n"
+        "client.start_tx()\n"
+        "client.start_txg('lazy_chan')\n"
+        "client.push('event', 'bye', 'lazy_chan')\n"
+        "assert client.Q.get(timeout=5) == 'event|bye'\n"
+        "print('done')\n" % (str(REPO_ROOT), str(tmp_path / "lazy_logs"), lttx_server["port"]),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "done" in result.stdout
