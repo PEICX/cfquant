@@ -921,7 +921,6 @@ class txl:
             msg = self.json.dumps(send_data)
             self.send_data(self.__tx,msg)
             result = self.recv_data_from_tx(self.__tx)
-            result = json.loads(result)
             if 'value' in result:
                 result = result['value']
                 self.heartbeat = 0
@@ -941,7 +940,6 @@ class txl:
             msg = self.json.dumps(send_data)
             self.send_data(self.__tx,msg)
             result = self.recv_data_from_tx(self.__tx)
-            result = json.loads(result)
             if 'value' in result:
                 result = result['value']
                 self.heartbeat = 0
@@ -961,7 +959,6 @@ class txl:
             msg = self.json.dumps(send_data)
             self.send_data(self.__tx,msg)
             result = self.recv_data_from_tx(self.__tx)
-            result = json.loads(result)
             if 'value' in result:
                 result = result['value']
                 self.heartbeat = 0
@@ -980,7 +977,6 @@ class txl:
             msg = self.json.dumps(send_data)
             self.send_data(self.__tx,msg)
             result = self.recv_data_from_tx(self.__tx)
-            result = json.loads(result)
             if 'value' in result:
                 result = result['value']
                 result = pd.DataFrame(json.loads(result))

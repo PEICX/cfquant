@@ -241,6 +241,20 @@ def test_get_list_value_indices_end_to_end(tx_client):
     assert tx_client.get_list_value("cfquant_test_missing", 0) is None
 
 
+def test_get_dict_value_end_to_end(tx_client):
+    tx_client.put("cfquant_test_dict", {"alpha": 1, "beta": "two"})
+    deadline = time.time() + 5
+    value = None
+    while time.time() < deadline:
+        value = tx_client.get_dict_value("cfquant_test_dict", "beta")
+        if value is not None:
+            break
+        time.sleep(0.1)
+    assert value == "two"
+    assert tx_client.get_dict_value("cfquant_test_dict", "missing") is None
+    assert tx_client.get_dict_value("cfquant_test_missing", "alpha") is None
+
+
 def test_v2_push_with_large_unicode_payload(tx_client):
     channel = "v2_unicode"
     tx_client.start_txg(channel)

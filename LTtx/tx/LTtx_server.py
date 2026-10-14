@@ -723,7 +723,7 @@ def main_push_data_que(client,C_que_push):
     while True:
         result = C_que_push.get()
         # print(result,'----')
-        send_data_to_client(client,msg=json.dumps(result))
+        send_data_to_client(client,msg=result)
                 
     
 def handle_connect_put(con,address,dict_data):
