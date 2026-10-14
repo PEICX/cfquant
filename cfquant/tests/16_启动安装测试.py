@@ -1,0 +1,399 @@
+# -*- coding: utf-8 -*-
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from cfquant import _editable_install
+from cfquant import cli
+
+
+def test_pip_environment_preserves_parent_settings(monkeypatch):
+    monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.setenv("PYTHONPATH", "inherited-source")
+    monkeypatch.setattr(sys, "platform", "win32")
+    env = _editable_install.pip_environment()
+    assert env["PYTHONUTF8"] == "0"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert "PYTHONPATH" not in env
+    assert _editable_install.os.environ["PYTHONUTF8"] == "1"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows legacy encoding")
+def test_pip_scans_legacy_egg_link_without_modifying_it(tmp_path):
+    target = tmp_path / "\u79c1\u4eba\u6587\u4ef6"
+    try:
+        contents = (str(target) + "\n").encode("mbcs")
+    except UnicodeEncodeError:
+        pytest.skip("System encoding cannot represent the fixture path")
+    target.mkdir()
+    link = tmp_path / "legacy.egg-link"
+    link.write_bytes(contents)
+    result = _editable_install._run_pip_command(
+        [sys.executable, "-m", "pip", "list", "--path", str(tmp_path),
+         "--format=json", "--disable-pip-version-check"],
+        tmp_path,
+    )
+    assert result["ok"], result["output"]
+    assert link.read_bytes() == contents
+
+
+def test_editable_install_uses_split_arguments(tmp_path):
+    command = _editable_install.editable_install_args(tmp_path, python_exe="python")
+
+    assert command[:4] == ["python", "-m", "pip", "install"]
+    assert command[command.index("--index-url") + 1] == _editable_install.DEFAULT_PIP_INDEX_URL
+    assert "--no-deps" not in command
+    assert "--editable" in command
+    assert command[command.index("--editable") + 1] == "."
+    assert "- e" not in subprocess.list2cmdline(command)
+    assert "-e ." not in subprocess.list2cmdline(command)
+
+
+def test_editable_install_can_skip_dependencies(tmp_path):
+    command = _editable_install.editable_install_args(
+        tmp_path,
+        python_exe="python",
+        no_deps=True,
+    )
+
+    assert "--no-deps" in command
+    assert command.index("--no-deps") < command.index("--editable")
+
+
+def test_editable_install_allows_pip_index_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("CFQUANT_PIP_INDEX_URL", "https://pypi.example.test/simple")
+
+    command = _editable_install.editable_install_args(tmp_path, python_exe="python")
+
+    assert command[command.index("--index-url") + 1] == "https://pypi.example.test/simple"
+
+
+def test_requirements_install_uses_requirements_file(tmp_path):
+    command = _editable_install.requirements_install_args(tmp_path, python_exe="python")
+
+    assert command[:4] == ["python", "-m", "pip", "install"]
+    assert command[command.index("--index-url") + 1] == _editable_install.DEFAULT_PIP_INDEX_URL
+    assert command[command.index("-r") + 1] == "requirements.txt"
+
+
+def test_source_install_uses_regular_project_install(tmp_path):
+    command = _editable_install.source_install_args(tmp_path, python_exe="python")
+
+    assert command[:4] == ["python", "-m", "pip", "install"]
+    assert command[command.index("--index-url") + 1] == _editable_install.DEFAULT_PIP_INDEX_URL
+    assert "--editable" not in command
+    assert "--no-deps" not in command
+    assert command[-1] == "."
+
+
+def test_requirements_uses_tsinghua_mirror():
+    requirements = (Path(__file__).resolve().parents[2] / "requirements.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--index-url https://pypi.tuna.tsinghua.edu.cn/simple" in requirements
+    assert "pycryptodome>=3.20" in requirements
+    assert "Crypto.Cipher" in requirements
+    assert "importlib-resources>=5" in requirements
+    assert "python_version" not in requirements
+
+
+def test_run_command_is_a_serve_alias(capsys):
+    assert cli.main(["run", "--dry-run"]) == 0
+    assert "cfquant 启动参数预览" in capsys.readouterr().out
+
+
+def test_installed_check_runs_outside_project_tree(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(_editable_install, "neutral_check_cwd", lambda: tmp_path / "neutral")
+
+    def fake_run(args, cwd, quiet=False, clear_pythonpath=False):
+        calls.append((args, cwd, quiet, clear_pythonpath))
+
+        class Result(object):
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(_editable_install, "run", fake_run)
+
+    assert _editable_install.is_cfquant_installed("python") is True
+    assert calls == [(
+        ["python", "-c", _editable_install.INSTALLED_CHECK_CODE],
+        tmp_path / "neutral",
+        True,
+        True,
+    )]
+
+
+def test_installed_check_verifies_strategy_packaging_crypto():
+    assert "Crypto.Cipher" in _editable_install.INSTALLED_CHECK_CODE
+    assert "Cryptodome.Cipher" in _editable_install.INSTALLED_CHECK_CODE
+
+
+def test_run_editable_install_reports_success(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'cfquant'\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result(object):
+            returncode = 0
+            stdout = "Successfully installed cfquant-0.2.13\n"
+
+        return Result()
+
+    monkeypatch.setattr(_editable_install.subprocess, "run", fake_run)
+    result = _editable_install.run_editable_install(
+        tmp_path,
+        python_exe="python",
+        timeout=12,
+    )
+
+    assert result["attempted"] is True
+    assert result["ok"] is True
+    assert result["returncode"] == 0
+    assert result["requirements_install"]["skipped"] is True
+    assert result["editable_attempted"] is True
+    assert calls[0][0][:4] == ["python", "-m", "pip", "install"]
+    assert "--no-deps" in calls[0][0]
+    assert calls[0][1]["cwd"] == str(tmp_path)
+    assert calls[0][1]["timeout"] == 12.0
+
+
+def test_run_editable_install_runs_requirements_before_editable(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'cfquant'\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("pycryptodome>=3.20\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result(object):
+            returncode = 0
+            stdout = "pip completed\n"
+
+        return Result()
+
+    monkeypatch.setattr(_editable_install.subprocess, "run", fake_run)
+    result = _editable_install.run_editable_install(
+        tmp_path,
+        python_exe="python",
+        timeout=12,
+    )
+
+    assert result["ok"] is True
+    assert result["requirements_install"]["attempted"] is True
+    assert result["requirements_install"]["command"][
+        result["requirements_install"]["command"].index("-r") + 1
+    ] == "requirements.txt"
+    assert len(calls) == 2
+    assert "-r" in calls[0][0]
+    assert "--editable" not in calls[0][0]
+    assert "--editable" in calls[1][0]
+    assert "--no-deps" in calls[1][0]
+
+
+def test_run_editable_install_skips_dependency_failure(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'cfquant'\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("pycryptodome>=3.20\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result(object):
+            pass
+
+        result = Result()
+        if "-r" in args:
+            result.returncode = 7
+            result.stdout = "requirements failed\n"
+        else:
+            result.returncode = 0
+            result.stdout = "cfquant installed\n"
+
+        return result
+
+    monkeypatch.setattr(_editable_install.subprocess, "run", fake_run)
+    result = _editable_install.run_editable_install(tmp_path, python_exe="python")
+
+    assert result["ok"] is True
+    assert result["requirements_install"]["ok"] is False
+    assert result["requirements_failed"] is True
+    assert result["dependency_install_skipped"] is True
+    assert result["editable_attempted"] is True
+    assert len(calls) == 2
+    assert "requirements failed" in result["output"]
+    assert "--no-deps" in calls[1][0]
+
+
+def test_run_editable_install_reports_failure(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'cfquant'\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result(object):
+            returncode = 7
+            stdout = "pip failed\n"
+
+        return Result()
+
+    monkeypatch.setattr(_editable_install.subprocess, "run", fake_run)
+    result = _editable_install.run_editable_install(tmp_path, python_exe="python")
+
+    assert result["attempted"] is True
+    assert result["ok"] is False
+    assert result["returncode"] == 7
+    assert result["source_install_attempted"] is True
+    assert result["source_install_returncode"] == 7
+    assert len(calls) == 2
+    assert "--no-deps" in calls[0][0]
+    assert "--no-deps" in calls[1][0]
+    assert "pip failed" in result["output"]
+
+
+def test_run_editable_install_falls_back_to_source_install(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'cfquant'\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result(object):
+            stdout = "pip completed\n"
+
+        result = Result()
+        result.returncode = 7 if "--editable" in args else 0
+        if result.returncode != 0:
+            result.stdout = "legacy editable failure\n"
+        return result
+
+    monkeypatch.setattr(_editable_install.subprocess, "run", fake_run)
+    result = _editable_install.run_editable_install(tmp_path, python_exe="python")
+
+    assert result["attempted"] is True
+    assert result["ok"] is True
+    assert result["editable_attempted"] is True
+    assert result["source_install_attempted"] is True
+    assert result["returncode"] == 0
+    assert "--editable" in calls[0][0]
+    assert "--editable" not in calls[1][0]
+    assert "--no-deps" in calls[0][0]
+    assert "--no-deps" in calls[1][0]
+    assert calls[1][0][-1] == "."
+    assert "legacy editable failure" in result["output"]
+    assert "pip completed" in result["output"]
+
+
+def test_ensure_cfquant_installed_falls_back_to_source_install(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'cfquant'\nversion = '0.2.23'\n", encoding="utf-8")
+    installed_checks = ["0.2.22", "0.2.23"]
+    calls = []
+
+    def fake_is_installed(python_exe=None):
+        return installed_checks.pop(0)
+
+    def fake_run(args, cwd, quiet=False, clear_pythonpath=False):
+        calls.append((args, cwd, quiet, clear_pythonpath))
+
+        class Result(object):
+            pass
+
+        result = Result()
+        result.returncode = 7 if "--editable" in args else 0
+        return result
+
+    monkeypatch.setattr(_editable_install, "installed_package_version", fake_is_installed)
+    monkeypatch.setattr(_editable_install, "run", fake_run)
+
+    assert _editable_install.ensure_cfquant_installed(tmp_path, python_exe="python") == 0
+    assert "--editable" in calls[0][0]
+    assert "--editable" not in calls[1][0]
+    assert calls[1][0][-1] == "."
+
+
+@pytest.mark.parametrize("installed", ["", "0.2.22", "0.2.24", "0.2.23"])
+def test_startup_installs_only_when_version_differs(monkeypatch, tmp_path, installed):
+    (tmp_path / "pyproject.toml").write_text("[project]\nversion='0.2.23'\n", encoding="utf-8")
+    versions = iter([installed, "0.2.23"])
+    monkeypatch.setattr(_editable_install, "installed_package_version", lambda exe: next(versions))
+    calls = []
+    def install(args, cwd):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(_editable_install, "run", install)
+    assert _editable_install.ensure_cfquant_installed(tmp_path, "python") == 0
+    assert len(calls) == (0 if installed == "0.2.23" else 1)
+
+
+def test_start_script_passes_dot_not_trailing_dp0():
+    script = (Path(__file__).resolve().parents[2] / "start_cfquant.bat").read_text(encoding="utf-8")
+
+    assert '"%PYTHON_EXE%" "%CFQUANT_INSTALL_HELPER%" .' in script
+    assert '"%PYTHON_EXE%" "%CFQUANT_INSTALL_HELPER%" "%~dp0"' not in script
+
+
+def test_start_script_reuses_existing_cfquant_web():
+    script = (Path(__file__).resolve().parents[2] / "start_cfquant.bat").read_text(encoding="utf-8")
+
+    assert 'set "CFQUANT_START_WAIT_SECONDS=90"' in script
+    assert "cfquant_web_server.%WEB_LOG_RUN_ID%.stdout.log" in script
+    assert "cfquant_web_server.%WEB_LOG_RUN_ID%.stderr.log" in script
+    assert "web stdout/stderr run logs" in script
+    assert ":wait_for_cfquant_web" in script
+    assert "/api/health" in script
+    assert "existing cfquant web reused" in script
+    assert "port occupied by non-cfquant process" in script
+    assert "call :wait_for_port" not in script
+
+
+def test_stop_script_stops_cfquant_web_by_port():
+    script = (Path(__file__).resolve().parents[2] / "stop_cfquant.bat").read_text(encoding="utf-8")
+
+    assert ":stop_cfquant_web_port" in script
+    assert "Get-NetTCPConnection -LocalPort $port -State Listen" in script
+    assert "cfquant_web_server.py" in script
+    assert "cfquant-web" in script
+    assert "cfquant.exe" in script
+    assert "Port ' + $port + ' is owned by non-cfquant process" in script
+
+
+def test_service_batch_scripts_capture_binary_status_without_errorlevel_expansion():
+    project_root = Path(__file__).resolve().parents[2]
+
+    for filename in ("restart_cfquant.bat", "start_cfquant.bat", "stop_cfquant.bat"):
+        script = (project_root / filename).read_text(encoding="utf-8").lower()
+        assert "%errorlevel%" not in script
+        assert "if errorlevel 1" in script
+
+
+def test_cli_open_browser_waits_for_cfquant_health(monkeypatch):
+    calls = []
+
+    class Response(object):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return json.dumps({"ok": True, "data": {"status": "ok"}}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request.full_url, timeout))
+        return Response()
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+
+    assert cli._cfquant_web_available("0.0.0.0", 8765, timeout=0.2) is True
+    assert calls == [("http://127.0.0.1:8765/api/health", 0.2)]

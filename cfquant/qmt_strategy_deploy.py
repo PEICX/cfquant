@@ -1,0 +1,1038 @@
+"""Resumable QMT strategy import and offline model configuration for Web bindings."""
+
+import ast
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import threading
+import time
+import tokenize
+import traceback
+import uuid
+from xml.dom import minidom
+
+from .qmt_strategy_package import build_package
+
+
+SCRIPTS = {"ctypes": "CFQUANT_CTYPE_ALL_LOWLAT.py", "lite": "CFQUANT_LITE.py",
+           "lttx": "CFQUANT.py"}
+MODE_ALIASES = {
+    "ctypes": "ctypes", "pipe": "ctypes", "named_pipe": "ctypes",
+    "lite": "lite", "extreme": "lite", "extreme_lite": "lite",
+    "lite_extreme": "lite", "ultimate": "lite",
+    "lite_extreme_pipe": "lite", "extreme_pipe": "lite", "cfquant_lite": "lite",
+    "named-pipe": "ctypes", "universal": "ctypes", "universal_ctypes": "ctypes",
+    "lttx": "lttx", "socket": "lttx", "normal": "lttx",
+    "default": "lttx",
+}
+LEGACY_NAMES = {Path(name).stem for name in SCRIPTS.values()} | {"CFQUANT_TRADE_LOWLAT"}
+LEGACY_NAMES |= {name + "_" + market for name in tuple(LEGACY_NAMES) for market in ("SH", "SZ")}
+STATES = {
+    "waiting_exit": "请正常退出对应 QMT，并等待模型配置完成后再启动",
+    "waiting_import": "导入包和模型已准备，请启动并登录 QMT",
+    "waiting_import_save": "策略已导入但模型尚未配置，请退出 QMT 并等待配置完成",
+    "waiting_start": "QMT 已启动，等待托管策略启动及通道连接",
+    "waiting_manual_start": "QMT 已启动，自启未开启，请在模型交易中运行托管策略",
+    "running": "托管策略已运行",
+    "waiting_account": "未找到此资金账号的 QMT 绑定键，请补充模型账号 Key",
+    "configured": "模型已配置，等待下次启动 QMT 生效",
+    "disabled": "自动运行已关闭，托管策略已禁用",
+    "error": "策略部署失败",
+}
+
+
+def normalize_strategy_settings(value):
+    value = value if isinstance(value, dict) else {}
+    result = {}
+    for name, default in (("enabled", False), ("live", True), ("autorun", False)):
+        raw = value.get(name, default)
+        if not isinstance(raw, bool):
+            raise ValueError("qmt_strategy.%s must be a boolean" % name)
+        result[name] = raw
+    stock = str(value.get("stock") or "SH000300").strip().upper()
+    if not re.fullmatch(r"(?:SH|SZ)[0-9]{6}", stock):
+        raise ValueError("QMT 主图品种必须为 SH/SZ 加六位代码")
+    result["stock"] = stock
+    result["period"] = 86400
+    keys = value.get("account_keys") or {}
+    if not isinstance(keys, dict):
+        raise ValueError("qmt_strategy.account_keys must be an object")
+    result["account_keys"] = {role: str(keys.get(role) or "").strip()
+                              for role in ("normal", "trade", "SH", "SZ")}
+    return result
+
+
+def normalize_strategy_mode(value):
+    mode = str(value or "ctypes").strip().lower()
+    try:
+        return MODE_ALIASES[mode]
+    except KeyError:
+        raise ValueError("unknown QMT strategy mode: %s" % mode)
+
+
+def entry_script_for_mode(mode, role="normal", market=""):
+    """One mapping for raw copies and the packages QMT actually imports."""
+    mode = normalize_strategy_mode(mode)
+    market = str(market or "").strip().upper()
+    if market and market not in ("SH", "SZ"):
+        raise ValueError("unknown QMT entry market: %s" % market)
+    filename = SCRIPTS[mode]
+    if mode == "lttx" and (role != "normal" or market):
+        filename = "CFQUANT_TRADE_LOWLAT.py"
+    if market:
+        return "同账号独立市场/%s_%s.py" % (Path(filename).stem, market)
+    return filename
+
+
+def read_entry_source(path):
+    """Reject a generic entry accidentally saved under a Lite filename."""
+    path = Path(path)
+    with tokenize.open(str(path)) as stream:
+        source = stream.read()
+    if path.stem.startswith("CFQUANT_LITE"):
+        tree = ast.parse(source)
+        constants = {target.id for node in tree.body if isinstance(node, ast.Assign)
+                     for target in node.targets if isinstance(target, ast.Name)}
+        imports_core = any(
+            (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "cfquant")
+            or (isinstance(node, ast.Import) and any(alias.name.split(".")[0] == "cfquant"
+                                                    for alias in node.names))
+            for node in ast.walk(tree))
+        if "LITE_ENTRY_VERSION" not in constants or imports_core:
+            raise ValueError("极致模式入口内容不匹配，拒绝部署通用模式代码: %s" % path)
+    return source
+
+
+def qmt_root(directory, validate=False):
+    path = Path(str(directory)).expanduser().resolve()
+    if path.name.lower() in ("bin.x64", "bin", "python"):
+        path = path.parent
+    if validate:
+        if not (path / "bin.x64" / "XtItClient.exe").is_file():
+            raise ValueError("QMT 目录缺少 bin.x64/XtItClient.exe: %s" % path)
+        if not (path / "config" / "indexUserConfig.xml").is_file():
+            raise ValueError("QMT 目录缺少 config/indexUserConfig.xml: %s" % path)
+        if not (path / "formulas").is_dir():
+            raise ValueError("QMT 目录缺少 formulas 导入队列: %s" % path)
+    return path
+
+
+def account_qmt_roots(row):
+    paths = [row.get("qmt_dir")]
+    if row.get("mode") == "lttx":
+        paths.append(row.get("qmt_trade_dir"))
+    if row.get("market_routing_enabled"):
+        paths = [route.get("qmt_dir") for route in (row.get("market_bridges") or {}).values()
+                 if isinstance(route, dict) and route.get("enabled", True)]
+    return {os.path.normcase(str(qmt_root(path))) for path in paths if path}
+
+
+def _role_stock(settings, role):
+    stock = settings["stock"]
+    if role == "SH" and not stock.startswith("SH"):
+        return "SH000300"
+    if role == "SZ" and not stock.startswith("SZ"):
+        return "SZ399001"
+    return stock
+
+
+def qmt_is_running(root):
+    import psutil
+    executable = os.path.normcase(str(root / "bin.x64" / "XtItClient.exe"))
+    for process in psutil.process_iter(["name"]):
+        try:
+            if str(process.info.get("name") or "").lower() != "xtitclient.exe":
+                continue
+            if os.path.normcase(str(Path(process.exe()).resolve())) == executable:
+                return True
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            # An uninspectable QMT may be the target. Do not write its XML.
+            return True
+    return False
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=True, sort_keys=True).encode("ascii")).hexdigest()
+
+
+def _atomic_write(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".pending")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(temporary), str(path))
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _write_json(path, value):
+    _atomic_write(path, json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2).encode("utf-8"))
+
+
+def _generation_values(value):
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result = []
+    for item in value:
+        item = str(item or "").strip()
+        if item and item not in result:
+            result.append(item)
+    return result
+
+
+def _runtime_generation(role):
+    path = role.get("runtime_status_path") if isinstance(role, dict) else ""
+    if not path:
+        return ""
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    generation = report.get("generation")
+    return str(generation or "").strip()
+
+
+def _read_document(path, expected_root="ICUserConfigFile"):
+    content = path.read_bytes()
+    if len(content) > 16 * 1024 * 1024 or b"<!DOCTYPE" in content.upper() or b"<!ENTITY" in content.upper():
+        raise ValueError("Unsupported QMT XML configuration")
+    document = minidom.parseString(content)
+    if document.documentElement.tagName != expected_root:
+        raise ValueError("Unsupported QMT XML root")
+    return document, content
+
+
+def _model_items(document):
+    sections = document.getElementsByTagName("strategyTrade")
+    if len(sections) > 1:
+        raise ValueError("Multiple QMT strategyTrade sections are not supported")
+    if not sections:
+        section = document.createElement("strategyTrade")
+        document.documentElement.appendChild(section)
+    else:
+        section = sections[0]
+    return section, list(section.getElementsByTagName("item"))
+
+
+def _strategy_slot_name(account_id, mode="ctypes", role="normal"):
+    """Return a deterministic, mode-specific name in cfquant's namespace."""
+    account = re.sub(r"[^A-Z0-9]+", "_", str(account_id or "").upper()).strip("_") or "ACCOUNT"
+    if len(account) > 20:
+        account = account[-5:]
+    mode = normalize_strategy_mode(mode).upper()
+    market = str(role or "normal").upper()
+    suffix = "_%s" % market if market in ("SH", "SZ") else ""
+    return ("CFQ_%s_%s%s" % (account, mode, suffix))[:64]
+
+
+def _is_managed_strategy_name(name):
+    """Recognize current and historical cfquant model names."""
+    text = str(name or "").strip().upper()
+    return text.startswith("CFQ_") or text in {item.upper() for item in LEGACY_NAMES}
+
+
+def _valid_managed_strategy_name(name):
+    return bool(re.fullmatch(r"CFQ_[A-Z0-9_]{1,59}", str(name or "")))
+
+
+def _remove_formula_catalog_entries(document, names):
+    names = {str(name or "") for name in names if name}
+    changed = False
+    for catalog_group in document.getElementsByTagName("FormulaCatalog"):
+        for entry in list(catalog_group.getElementsByTagName("catalog")):
+            if entry.getAttribute("name") in names:
+                # QMT versions differ in whether catalog entries are direct
+                # children of FormulaCatalog or nested inside a sub-group.
+                # Always remove from the node that actually owns the entry.
+                parent = entry.parentNode
+                if parent is not None:
+                    parent.removeChild(entry)
+                    changed = True
+    return changed
+
+
+_ACCOUNT_BINDING_TYPES = {"STOCK": "2", "CREDIT": "3", "HUGANGTONG": "7", "SHENGANGTONG": "11"}
+
+
+def _account_binding(document, account_id, account_type, supplied=""):
+    expected_kind = _ACCOUNT_BINDING_TYPES.get(account_type)
+    candidates = set()
+    for item in document.getElementsByTagName("item"):
+        if item.getAttribute("account") == account_id:
+            key, kind = item.getAttribute("m_strAccountKey"), item.getAttribute("accountType")
+            if key and kind and (not expected_kind or kind == expected_kind):
+                candidates.add((kind, key))
+    if supplied:
+        parts = supplied.split("____")
+        binding = (parts[0], supplied)
+    elif len(candidates) == 1:
+        binding = next(iter(candidates))
+    else:
+        return None
+    parts = binding[1].split("____")
+    if (len(parts) != 6 or parts[-1] or parts[-2] != account_id
+            or parts[0] != binding[0] or not all(p.isdigit() for p in parts[:-1])):
+        raise ValueError("模型账号 Key 与资金账号不匹配")
+    if expected_kind and binding[0] != expected_kind:
+        raise ValueError("模型账号 Key 与账户类型不匹配（普通/信用/沪港通/深港通）")
+    return binding
+
+
+def _resolve_account_binding(root, document, account_id, account_type, supplied="", cached=""):
+    binding = _account_binding(document, account_id, account_type, supplied)
+    if binding or supplied:
+        return binding
+    # A conflicting selection must not be silently resolved using another source.
+    expected_kind = _ACCOUNT_BINDING_TYPES.get(account_type)
+    if any(item.getAttribute("account") == account_id and item.getAttribute("m_strAccountKey")
+           and (not expected_kind or item.getAttribute("accountType") == expected_kind)
+           for item in document.getElementsByTagName("item")):
+        return None
+    candidates = set()
+    for path in (root / "userdata" / "users").glob("*/authAndConfig.xml"):
+        try:
+            auth, _ = _read_document(path, expected_root="TTAuthAndConfigFile")
+        except Exception:
+            continue
+        for node in auth.getElementsByTagName("AccountAuth"):
+            key = node.getAttribute("key")
+            if key.split("____")[-2:-1] != [account_id]:
+                continue
+            try:
+                candidates.add(_account_binding(document, account_id, account_type, key))
+            except ValueError:
+                continue
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if not candidates and cached:
+        return _account_binding(document, account_id, account_type, cached)
+    return None
+
+
+def _ascii_entry_source(source):
+    """Preserve executable source through QMT's possible Windows ANSI recoding."""
+    tokens = []
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if not token.string.isascii():
+            if token.type == tokenize.STRING:
+                # Escape string values, not the whole program. In particular,
+                # raw strings must retain their literal backslashes.
+                prefix = "u" if token.string[:1].lower() == "u" else ""
+                token = token._replace(string=prefix + ascii(ast.literal_eval(token.string)))
+            elif token.type == tokenize.COMMENT:
+                token = token._replace(string=token.string.encode("ascii", "backslashreplace").decode("ascii"))
+        tokens.append(token)
+    return tokenize.untokenize(tokens)
+
+
+def managed_source(source_path, identity_path, identity, descriptor):
+    source = read_entry_source(source_path)
+    fileless = normalize_strategy_mode(descriptor["mode"]) in ("ctypes", "lite")
+    lines = source.splitlines(keepends=True)
+    tree = ast.parse(source)
+    replacements = []
+    constants = {"DEFAULT_ACCOUNT_ID": identity["account_id"], "DEFAULT_ACCOUNT_TYPE": identity["account_type"],
+                 "USER_BRIDGE_ID": identity["bridge_id"], "BRIDGE_ID": identity["bridge_id"],
+                 "QMT_MARKET": identity.get("market", "")}
+    if fileless:
+        config = dict(identity)
+        config["managed_strategy"] = {key: descriptor[key] for key in ("mode", "generation", "role")}
+        config["managed_strategy"]["runtime_key"] = descriptor.get("runtime_key") or _digest(str(identity_path))[:24]
+        constants["EMBEDDED_RUNTIME_CONFIG"] = config
+    seen = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in constants and (name not in seen or name == "QMT_MARKET"):
+                replacements.append((node.lineno - 1, node.end_lineno, name + " = " + ascii(constants[name]) + "\n"))
+                seen.add(name)
+        elif not fileless and isinstance(node, ast.FunctionDef) and node.name == "_runtime_config_paths":
+            replacements.append((node.lineno - 1, node.end_lineno,
+                                 "def _runtime_config_paths():\n    return [%s]\n" % ascii(str(identity_path))))
+        elif isinstance(node, ast.FunctionDef) and node.name == "_env_allows_runtime_override":
+            replacements.append((node.lineno - 1, node.end_lineno,
+                                 "def _env_allows_runtime_override(name, default_value=''):\n    return True\n"))
+    for start, end, text in sorted(replacements, reverse=True):
+        lines[start:end] = [text]
+    lines[0] = "# coding: utf-8\n"
+    source = "".join(lines)
+    ast.parse(source, feature_version=(3, 6))
+    if fileless:
+        if "EMBEDDED_RUNTIME_CONFIG" not in seen:
+            raise ValueError("QMT Pipe entry does not support embedded account configuration; update the entry source.")
+        # Deploy the entry itself. No file lease, exec wrapper, or surrounding try block.
+        generated = _ascii_entry_source(source)
+        generated.encode("ascii")
+        ast.parse(generated, feature_version=(3, 6))
+        return generated
+    helper = Path(__file__).with_name("qmt_strategy_runtime.py").read_text(encoding="utf-8")
+    source_lines = source.splitlines(keepends=True)
+    embedded = "\n".join("        " + ascii(line) for line in source_lines)
+    entry = "    exec(compile((\n%s\n    ), %s, 'exec'), globals())\n" % (embedded, ascii(str(source_path)))
+    description = "# Embedded entry: %d lines, preserved line by line below.\n" % len(source_lines)
+    header = ("# coding: utf-8\n# cfquant managed strategy\n"
+              + "# Mode: " + ascii(descriptor["mode"]) + "\n"
+              + "# Entry: " + ascii(Path(source_path).name) + "\n"
+              + description
+              + "# The lease wrapper is shared by all modes.\n\n")
+    generated = (header + helper + "\n_cq_descriptor = " + ascii(descriptor)
+            + "\n_cq_guard = _CqStrategyLease(_cq_descriptor).acquire()\n"
+            + "_cq_guard.namespace = globals()\ntry:\n"
+            + entry
+            + "    for _cq_name in ('_cf_bridge', '_normal_bridge', '_trade_bridge'):\n"
+            + "        if globals().get(_cq_name) is not None:\n"
+            + "            globals()[_cq_name].account_type = %s\n" % ascii(identity["account_type"])
+            + "    _cq_guard.bind(globals())\nexcept BaseException as _cq_error:\n"
+            + "    _cq_guard.failure = str(_cq_error)\n    _cq_guard.close()\n    raise\n")
+    # QMT may recode source through the Windows ANSI code page before compiling.
+    generated.encode("ascii")
+    ast.parse(generated, feature_version=(3, 6))
+    return generated
+
+
+def configured_pipe_source(source, identity):
+    """Embed a standalone entry's config while still in the external deployer."""
+    lines = source.splitlines(keepends=True)
+    for node in ast.parse(source).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "EMBEDDED_RUNTIME_CONFIG"):
+            lines[node.lineno - 1:node.end_lineno] = ["EMBEDDED_RUNTIME_CONFIG = " + ascii(identity) + "\n"]
+            return "".join(lines)
+    raise ValueError("QMT Pipe entry is missing EMBEDDED_RUNTIME_CONFIG")
+
+
+class PipeStrategyController:
+    """External Web-side client; QMT receives desired state without opening files."""
+    def __init__(self):
+        self.clients = {}
+
+    def __call__(self, identity, desired):
+        from .channels import channels_for_bridge
+        from .pipe_client import PipeRpcClient
+        channel = ((identity.get("channels") or {}).get("normal") or identity.get("normal_channel")
+                   or channels_for_bridge(identity.get("bridge_id"))["normal"])
+        key = (identity.get("pipe_name"), channel)
+        client = self.clients.get(key)
+        if client is None:
+            client = self.clients[key] = PipeRpcClient(pipe_name=key[0], request_channel=channel,
+                                                       timeout=0.5, connect_timeout_ms=150)
+        try:
+            return client.request("cfquant.strategy.control", desired)
+        except Exception:
+            self.clients.pop(key, None)
+            client.close()
+            raise
+
+    def close(self):
+        for client in self.clients.values():
+            client.close()
+        self.clients.clear()
+
+
+class QmtStrategyManager:
+    def __init__(self, state_path, scripts_dir, process_checker=qmt_is_running, runtime_request=None):
+        self.path = Path(state_path)
+        self.scripts_dir = Path(scripts_dir)
+        self.process_checker = process_checker
+        self.runtime_request = runtime_request
+        self.lock = threading.RLock()
+        self.event = threading.Event()
+        self.stopping = threading.Event()
+        self.worker = None
+        self.jobs = {}
+        self.errors = {}
+        self.load_error = ""
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if data.get("version") != 1 or not isinstance(data.get("jobs"), dict):
+                    raise ValueError("unsupported deployment state")
+                self.jobs = data["jobs"]
+                self.errors = data.get("errors", {})
+            except (OSError, ValueError, TypeError) as error:
+                self.load_error = "QMT 策略任务文件无法读取，请检查 %s: %s" % (self.path, error)
+
+    def _save(self):
+        if self.load_error:
+            return
+        _write_json(self.path, {"version": 1, "jobs": self.jobs, "errors": self.errors})
+
+    def report_error(self, account_key, error):
+        detail = str(error or "策略部署失败").strip() or "策略部署失败"
+        with self.lock:
+            self.errors[account_key] = detail
+            # Keep the concrete exception on each affected job as well. The
+            # status endpoint previously returned only the generic state
+            # label, which made the Web UI hide the deployment root cause.
+            for job in self.jobs.values():
+                if job.get("account_key") == account_key:
+                    job.update(state="error", error=detail, message="策略部署失败: " + detail, updated_at=time.time())
+            self._save()
+            return self.status(account_key)
+
+    def _state(self, job, state, error=""):
+        if job.get("state") == state and job.get("error", "") == error:
+            return
+        job.update(state=state, message=error or STATES[state], error=error, updated_at=time.time())
+        if state != "error":
+            job.pop("deploy_retry_count", None)
+            job.pop("deploy_retry_after", None)
+
+    def _clear_generation_transition(self, job):
+        changed = False
+        for key in ("control_generation", "accepted_generations"):
+            if key in job:
+                job.pop(key, None)
+                changed = True
+        for role in job.get("roles", []):
+            if "reimport_from_generation" in role:
+                role.pop("reimport_from_generation", None)
+                changed = True
+        return changed
+
+    def _prepare_generation_transition(self, job, previous=None):
+        """Keep old same-name containers valid until the replacement starts."""
+        if not job.get("enabled"):
+            return self._clear_generation_transition(job)
+
+        generation = str(job.get("generation") or "").strip()
+        if not generation:
+            return False
+
+        if previous is not None:
+            previous_roles = {
+                role.get("role"): role
+                for role in previous.get("roles", [])
+                if isinstance(role, dict)
+            }
+            reused = any(
+                isinstance(previous_roles.get(role.get("role")), dict)
+                and previous_roles[role["role"]].get("name") == role.get("name")
+                for role in job.get("roles", [])
+            )
+            if previous.get("mode") != job.get("mode") or not reused:
+                return self._clear_generation_transition(job)
+            candidates = _generation_values(previous.get("accepted_generations"))
+            if previous.get("control_generation"):
+                candidates.insert(0, str(previous["control_generation"]).strip())
+            candidates.extend(
+                _runtime_generation(previous_roles[role.get("role")])
+                for role in job.get("roles", [])
+                if isinstance(previous_roles.get(role.get("role")), dict)
+            )
+            if previous.get("generation"):
+                candidates.append(str(previous["generation"]).strip())
+        else:
+            candidates = _generation_values(job.get("accepted_generations"))
+            if job.get("control_generation"):
+                candidates.insert(0, str(job["control_generation"]).strip())
+            candidates.extend(_runtime_generation(role) for role in job.get("roles", []))
+
+        legacy = next((item for item in candidates if item and item != generation), "")
+        if not legacy:
+            return False
+
+        accepted = [item for item in _generation_values(job.get("accepted_generations"))
+                    if item not in (legacy, generation)]
+        accepted.append(generation)
+        changed = (
+            job.get("control_generation") != legacy
+            or _generation_values(job.get("accepted_generations")) != accepted
+        )
+        job["control_generation"] = legacy
+        job["accepted_generations"] = accepted
+        for role in job.get("roles", []):
+            if (_runtime_generation(role) == legacy
+                    and role.get("reimport_from_generation") != legacy):
+                # The old report survives QMT shutdown and import. Handle it
+                # once per replacement job, including across Web restarts;
+                # resetting every poll destroys the prepared/imported model.
+                updates = {
+                    "reimport_from_generation": legacy,
+                    "reimport_required": True,
+                    "imported": False,
+                    "queued": False,
+                    "model_prepared": False,
+                }
+                for key, value in updates.items():
+                    if role.get(key) != value:
+                        role[key] = value
+                        changed = True
+        if changed and job.get("state") == "error":
+            self._state(job, "waiting_exit")
+        return changed
+
+    def status(self, account_key):
+        with self.lock:
+            jobs = [job for job in self.jobs.values() if job["account_key"] == account_key]
+            fields = ("root", "state", "message", "error", "mode", "updated_at", "backup")
+            result = {"enabled": any(job.get("enabled") for job in jobs),
+                    "targets": [dict({k: job.get(k, "") for k in fields},
+                                     strategies=[r["name"] for r in job.get("roles", [])]) for job in jobs]}
+            if account_key in self.errors:
+                detail = str(self.errors[account_key] or "策略部署失败")
+                result.update(error=detail, message="账号已保存，策略部署失败: " + detail)
+            if self.load_error:
+                result.update(error=self.load_error, message=self.load_error)
+            return result
+
+    def configure(self, row, identities, force=False, scripts_dir=None):
+        if self.load_error:
+            raise ValueError(self.load_error)
+        settings = normalize_strategy_settings(row.get("qmt_strategy"))
+        mode = normalize_strategy_mode(row.get("mode"))
+        enabled = row.get("enabled", True) and settings["enabled"]
+        scripts_dir = Path(scripts_dir) if scripts_dir is not None else self.scripts_dir
+        with self.lock:
+            wanted = set()
+            grouped = {}
+            if enabled:
+                if row.get("market_routing_enabled"):
+                    identities = [info for info in identities if info.get("market") in ("SH", "SZ")]
+                for info in identities:
+                    if not info.get("written"):
+                        raise ValueError(info.get("error") or info.get("warning") or "QMT 身份配置写入失败")
+                    root = qmt_root(info["core_dir"], validate=True)
+                    identity = json.loads(Path(info["path"]).read_text(encoding="utf-8"))
+                    identity.update(account_id=row["account_id"], account_type=row["account_type"],
+                                    account_key=row["account_key"], accounts=[{
+                                        "account_id": row["account_id"], "account_type": row["account_type"],
+                                        "account_key": row["account_key"]}])
+                    market = info.get("market") or identity.get("market") or ""
+                    role = market or info.get("qmt_role") or "normal"
+                    filename = entry_script_for_mode(mode, role, market)
+                    source_path = scripts_dir / filename
+                    if not source_path.is_file():
+                        raise ValueError("QMT 内置脚本不存在: %s" % source_path)
+                    read_entry_source(source_path)
+                    for key in ("updated_at", "updated_at_text"):
+                        identity.pop(key, None)
+                    group_key = _digest([os.path.normcase(str(root)), row["account_id"]])[:24]
+                    grouped.setdefault(group_key, {"root": str(root), "roles": []})["roles"].append({
+                        "role": role, "source": str(source_path), "entry_script": filename, "identity": identity,
+                        "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                        "account_key": settings["account_keys"].get(role, "")})
+                if not grouped:
+                    raise ValueError("自动导入策略需要填写 QMT 目录")
+            for key, group in grouped.items():
+                wanted.add(key)
+                previous = self.jobs.get(key, {})
+                source_group = copy.deepcopy(group)
+                for role in source_group["roles"]:
+                    role.pop("account_key", None)
+                fingerprint = _digest([source_group, mode, [
+                    hashlib.sha256(Path(__file__).with_name(filename).read_bytes()).hexdigest()
+                    for filename in ("qmt_strategy_runtime.py", "qmt_pipe_runtime.py", "qmt_strategy_package.py", "qmt_strategy_deploy.py")]])
+                if not force and previous.get("fingerprint") == fingerprint and previous.get("enabled"):
+                    previous["account_key"] = row["account_key"]
+                    self._prepare_generation_transition(previous)
+                    if previous["settings"] != settings:
+                        previous["settings"] = settings
+                        for role in previous["roles"]:
+                            role["account_key"] = settings["account_keys"].get(role["role"], "")
+                            role["model_prepared"] = False
+                        self._state(previous, "waiting_exit")
+                    if previous.get("state") == "error":
+                        for role in previous["roles"]:
+                            role["queued"] = False
+                        self._state(previous, "waiting_exit")
+                    continue
+                generation = uuid.uuid4().hex
+                directory = Path(group["root"]) / "cfquant_managed" / key
+                previous_roles = {
+                    role.get("role"): role
+                    for role in previous.get("roles", [])
+                    if isinstance(role, dict)
+                }
+                role_names = {}
+                for role in group["roles"]:
+                    old_role = previous_roles.get(role["role"])
+                    old_name = old_role.get("name") if isinstance(old_role, dict) else ""
+                    expected_name = _strategy_slot_name(row["account_id"], mode, role["role"])
+                    if old_name == expected_name:
+                        role_names[role["role"]] = old_name
+                    else:
+                        role_names[role["role"]] = expected_name
+                current_names = set(role_names.values())
+                retired = set(previous.get("retired", []))
+                retired.update(
+                    role.get("name")
+                    for role in previous.get("roles", [])
+                    if isinstance(role, dict) and role.get("name")
+                )
+                retired.difference_update(current_names)
+                job = dict(group, account_key=row["account_key"], account_id=row["account_id"],
+                           account_type=row["account_type"], mode=mode, settings=settings,
+                           enabled=True, generation=generation, fingerprint=fingerprint,
+                           control_path=str(directory / "desired.json"),
+                           retired=sorted(retired))
+                current_endpoints = {self._role_endpoint(role) for role in job["roles"]}
+                old_endpoints = {}
+                for old_role in previous.get("roles", []) + previous.get("retired_roles", []):
+                    endpoint = self._role_endpoint(old_role)
+                    if endpoint not in current_endpoints:
+                        old_endpoints[endpoint] = {"identity": old_role["identity"], "role": old_role["role"]}
+                job["retired_roles"] = list(old_endpoints.values())
+                for role in job["roles"]:
+                    role["name"] = role_names[role["role"]]
+                    # Every new generation needs its own imported container.
+                    # Switching back to a mode can find a same-name container
+                    # from an earlier job, even though the previous job used
+                    # a different slot. Its catalog entry proves no freshness.
+                    role["reimport_required"] = True
+                    role["identity_path"] = str(directory / (role["name"] + ".json"))
+                    _write_json(role["identity_path"], role["identity"])
+                    role["runtime_status_path"] = str(directory / (role["name"] + ".status.json"))
+                    descriptor = {"mode": job["mode"], "generation": generation, "role": role["role"],
+                                  "runtime_key": _digest([os.path.normcase(job["root"]), job["account_id"]])[:24],
+                                  "control_path": job["control_path"], "lease_dir": str(directory / "leases"),
+                                  "runtime_status_path": role["runtime_status_path"]}
+                    source = managed_source(Path(role["source"]), role["identity_path"], role["identity"], descriptor)
+                    package = build_package(role["name"], source, _role_stock(settings, role["role"]), settings["period"])
+                    role["package_path"] = str(directory / (role["name"] + ".rzrk"))
+                    _atomic_write(role["package_path"], package)
+                    role["package_sha256"] = hashlib.sha256(package).hexdigest()
+                self._prepare_generation_transition(job, previous=previous)
+                self._state(job, "waiting_exit")
+                self.jobs[key] = job
+            for key, job in self.jobs.items():
+                if job["account_key"] == row["account_key"] and key not in wanted:
+                    job["enabled"] = False
+                    self._state(job, "waiting_exit")
+            # Persist jobs before granting a new generation ownership. A restart
+            # can resume an interrupted write without losing the selected mode.
+            self.errors.pop(row["account_key"], None)
+            self._save()
+            for job in self.jobs.values():
+                if job["account_key"] == row["account_key"]:
+                    self._control(job)
+            self.process_once()
+            self.event.set()
+            return self.status(row["account_key"])
+
+    def _control(self, job):
+        _write_json(job["control_path"], self._desired(job))
+
+    def _desired(self, job):
+        generation = str(job.get("control_generation") or job.get("generation") or "")
+        payload = {"enabled": bool(job.get("enabled")), "generation": generation, "mode": job.get("mode", "")}
+        accepted = [item for item in _generation_values(job.get("accepted_generations"))
+                    if item and item != generation]
+        if accepted:
+            payload["accepted_generations"] = accepted
+        payload["runtime_key"] = _digest([os.path.normcase(job["root"]), job["account_id"]])[:24]
+        return payload
+
+    def _sync_pipe_runtime(self, job):
+        if self.runtime_request is None:
+            return
+        desired = self._desired(job)
+        for role in job.get("retired_roles", []):
+            try:
+                self.runtime_request(role["identity"], dict(desired, enabled=False))
+            except Exception:
+                pass
+        for role in job["roles"]:
+            try:
+                report = self.runtime_request(role["identity"], desired)
+                if (isinstance(report, dict) and report.get("runtime_key") == desired["runtime_key"]
+                        and report.get("role") == role["role"]):
+                    # Only the external manager writes status files.
+                    _write_json(role["runtime_status_path"], report)
+            except Exception:
+                # A stopped/not-yet-imported strategy has no Pipe endpoint.
+                # Existing reports expire normally in _observe_runtime.
+                pass
+
+    @staticmethod
+    def _role_endpoint(role):
+        identity = role.get("identity") or {}
+        return (identity.get("pipe_name"), (identity.get("channels") or {}).get("normal")
+                or identity.get("normal_channel") or identity.get("bridge_id"))
+
+    def reconcile(self, accounts):
+        with self.lock:
+            changed = False
+            for job in self.jobs.values():
+                row = accounts.get(job["account_key"], {})
+                valid = (row.get("enabled", True) and row.get("qmt_strategy", {}).get("enabled")
+                         and row.get("mode") == job["mode"]
+                         and os.path.normcase(job["root"]) in account_qmt_roots(row))
+                if job.get("enabled") and not valid:
+                    job["enabled"] = False
+                    self._clear_generation_transition(job)
+                    self._state(job, "waiting_exit")
+                    self._control(job)
+                    changed = True
+                elif job.get("enabled") and self._prepare_generation_transition(job):
+                    changed = True
+                self._control(job)
+            for key in list(self.errors):
+                if key not in accounts:
+                    self.errors.pop(key)
+                    changed = True
+            if changed:
+                self._save()
+                self.event.set()
+
+    def process_once(self):
+        with self.lock:
+            changed = False
+            for job in self.jobs.values():
+                before = copy.deepcopy(job)
+                if job.get("state") == "disabled":
+                    continue
+                if job.get("enabled") and self._prepare_generation_transition(job):
+                    # A strategy can report an older generation after this
+                    # process starts. Publish the transition before QMT
+                    # launches the old container again.
+                    self._control(job)
+                if job.get("state") == "error":
+                    if not job.get("control_generation") and not _generation_values(
+                            job.get("accepted_generations")):
+                        continue
+                    retry_count = int(job.get("deploy_retry_count") or 0)
+                    if retry_count >= 5 or time.time() < float(job.get("deploy_retry_after") or 0):
+                        continue
+                try:
+                    self._advance(job)
+                except Exception as error:
+                    retry_count = int(job.get("deploy_retry_count") or 0) + 1
+                    job["deploy_retry_count"] = retry_count
+                    job["deploy_retry_after"] = time.time() + min(10.0, 2.0 * retry_count)
+                    detail = str(error).strip()
+                    if not detail:
+                        trace = traceback.format_exc().strip().splitlines()
+                        frames = [line.strip() for line in trace if line.strip().startswith("File ")]
+                        location = frames[-1] if frames else ""
+                        detail = "%s (%s)" % (type(error).__name__, location or repr(error))
+                    if retry_count < 5:
+                        detail = "部署写入暂时失败（第 %d/5 次），系统将自动重试：%s" % (retry_count, detail)
+                    else:
+                        detail = "部署连续失败 5 次，请关闭 QMT 并检查目录权限后重新保存：%s" % detail
+                    self._state(job, "error", detail)
+                changed = changed or before != job
+            if changed:
+                self._save()
+
+    def _advance(self, job):
+        root = qmt_root(job["root"], validate=True)
+        if self.process_checker(root):
+            self._sync_pipe_runtime(job)
+            self._observe_runtime(job)
+            return
+        job["retired_roles"] = []
+        if (job.get("state") in ("configured", "running", "waiting_start", "waiting_manual_start")
+                and all(role.get("imported") for role in job["roles"])):
+            self._state(job, "configured")
+            return
+        config = root / "config" / "indexUserConfig.xml"
+        document, original = _read_document(config)
+        section, items = _model_items(document)
+        owned_names = set(job.get("retired", [])) | {role["name"] for role in job["roles"]}
+        changed = False
+        disabled_names = set(job.get("retired", [])) | LEGACY_NAMES
+        for item in items:
+            item_name = item.getAttribute("name")
+            if (item.getAttribute("account") == job["account_id"]
+                    and (_is_managed_strategy_name(item_name) or item_name in disabled_names)
+                    and (item_name not in {role["name"] for role in job["roles"]}
+                         or not job["enabled"])
+                    and item.getAttribute("startupAutorun") != "0"):
+                item.setAttribute("startupAutorun", "0")
+                changed = True
+        reimport_names = {
+            role["name"] for role in job["roles"]
+            if job["enabled"] and role.get("reimport_required")
+        }
+        if reimport_names:
+            # QMT stores imported Python strategies separately from the
+            # .rzrk queue. Replace only the managed slot being refreshed.
+            changed = _remove_formula_catalog_entries(document, reimport_names) or changed
+            for role in job["roles"]:
+                if role["name"] not in reimport_names:
+                    continue
+                generated = root / "python" / (role["name"] + ".py")
+                if generated.exists():
+                    generated.unlink()
+                    changed = True
+                role["imported"] = False
+                role["queued"] = False
+                role["model_prepared"] = False
+        state = "disabled"
+        if job["enabled"]:
+            catalog = {item.getAttribute("name") for group in document.getElementsByTagName("FormulaCatalog")
+                       for item in group.getElementsByTagName("catalog")}
+            state = "configured"
+            for role in job["roles"]:
+                name = role["name"]
+                queue = root / "formulas" / (name + ".rzrk")
+                imported = name in catalog and (root / "python" / (name + ".py")).is_file()
+                if not imported:
+                    if not role.get("queued"):
+                        generated = root / "python" / (name + ".py")
+                        if generated.exists() or name in catalog:
+                            # CFQ_* is cfquant's reserved namespace.  A stale
+                            # container/catalog entry can be left behind by a
+                            # deployment on another machine; remove it while
+                            # QMT is stopped and enqueue the current package.
+                            # User strategies with other names still fail
+                            # loudly instead of being overwritten.
+                            if not _valid_managed_strategy_name(name):
+                                raise ValueError("QMT 策略名称冲突: %s" % name)
+                            changed = _remove_formula_catalog_entries(document, {name}) or changed
+                            if generated.exists():
+                                generated.unlink()
+                                changed = True
+                        package = Path(role["package_path"]).read_bytes()
+                        if queue.exists() and queue.read_bytes() != package:
+                            if _valid_managed_strategy_name(name) or role.get("reimport_required"):
+                                _atomic_write(queue, package)
+                            else:
+                                raise ValueError("QMT 导入队列存在同名文件: %s" % name)
+                        elif not queue.exists():
+                            _atomic_write(queue, package)
+                        role["queued"] = True
+                    elif not queue.exists():
+                        raise ValueError("导入队列已被消费，但未找到完整策略登记；请查看 QMT 日志后重试: %s" % name)
+                    role["reimport_required"] = False
+                    if state != "waiting_account":
+                        state = "waiting_import"
+                else:
+                    role["imported"] = True
+                    role["reimport_required"] = False
+                binding = _resolve_account_binding(root, document, job["account_id"], job["account_type"],
+                                                   role["account_key"], role.get("resolved_account_key", ""))
+                if not binding:
+                    state = "waiting_account"
+                    continue
+                role["resolved_account_key"] = binding[1]
+                matches = [item for item in items if item.getAttribute("name") == name]
+                if len(matches) > 1:
+                    raise ValueError("QMT 中存在重复的托管模型: %s" % name)
+                if matches:
+                    item = matches[0]
+                    if item.getAttribute("account") != job["account_id"]:
+                        raise ValueError("托管模型被绑定到其他资金账号: %s" % name)
+                else:
+                    templates = [item for item in items if item.getAttribute("account") == job["account_id"]
+                                 and item.getAttribute("eStrategyType") in ("4", "5")]
+                    item = templates[0].cloneNode(deep=True) if templates else document.createElement("item")
+                    ids = [int(item.getAttribute("id")) for item in items if item.getAttribute("id").isdigit()]
+                    item.setAttribute("id", str(max(ids or [0]) + 1))
+                    section.appendChild(item)
+                    items.append(item)
+                attributes = {"name": name, "account": job["account_id"], "accountType": binding[0],
+                              "m_strAccountKey": binding[1], "stock": _role_stock(job["settings"], role["role"]),
+                              "peroid": str(job["settings"]["period"]), "eStrategyType": "4",
+                              "strategymall": "0", "specialType": "48", "recover_type": "14",
+                              "runname": "", "strategyRemark": "cfquant managed",
+                              "runMode": "1" if job["settings"]["live"] else "0",
+                              "startupAutorun": "1" if job["settings"]["autorun"] else "0",
+                              "FromulaExpandData": json.dumps({"m_qsFormula": name,
+                                  "m_qsAccount": job["account_id"], "variableSize": "0"}, ensure_ascii=True)}
+                for key, value in attributes.items():
+                    if item.getAttribute(key) != value:
+                        item.setAttribute(key, value)
+                        changed = True
+                role["model_id"] = item.getAttribute("id")
+        else:
+            for name in owned_names:
+                queue = root / "formulas" / (name + ".rzrk")
+                if queue.exists():
+                    queue.unlink()
+        if changed:
+            if self.process_checker(root) or config.read_bytes() != original:
+                self._state(job, "waiting_exit")
+                return
+            backup = root / "cfquant_managed" / "backups" / (uuid.uuid4().hex + ".xml")
+            _atomic_write(backup, original)
+            updated = document.toxml(encoding="utf-8")
+            minidom.parseString(updated)
+            if self.process_checker(root):
+                self._state(job, "waiting_exit")
+                return
+            _atomic_write(config, updated)
+            job["backup"] = str(backup)
+        for role in job["roles"]:
+            if role.get("model_id"):
+                role["model_prepared"] = True
+        self._state(job, state)
+
+    def _observe_runtime(self, job):
+        if not job["enabled"]:
+            self._state(job, "waiting_exit")
+            return
+        prepared = all(role.get("model_prepared") for role in job["roles"])
+        if not prepared:
+            state = "waiting_import_save" if any(role.get("queued") and not role.get("imported") for role in job["roles"]) else "waiting_exit"
+            self._state(job, state)
+            return
+        transition_generations = set(_generation_values(job.get("accepted_generations")))
+        if job.get("control_generation"):
+            transition_generations.add(str(job["control_generation"]).strip())
+        valid_generations = set([str(job["generation"])]) | transition_generations
+        reports = []
+        states = []
+        for role in job["roles"]:
+            try:
+                report = json.loads(Path(role["runtime_status_path"]).read_text(encoding="utf-8"))
+                report_generation = str(report.get("generation") or "").strip()
+                valid = (report_generation in valid_generations
+                         and 0 <= time.time() - float(report.get("updated_at", 0)) < 10)
+                report_state = report.get("state") or ""
+                reports.append((valid, report_generation, report_state))
+                if valid and report_generation == str(job["generation"]) and report_state == "error":
+                    self._state(job, "error", "QMT 策略启动失败: " + str(report.get("error") or role["name"]))
+                    return
+                states.append(report_state if valid and report_state != "error" else "")
+            except (OSError, ValueError, KeyError, TypeError):
+                reports.append((False, "", ""))
+                states.append("")
+        if (transition_generations and reports
+                and all(valid and generation == str(job["generation"])
+                        and state in ("loaded", "running")
+                        for valid, generation, state in reports)):
+            self._clear_generation_transition(job)
+            self._control(job)
+        state = "running" if states and all(item == "running" for item in states) else (
+            "waiting_start" if job["settings"]["autorun"] else "waiting_manual_start")
+        self._state(job, state)
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.stopping.clear()
+        self.worker = threading.Thread(target=self._run, name="qmt-strategy-deploy", daemon=True)
+        self.worker.start()
+
+    def _run(self):
+        while not self.stopping.is_set():
+            try:
+                self.process_once()
+            except Exception:
+                # Per-target errors are reported by process_once; a state-file
+                # write failure will be retried without terminating the worker.
+                pass
+            self.event.wait(2.0)
+            self.event.clear()
+
+    def close(self):
+        self.stopping.set()
+        self.event.set()
+        if self.worker:
+            self.worker.join(timeout=5.0)
+        close = getattr(self.runtime_request, "close", None)
+        if callable(close) and not (self.worker and self.worker.is_alive()):
+            close()

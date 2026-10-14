@@ -1,0 +1,1476 @@
+# -*- coding: utf-8 -*-
+import datetime as dt
+import hashlib
+import json
+import os
+from .stock_connect import connect_account_type
+import queue
+import re
+import threading
+import time
+
+from . import order_meta
+from .order_identity import prepare_order_remark, order_remark_key, restore_order_remark, restore_strategy_name
+from .level2 import L2_THOUSAND_SUBSCRIPTIONS, quote_callback_data, quote_plain, require_l2_callable, thousand_price
+from .protocol import loads_message, pack_event, pack_response
+from .tx_trade_bridge import TxTradeBridge, relay_sync_order_callback
+
+
+COALESCED_QUERY_ACTIONS = set([
+    "xttrader.query_stock_asset",
+    "xttrader.query_stock_positions",
+    "xttrader.query_stock_orders",
+    "xttrader.query_stock_trades",
+    "xttrader.query_credit_detail",
+    "xttrader.query_credit_subjects",
+    "xttrader.query_credit_slo_code",
+    "xttrader.query_credit_assure",
+    "xttrader.query_stk_compacts",
+])
+
+
+class NormalQmtBridge(TxTradeBridge):
+    def __init__(
+        self,
+        context,
+        ip="127.0.0.1",
+        port=2049,
+        token="LTtx",
+        request_channel="cfquant.request",
+        callback_event_channel="cfquant.callback.event",
+        bridge_id="default",
+        account_id="",
+        show=True,
+        globals_dict=None,
+        schedule_timer=True,
+        pump_max_count=20,
+        pump_max_ms=0,
+        dispatch_on_qmt_thread=False,
+        order_meta_enabled=True,
+    ):
+        super(NormalQmtBridge, self).__init__(
+            context,
+            ip=ip,
+            port=port,
+            token=token,
+            request_channel=request_channel,
+            bridge_id=bridge_id,
+            account_id=account_id,
+            show=show,
+            globals_dict=globals_dict,
+            order_meta_enabled=order_meta_enabled,
+        )
+        self.request_queue = queue.Queue(maxsize=10000)
+        self.recv_thread = None
+        self.worker_thread = None
+        self.worker_event = threading.Event()
+        self.worker_source = ""
+        self.worker_source_lock = threading.Lock()
+        self.pump_max_count = int(pump_max_count)
+        self.pump_max_ms = float(pump_max_ms)
+        self.dispatch_on_qmt_thread = bool(dispatch_on_qmt_thread)
+        self.dispatch_lock = threading.RLock()
+        self.coalesce_lock = threading.RLock()
+        self.coalesced_requests = {}
+        self.coalesce_join_count = 0
+        self.coalesce_dispatch_count = 0
+        self.subscription_seq = 0
+        self.quote_subscriptions = {}
+        self.whole_quote_publish_sub_id = None
+        self.whole_quote_publish_enabled = False
+        self.whole_quote_sub_id = None
+        self.schedule_key = None
+        self.callback_event_channel = callback_event_channel
+        self.bridge_id = bridge_id or "default"
+        self.schedule_timer = bool(schedule_timer)
+        self.order_meta_txs = {}
+        self.order_meta_threads = {}
+        self.order_meta_accounts = set()
+        self.order_meta_subscription_lock = threading.RLock()
+        self.order_meta_reset_slots = set()
+        self.order_meta_store_load_times = {}
+        self.callback_asset_dedupe_lock = threading.RLock()
+        self.callback_asset_fingerprints = {}
+        self.callback_asset_dedupe_max = 4096
+        self.order_terminal_statuses = {}
+        self.order_terminal_statuses_lock = threading.RLock()
+        self.pending_order_errors = []
+        self.pending_order_errors_lock = threading.RLock()
+
+    def start(self):
+        if self.running:
+            return self
+        self.running = True
+        if not self.started_at:
+            self.started_at = time.time()
+        txl = self._load_txl()
+        self.tx = txl(self.ip, self.port, self.token)
+        self.tx.start_tx()
+        self.tx.start_txg(self.request_channel)
+        self.recv_thread = threading.Thread(target=self._recv_loop)
+        self.recv_thread.daemon = True
+        self.recv_thread.start()
+        if self.order_meta_enabled and self.account_id:
+            self._ensure_order_meta_account_subscription(self.account_id, self.account_type)
+        with self.order_meta_subscription_lock:
+            initial_order_meta_accounts = list(self.order_meta_accounts)
+        if self.order_meta_enabled:
+            for account_type, account_id in initial_order_meta_accounts:
+                self._ensure_order_meta_account_subscription(account_id, account_type)
+        self._log(
+            "normal bridge started LTtx=%s:%s request_channel=%s"
+            % (self.ip, self.port, self.request_channel)
+        )
+        self._publish_runtime_report("start")
+        return self
+
+    def set_context(self, context):
+        self.context = context
+        if self.account_id:
+            self._set_context_account(self.account_id, self.account_type)
+        self._enable_auto_trade_callback()
+        if self.order_meta_enabled and self.account_id:
+            self._ensure_order_meta_account_subscription(self.account_id, self.account_type)
+        if self.dispatch_on_qmt_thread:
+            self._log("normal bridge QMT-thread dispatch enabled")
+        else:
+            self._start_worker_thread(context)
+        if self.schedule_timer:
+            self._schedule_timer()
+        if self.dispatch_on_qmt_thread:
+            dispatch_source = "QMT timer/handlebar callbacks" if self.schedule_timer else "QMT caller thread callbacks"
+            self._log("normal bridge requests are consumed by %s" % dispatch_source)
+        else:
+            self._log("normal bridge worker is released by quote/timer/handlebar callbacks")
+        self._log("normal bridge context ready")
+        self._publish_runtime_report("context_ready")
+
+    def close(self):
+        self._flush_pending_order_errors(force=True)
+        self.running = False
+        self.worker_event.set()
+        self._close_quote_subscriptions()
+        with self.order_meta_subscription_lock:
+            meta_txs = list(self.order_meta_txs.values())
+            self.order_meta_txs.clear()
+            self.order_meta_threads.clear()
+        if self.context is not None and self.schedule_key:
+            try:
+                self.context.cancel_schedule_run(self.schedule_key)
+            except Exception:
+                pass
+        for meta_tx in meta_txs:
+            try:
+                meta_tx.close()
+            except Exception:
+                pass
+        super(NormalQmtBridge, self).close()
+
+    def _recv_loop(self):
+        while self.running:
+            try:
+                raw = self.tx.Q.get()
+                if raw is None:
+                    break
+                self._handle_raw_from_thread(raw)
+            except Exception as e:
+                if self.running:
+                    self._log("normal bridge recv error: %s" % e)
+                time.sleep(0.05)
+
+    def _handle_raw_from_thread(self, raw):
+        if self.order_meta_enabled and self._handle_order_meta_raw(raw):
+            return
+        msg = loads_message(raw)
+        if not msg or msg.get("type") != "request":
+            return
+        action = msg.get("action")
+        if action == "cfquant.ping":
+            self._send_response(msg, {"pong": True, "ts": time.time(), "request_channel": self.request_channel})
+            return
+        if action == "cfquant.status":
+            self._send_response(msg, self._status())
+            return
+        if action == "cfquant.strategy.control":
+            try:
+                self._send_response(msg, self._dispatch(action, msg.get("params") or {}, msg))
+            except Exception as error:
+                self._send_error(msg, error)
+            return
+        if self._try_enqueue_coalesced_request(msg):
+            return
+        try:
+            self.request_queue.put_nowait((msg, time.time(), None))
+            self._release_worker("enqueue")
+            self._log(
+                "normal bridge request queued action=%s id=%s queue_size=%s"
+                % (msg.get("action"), msg.get("id"), self.request_queue.qsize())
+            )
+        except queue.Full as e:
+            self._send_error(msg, e)
+
+    def _subscribe_account(self, params, msg=None):
+        account = params.get("account") or {}
+        account_id = account.get("account_id") or params.get("account_id") or self.account_id
+        account_type = self._account_type_name(account.get("account_type") or params.get("account_type")).upper()
+        result = super(NormalQmtBridge, self)._subscribe_account(params, msg)
+        if self.order_meta_enabled:
+            self._ensure_order_meta_account_subscription(account_id or self.account_id, account_type or self.account_type)
+        return result
+
+    def _ensure_order_meta_account_subscription(self, account_id, account_type=None):
+        if not self.order_meta_enabled:
+            return False
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            return False
+        account_type = order_meta.normalize_account_type(account_type or self.account_type)
+        account_key = (account_type, account_id)
+        channel = order_meta.account_meta_channel(self.bridge_id, account_type, account_id)
+        with self.order_meta_subscription_lock:
+            self.order_meta_accounts.add(account_key)
+            if self.tx is None or not self.running:
+                return False
+            if channel in self.order_meta_txs:
+                return True
+            txl = self._load_txl()
+            try:
+                meta_tx = txl(self.ip, self.port, self.token, show=False)
+            except TypeError:
+                meta_tx = txl(self.ip, self.port, self.token)
+            try:
+                meta_tx.start_txg(channel)
+            except Exception:
+                try:
+                    meta_tx.close()
+                except Exception:
+                    pass
+                raise
+            thread = threading.Thread(target=self._order_meta_recv_loop, args=(channel, meta_tx))
+            thread.daemon = True
+            self.order_meta_txs[channel] = meta_tx
+            self.order_meta_threads[channel] = thread
+            thread.start()
+        self._load_order_meta_store_throttled(account_id, account_type, force=True)
+        self._log("normal bridge order meta subscribed account=%s type=%s channel=%s" % (account_id, account_type, channel))
+        return True
+
+    def _order_meta_recv_loop(self, channel, meta_tx):
+        while self.running:
+            try:
+                raw = meta_tx.Q.get()
+                if raw is None:
+                    break
+                self._handle_order_meta_raw(raw, channel)
+            except Exception as e:
+                if self.running:
+                    self._log("normal bridge order meta recv error channel=%s error=%s" % (channel, e))
+                time.sleep(0.05)
+
+    def _handle_order_meta_raw(self, raw, channel=""):
+        if not self.order_meta_enabled:
+            return False
+        key, payload = order_meta.split_push_message(raw)
+        if not key:
+            return False
+        record = order_meta.decode_record_payload(payload)
+        if not isinstance(record, dict):
+            return False
+        record = order_meta.normalize_record(record, bridge_id=self.bridge_id)
+        status = order_meta.normalize_text(record.get("status")).lower()
+        if key == order_meta.ORDER_META_DELETE_KEY or status in ("delete", "deleted", "failed", "cancelled"):
+            self.order_meta_cache.remove(record)
+        else:
+            self.order_meta_cache.upsert(record)
+        self._persist_order_meta_record(record, payload=order_meta.encode_record(record))
+        return True
+
+    def _load_order_meta_store_throttled(self, account_id, account_type, force=False):
+        if not self.order_meta_enabled:
+            return {"loaded": 0, "stale": 0}
+        account_id = str(account_id or "").strip()
+        account_type = order_meta.normalize_account_type(account_type or self.account_type)
+        if not account_id:
+            return {"loaded": 0, "stale": 0}
+        key = (account_type, account_id)
+        now = time.time()
+        with self.order_meta_subscription_lock:
+            last_load = self.order_meta_store_load_times.get(key, 0.0)
+            if not force and now - last_load < 1.0:
+                return {"loaded": 0, "stale": 0}
+            self.order_meta_store_load_times[key] = now
+        return self._load_order_meta_store(account_id, account_type)
+
+    def _enrich_callback_order_meta(self, event_name, data, account_id, account_type):
+        if event_name not in (
+            "trader:on_stock_order",
+            "trader:on_stock_trade",
+            "trader:on_order_error",
+            "trader:on_cancel_error",
+            "trader:on_order_stock_async_response",
+            "trader:on_cancel_order_stock_async_response",
+        ):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if not self.order_meta_enabled:
+            order_meta.ensure_callback_text_fields(data)
+            return None
+        account_id = str(account_id or "").strip()
+        account_type = order_meta.normalize_account_type(account_type or self.account_type)
+        if account_id:
+            data.setdefault("account_id", account_id)
+            data.setdefault("m_strAccountID", account_id)
+            self._ensure_order_meta_account_subscription(account_id, account_type)
+        if account_type:
+            data.setdefault("account_type", account_type)
+        record, match_info = self.order_meta_cache.resolve_callback(
+            data,
+            bridge_id=self.bridge_id,
+            account_type=account_type,
+            account_id=account_id,
+            allow_pending=True,
+        )
+        load_info = None
+        if record is None and account_id:
+            load_info = self._load_order_meta_store_throttled(account_id, account_type, force=True)
+            record, match_info = self.order_meta_cache.resolve_callback(
+                data,
+                bridge_id=self.bridge_id,
+                account_type=account_type,
+                account_id=account_id,
+                allow_pending=True,
+            )
+        order_meta.apply_record_to_callback(data, record, match_info)
+        order_meta.ensure_callback_text_fields(data)
+        if record and match_info.get("bound_order_ref"):
+            self._persist_order_meta_record(record, payload=order_meta.encode_record(record))
+        refs = order_meta.order_ref_candidates_from_data(data)
+        if record:
+            self._log(
+                "normal bridge order meta hit event=%s account=%s type=%s match=%s refs=%s filled_strategy=%s filled_remark=%s"
+                % (
+                    event_name,
+                    account_id or "-",
+                    account_type or "-",
+                    match_info.get("match_confidence") or "-",
+                    ",".join(refs[:6]) or "-",
+                    bool(order_meta.normalize_text(data.get("strategy_name"))),
+                    bool(order_meta.normalize_text(data.get("order_remark"))),
+                )
+            )
+            if data.get("cfquant_order_id_reconciled"):
+                self._log(
+                    "normal bridge order id reconciled event=%s raw=%s canonical=%s"
+                    % (
+                        event_name,
+                        data.get("cfquant_callback_order_id") or "-",
+                        data.get("order_id") or "-",
+                    )
+                )
+        else:
+            self._log(
+                "normal bridge order meta miss event=%s account=%s type=%s refs=%s order_id=%s order_sysid=%s load=%s"
+                % (
+                    event_name,
+                    account_id or "-",
+                    account_type or "-",
+                    ",".join(refs[:6]) or "-",
+                    data.get("order_id") or "-",
+                    data.get("order_sysid") or data.get("m_strOrderSysID") or "-",
+                    load_info if load_info is not None else "-",
+                )
+            )
+        return record
+
+    def _maybe_reset_order_meta_stores(self):
+        if not self.order_meta_enabled:
+            return
+        now = dt.datetime.now()
+        slot = ""
+        if now.hour == 9 and now.minute == 0:
+            slot = "0900"
+        elif now.hour >= 16:
+            slot = "after_1600"
+        if not slot:
+            return
+        trade_day = now.strftime("%Y%m%d")
+        with self.order_meta_subscription_lock:
+            self.order_meta_reset_slots = set(
+                item for item in self.order_meta_reset_slots
+                if item and item[0] == trade_day
+            )
+            accounts = list(self.order_meta_accounts)
+            markers = []
+            for account_type, account_id in accounts:
+                marker = (trade_day, slot, account_type, account_id)
+                if marker in self.order_meta_reset_slots:
+                    continue
+                self.order_meta_reset_slots.add(marker)
+                markers.append((account_type, account_id, marker))
+        for account_type, account_id, marker in markers:
+            self._reset_order_meta_store(account_id, account_type, reason=marker[1])
+
+    def _publish_runtime_report(self, reason):
+        super(NormalQmtBridge, self)._publish_runtime_report(reason)
+        if self.tx is None or not self.callback_event_channel:
+            return
+        try:
+            data = self._runtime_info()
+            data.update({
+                "reason": reason,
+                "transport": "lttx" if self.port else "pipe",
+                "channel_key": "normal",
+                "callback_event_channel": self.callback_event_channel,
+            })
+            payload = pack_event(
+                "cfquant.runtime",
+                data=data,
+                client_id=self.callback_event_channel,
+                meta={
+                    "bridge_id": self.bridge_id,
+                    "account_id": self.account_id,
+                    "source": "qmt_runtime_report",
+                },
+            )
+            self.tx.push("event", payload, self.callback_event_channel)
+            self._log("normal bridge runtime report sent version=%s reason=%s" % (data.get("core_version") or "-", reason))
+        except Exception as e:
+            self._log("normal bridge runtime report failed:%s" % e)
+
+    def _start_worker_thread(self, context):
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            return
+        self.context = context
+        self.worker_thread = threading.Thread(target=self._worker_loop, args=(context,))
+        self.worker_thread.daemon = True
+        self.worker_thread.start()
+        self._log("normal bridge worker thread started in init context")
+
+    def _dispatch(self, action, params, msg):
+        if action in ("xtdata.subscribe_l2thousand", "xtdata.subscribe_l2thousand_queue"):
+            return self._subscribe_native_quote(dict(msg, params=params), "thousand", action.split(".", 1)[1])
+        if action in ("xtdata.subscribe_whole_quote", "xtdata.subscribe_quote", "xtdata.unsubscribe_quote"):
+            msg = dict(msg, params=params)
+        if action == "xtdata.subscribe_whole_quote":
+            return self._handle_whole_quote_publish_subscribe(msg)
+        if action == "xtdata.subscribe_quote":
+            return self._handle_quote_subscribe(msg, kind="quote")
+        if action == "xtdata.unsubscribe_quote":
+            return self._handle_quote_unsubscribe(msg)
+        return super(NormalQmtBridge, self)._dispatch(action, params, msg)
+
+    def _handle_quote_subscribe(self, msg, kind):
+        params = msg.get("params") or {}
+        if params.get("start_time") or params.get("end_time") or params.get("count", 0) != 0:
+            self._get_market_data_ex(dict(params, stock_list=[params.get("stock_code", "")]))
+        return self._subscribe_native_quote(msg, kind, "subscribe_quote")
+
+    def _handle_whole_quote_publish_subscribe(self, msg):
+        return self._subscribe_native_quote(msg, "whole_quote", "subscribe_whole_quote")
+
+    def _subscribe_native_quote(self, msg, kind, method):
+        self.subscription_seq += 1
+        sub_id = self.subscription_seq
+        params = msg.get("params") or {}
+        sub = {
+            "kind": kind,
+            "client_id": msg.get("client_id") or msg.get("reply_channel"),
+            "code_list": params.get("code_list", params.get("stock_list", [])),
+            "stock_code": params.get("stock_code", ""),
+            "period": params.get("period", "1d"),
+            "callback_event": params.get("callback_event") or "quote:%s" % sub_id,
+            "publish_existing": False,
+        }
+        pending = []
+        callback_lock = threading.RLock()
+        initializing = [True]
+
+        def callback(data):
+            with callback_lock:
+                self._release_worker("quote")
+                if self.quote_subscriptions.get(sub_id) is not sub or self.tx is None:
+                    return
+                payload = quote_plain(data) if kind == "whole_quote" else quote_callback_data(data)
+                if initializing[0]:
+                    pending.append(payload)
+                    return
+                client_id = sub.get("client_id")
+                if client_id:
+                    event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+                    self.tx.push("event", event, client_id)
+
+        func = self._get_callable(method)
+        if method in L2_THOUSAND_SUBSCRIPTIONS:
+            func = require_l2_callable(func, method)
+        if not callable(func):
+            raise NotImplementedError("QMT %s not found" % method)
+        self.quote_subscriptions[sub_id] = sub
+        try:
+            if kind == "whole_quote":
+                internal_id = self._call_variants(func, [
+                    ((sub["code_list"],), {"callback": callback}),
+                    ((sub["code_list"], callback), {}),
+                ])
+            elif kind == "quote":
+                internal_id = func(sub["stock_code"], sub["period"], params.get("dividend_type") or "none", "dict", callback)
+            elif method == "subscribe_l2thousand":
+                internal_id = func(sub["stock_code"], gear_num=params.get("gear_num"), callback=callback)
+            else:
+                if params.get("gear_num") is not None and params.get("price") is not None:
+                    raise ValueError("gear_num and price cannot both be specified")
+                internal_id = func(sub["stock_code"], callback=callback, gear_num=params.get("gear_num"), price=thousand_price(params))
+            if internal_id is None or isinstance(internal_id, bool) or int(internal_id) <= 0:
+                raise RuntimeError("QMT %s failed: %r" % (method, internal_id))
+            sub["internal_subscribe_id"] = internal_id
+        except Exception:
+            self.quote_subscriptions.pop(sub_id, None)
+            raise
+        if kind == "whole_quote":
+            self.whole_quote_publish_sub_id = sub_id
+            self.whole_quote_publish_enabled = True
+        with callback_lock:
+            initializing[0] = False
+            try:
+                for payload in pending:
+                    callback(payload)
+            except Exception:
+                self._handle_quote_unsubscribe({"params": {"subscribe_id": sub_id}})
+                raise
+            finally:
+                pending[:] = []
+        self._log("normal bridge quote subscribed id=%s kind=%s internal_id=%s" % (sub_id, kind, internal_id))
+        return {
+            "subscribe_id": sub_id,
+            "internal_subscribe_id": internal_id,
+            "callback_event": sub["callback_event"],
+            "publish_existing": False,
+        }
+
+    def _handle_quote_unsubscribe(self, msg):
+        params = msg.get("params") or {}
+        sub_id = params.get("subscribe_id")
+        try:
+            sub_id = int(sub_id)
+        except (TypeError, ValueError):
+            pass
+        sub = self.quote_subscriptions.get(sub_id)
+        if sub and "internal_subscribe_id" in sub:
+            result = self._get_callable("unsubscribe_quote")(sub["internal_subscribe_id"])
+            if result is False or (isinstance(result, (int, float)) and result < 0):
+                raise RuntimeError("QMT unsubscribe_quote failed: %r" % (result,))
+        self.quote_subscriptions.pop(sub_id, None)
+        whole_ids = [key for key, row in self.quote_subscriptions.items() if row.get("kind") == "whole_quote"]
+        self.whole_quote_publish_enabled = bool(whole_ids)
+        self.whole_quote_publish_sub_id = whole_ids[-1] if whole_ids else None
+        self._log("normal bridge quote unsubscribed id=%s" % sub_id)
+        return True
+
+    def _close_quote_subscriptions(self):
+        with self.dispatch_lock:
+            internal_ids = [sub["internal_subscribe_id"] for sub in self.quote_subscriptions.values()
+                            if "internal_subscribe_id" in sub]
+            if self.whole_quote_sub_id is not None:
+                internal_ids.append(self.whole_quote_sub_id)
+            self.quote_subscriptions.clear()
+            self.whole_quote_publish_enabled = False
+            self.whole_quote_publish_sub_id = None
+            self.whole_quote_sub_id = None
+            for internal_id in internal_ids:
+                try:
+                    self._get_callable("unsubscribe_quote")(internal_id)
+                except Exception as e:
+                    self._log("normal bridge quote cleanup failed id=%s error=%s" % (internal_id, e))
+
+    def _try_enqueue_coalesced_request(self, msg):
+        coalesce_key = self._coalesce_key(msg)
+        if not coalesce_key:
+            return False
+        received_at = time.time()
+        action = msg.get("action")
+        with self.coalesce_lock:
+            current = self.coalesced_requests.get(coalesce_key)
+            if current is not None:
+                current["waiters"].append((msg, received_at))
+                self.coalesce_join_count += 1
+                self._log(
+                    "normal bridge request coalesced action=%s id=%s waiters=%s"
+                    % (action, msg.get("id"), len(current["waiters"]))
+                )
+                return True
+            entry = {
+                "key": coalesce_key,
+                "action": action,
+                "primary_id": msg.get("id"),
+                "waiters": [(msg, received_at)],
+            }
+            self.coalesced_requests[coalesce_key] = entry
+        try:
+            self.request_queue.put_nowait((msg, received_at, coalesce_key))
+            self._release_worker("enqueue")
+            self._log(
+                "normal bridge request queued action=%s id=%s queue_size=%s coalesced=1"
+                % (action, msg.get("id"), self.request_queue.qsize())
+            )
+            return True
+        except queue.Full as e:
+            with self.coalesce_lock:
+                if self.coalesced_requests.get(coalesce_key) is entry:
+                    self.coalesced_requests.pop(coalesce_key, None)
+            self._send_error(msg, e)
+            return True
+
+    def _coalesce_key(self, msg):
+        action = msg.get("action")
+        if action not in COALESCED_QUERY_ACTIONS:
+            return None
+        params = msg.get("params") or {}
+        try:
+            params_key = json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            params_key = repr(params)
+        return "%s|%s" % (action, params_key)
+
+    def pump(self):
+        if self.dispatch_on_qmt_thread:
+            return self._drain_requests("pump")
+        self._release_worker("pump")
+        return self.request_queue.qsize()
+
+    def on_timer(self, *args, **kwargs):
+        self._maybe_reset_order_meta_stores()
+        self._flush_pending_order_errors()
+        if self.dispatch_on_qmt_thread:
+            self._drain_requests("timer")
+            return
+        self._release_worker("timer")
+
+    def _release_worker(self, source):
+        with self.worker_source_lock:
+            self.worker_source = source
+        self.worker_event.set()
+
+    def _worker_loop(self, context=None):
+        if context is not None:
+            self.context = context
+        while self.running:
+            self.worker_event.wait(0.5)
+            if not self.running:
+                break
+            if not self.worker_event.is_set():
+                continue
+            self.worker_event.clear()
+            with self.worker_source_lock:
+                source = self.worker_source or "unknown"
+            try:
+                self._drain_requests(source)
+            except Exception as e:
+                self._log("normal bridge worker error source=%s error=%s" % (source, e))
+
+    def _drain_requests(self, source):
+        with self.dispatch_lock:
+            self._poll_sync_order_responses()
+            start = time.perf_counter()
+            count = 0
+            while self.running and count < self.pump_max_count:
+                if self.pump_max_ms > 0 and (time.perf_counter() - start) * 1000 >= self.pump_max_ms:
+                    break
+                try:
+                    item = self.request_queue.get_nowait()
+                except queue.Empty:
+                    break
+                msg, received_at, coalesce_key = self._queue_item_parts(item)
+                if coalesce_key:
+                    self._drain_coalesced_request(source, msg, received_at, coalesce_key)
+                else:
+                    self._drain_single_request(source, msg, received_at)
+                count += 1
+            return count
+
+    def _queue_item_parts(self, item):
+        try:
+            if len(item) == 3:
+                return item
+        except Exception:
+            pass
+        msg, received_at = item
+        return msg, received_at, None
+
+    def _drain_single_request(self, source, msg, received_at):
+        try:
+            if self.dispatch_on_qmt_thread and msg.get("action") == "xttrader.order_stock":
+                self._defer_sync_order_response(msg)
+                return
+            result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
+            self._send_response(msg, result)
+            self._log(
+                "normal bridge worker response source=%s action=%s id=%s total_ms=%.2f"
+                % (source, msg.get("action"), msg.get("id"), (time.time() - received_at) * 1000)
+            )
+        except Exception as e:
+            self._log(
+                "normal bridge worker request_error source=%s action=%s id=%s error=%s"
+                % (source, msg.get("action"), msg.get("id"), e)
+            )
+            self._send_error(msg, e)
+
+    def _defer_sync_order_response(self, msg):
+        # Keep the RPC open, but return control to QMT so it can process the
+        # submitted order and deliver callbacks on this same thread.
+        params = dict(msg.get("params") or {})
+        account = params.get("account") or {}
+        account_id = account.get("account_id") or params.get("account_id") or self.account_id
+        account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
+        remark = prepare_order_remark(params, msg.get("id", "tx_order"))
+        strategy = params.get("strategy_name", "")
+        try:
+            wait = max(0.0, float(params.get("find_order_wait", os.environ.get("CFQUANT_ORDER_ID_WAIT_SECONDS", 2.0)) or 0))
+        except (TypeError, ValueError):
+            wait = 2.0
+        record = self._register_pending_sync_order(
+            account_id, account_type, params.get("stock_code", params.get("code", "")), remark, strategy, None,
+        )
+        try:
+            result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False)
+            if self._is_failed_order_result(result.get("request_result")):
+                self._discard_pending_sync_order(record)
+                self._send_response(msg, result)
+                return
+            record.update({
+                "previous_order_id": result.get("previous_order_id"),
+                "response_msg": msg,
+                "response_result": result,
+                "lookup_params": dict(params, find_order_wait=0),
+                "deadline": time.monotonic() + wait,
+            })
+            self._log("sync order awaiting confirmation id=%s; QMT thread released" % msg.get("id"))
+        except Exception:
+            self._discard_pending_sync_order(record)
+            raise
+
+    def _poll_sync_order_responses(self):
+        with self.pending_sync_orders_lock:
+            pending = [item for item in self.pending_sync_orders if "response_msg" in item]
+        for record in pending:
+            try:
+                if (
+                    not record.get("callback_seen_at")
+                    and time.monotonic() < record["deadline"]
+                ):
+                    # Do not query the complete QMT order history until the
+                    # matching callback has indicated that the new row exists.
+                    continue
+                order_id = self._find_order_id(
+                    record["account_id"], record["account_type"], record["order_remark"],
+                    record["strategy_name"], record.get("previous_order_id"), record["lookup_params"], record,
+                )
+                if order_id is None and time.monotonic() < record["deadline"]:
+                    continue
+                result = dict(record["response_result"], order_id=order_id if order_id is not None else -1)
+                if order_id is not None:
+                    self._remember_order_request(record["account_id"], record["stock_code"],
+                                                 record["order_remark"], record["strategy_name"], order_id=order_id)
+                else:
+                    self._log("sync order confirmation timeout id=%s callback_sysid=%s lookup_error=%s; submission not retried"
+                              % (record["response_msg"].get("id"), record.get("callback_order_sysid", ""),
+                                 record.get("lookup_error", "")))
+                self._discard_pending_sync_order(record)
+                self._send_response(record["response_msg"], result)
+            except Exception as error:
+                self._discard_pending_sync_order(record)
+                self._send_error(record["response_msg"], error)
+
+    def _drain_coalesced_request(self, source, msg, received_at, coalesce_key):
+        try:
+            result = self._dispatch(msg.get("action"), msg.get("params") or {}, msg)
+            with self.coalesce_lock:
+                entry = self.coalesced_requests.pop(coalesce_key, None)
+                self.coalesce_dispatch_count += 1
+            waiters = entry.get("waiters", []) if entry else [(msg, received_at)]
+            for waiter_msg, _ in waiters:
+                self._send_response(waiter_msg, result)
+            self._log(
+                "normal bridge worker coalesced_response source=%s action=%s id=%s waiters=%s total_ms=%.2f"
+                % (source, msg.get("action"), msg.get("id"), len(waiters), (time.time() - received_at) * 1000)
+            )
+        except Exception as e:
+            with self.coalesce_lock:
+                entry = self.coalesced_requests.pop(coalesce_key, None)
+                self.coalesce_dispatch_count += 1
+            waiters = entry.get("waiters", []) if entry else [(msg, received_at)]
+            self._log(
+                "normal bridge worker coalesced_error source=%s action=%s id=%s waiters=%s error=%s"
+                % (source, msg.get("action"), msg.get("id"), len(waiters), e)
+            )
+            for waiter_msg, _ in waiters:
+                self._send_error(waiter_msg, e)
+
+    def _on_whole_quote(self, data):
+        self._release_worker("whole_quote")
+
+    def _on_timer(self, *args, **kwargs):
+        self.on_timer(*args, **kwargs)
+
+    def _subscribe_internal_whole_quote(self):
+        if self.context is None or self.whole_quote_sub_id:
+            return
+        try:
+            self.whole_quote_sub_id = self.context.subscribe_whole_quote(["SH", "SZ"], callback=self._on_whole_quote)
+            self._log("normal bridge internal whole quote subscribed id=%s" % self.whole_quote_sub_id)
+        except Exception as e:
+            self._log("normal bridge internal whole quote subscribe failed: %s" % e)
+
+    def _schedule_timer(self):
+        if self.context is None or self.schedule_key:
+            return
+        try:
+            first_time = dt.datetime.now() + dt.timedelta(seconds=1)
+            self.schedule_key = self.context.schedule_run(
+                self._on_timer,
+                first_time,
+                repeat_times=-1,
+                interval=dt.timedelta(milliseconds=500),
+                name="cfquant_normal_bridge_pump",
+            )
+            self._log("normal bridge timer scheduled key=%s" % self.schedule_key)
+        except Exception as e:
+            self._log("normal bridge timer schedule failed: %s" % e)
+
+    def _send_response(self, msg, result):
+        client_id = msg.get("client_id") or msg.get("reply_channel")
+        if not client_id:
+            return
+        response = pack_response(msg.get("id"), ok=True, result=result)
+        self.tx.push("response", response, client_id)
+
+    def _send_error(self, msg, error):
+        client_id = msg.get("client_id") or msg.get("reply_channel")
+        if not client_id:
+            return
+        self._log(
+            "normal bridge send_error action=%s id=%s client_id=%s error=%s"
+            % (msg.get("action"), msg.get("id"), client_id, error)
+        )
+        response = pack_response(msg.get("id"), ok=False, error=error)
+        self.tx.push("response", response, client_id)
+
+    def publish_callback_event(self, event_name, obj):
+        if self.tx is None:
+            return
+        force_order_error = isinstance(obj, dict) and obj.pop("_cfquant_force_order_error", False)
+        reconciled_order_error = None
+        if event_name == "trader:on_stock_order":
+            data = self._format_trade_detail(obj, "order")
+            if not self._accept_order_callback(data):
+                return
+            reconciled_order_error = self._match_pending_order_error(data)
+        elif event_name == "trader:on_stock_trade":
+            data = self._format_trade_detail(obj, "deal")
+        else:
+            data = self._callback_object_to_dict(obj)
+        account_id = self._callback_account_id(obj, data)
+        account_type = self._callback_account_type(obj, data)
+        if not account_type and self.account_type:
+            account_type = order_meta.normalize_account_type(self.account_type)
+        if account_id:
+            data.setdefault("account_id", account_id)
+        if account_type:
+            data.setdefault("account_type", account_type)
+        if event_name == "trader:on_order_error":
+            self._enrich_qmt_order_error_fields(data)
+            if not force_order_error:
+                self._queue_pending_order_error(data)
+                return
+        if event_name in (
+            "trader:on_stock_order",
+            "trader:on_stock_trade",
+            "trader:on_order_error",
+            "trader:on_cancel_error",
+            "trader:on_order_stock_async_response",
+            "trader:on_cancel_order_stock_async_response",
+        ):
+            self._enrich_order_request_fields(data)
+        self._enrich_callback_order_meta(event_name, data, account_id, account_type)
+        restore_order_remark(data)
+        if event_name == "trader:on_stock_order":
+            # A synchronous passorder has no reliable return value.  Wake its
+            # resolver as soon as the matching QMT callback arrives; the
+            # resolver then reads the canonical id from the ORDER query.
+            self._resolve_pending_sync_order_callback(data)
+            relay_sync_order_callback(self.context, data)
+            self._handle_async_order_callback(data)
+            self._remember_order_callback_fields(data)
+        restore_strategy_name(data)
+        payload = {
+            "type": "event",
+            "event": event_name,
+            "account_id": account_id,
+            "account_type": account_type,
+            "bridge_id": self.bridge_id,
+            "source": "CFQUANT",
+            "ts": int(time.time() * 1000),
+            "data": data,
+        }
+        channel_duplicate = self._duplicate_asset_callback(
+            "channel",
+            event_name,
+            account_id,
+            account_type,
+            data,
+        )
+        if not channel_duplicate:
+            self.tx.push("event", json.dumps(payload, ensure_ascii=False), self.callback_event_channel)
+        sent_clients = 0
+        if account_id:
+            trader_event = event_name.replace("trader:", "", 1)
+            for client_id in self._client_ids_for_account(account_id, account_type=account_type or None):
+                client_duplicate = self._duplicate_asset_callback(
+                    "client:%s" % client_id,
+                    event_name,
+                    account_id,
+                    account_type,
+                    data,
+                )
+                if client_duplicate:
+                    continue
+                self._send_trader_event(client_id, trader_event, data)
+                sent_clients += 1
+        self._log(
+            "normal bridge callback event sent event=%s account=%s channel_sent=%s clients=%s duplicate=%s"
+            % (event_name, account_id or "-", not channel_duplicate, sent_clients, channel_duplicate and sent_clients == 0)
+        )
+        if reconciled_order_error is not None:
+            reconciled_order_error.update({
+                "order_id": data.get("order_id", -1),
+                "m_nOrderID": data.get("m_nOrderID", data.get("order_id", -1)),
+                "m_nRef": data.get("m_nRef", data.get("order_id", -1)),
+                "order_sysid": data.get("order_sysid", ""),
+                "stock_code": data.get("stock_code", reconciled_order_error.get("stock_code", "")),
+                "_cfquant_force_order_error": True,
+            })
+            self.publish_callback_event("trader:on_order_error", reconciled_order_error)
+
+    def _queue_pending_order_error(self, data):
+        with self.pending_order_errors_lock:
+            self.pending_order_errors.append({"data": dict(data), "created_at": time.time()})
+
+    def _match_pending_order_error(self, order):
+        if not isinstance(order, dict):
+            return None
+        account = str(order.get("account_id") or "").strip()
+        code = str(order.get("stock_code") or "").upper().split(".", 1)[0]
+        strategy = str(order.get("strategy_name") or "")
+        remark = order_remark_key(order)
+        with self.pending_order_errors_lock:
+            for index, item in enumerate(self.pending_order_errors):
+                error = item.get("data") or {}
+                error_account = str(error.get("account_id") or "").strip()
+                error_code = str(error.get("stock_code") or "").upper().split(".", 1)[0]
+                if account and error_account and account != error_account:
+                    continue
+                if code and error_code and code != error_code:
+                    continue
+                error_strategy = str(error.get("strategy_name") or error.get("strategyName") or "")
+                if error_strategy and strategy and error_strategy != strategy and not strategy.startswith(error_strategy + "&&&"):
+                    continue
+                error_remark = order_remark_key(error)
+                if error_remark and remark and error_remark != remark:
+                    continue
+                self.pending_order_errors.pop(index)
+                return error
+        return None
+
+    def _flush_pending_order_errors(self, force=False):
+        cutoff = time.time() - 0.5 if not force else time.time() + 1.0
+        expired = []
+        with self.pending_order_errors_lock:
+            keep = []
+            for item in self.pending_order_errors:
+                if item.get("created_at", 0) <= cutoff:
+                    expired.append(item.get("data") or {})
+                else:
+                    keep.append(item)
+            self.pending_order_errors = keep
+        for data in expired:
+            data["_cfquant_force_order_error"] = True
+            self.publish_callback_event("trader:on_order_error", data)
+
+    def _enrich_qmt_order_error_fields(self, data):
+        """Fill canonical fields that大QMT only embeds in ``errMsg``.
+
+        The QMT strategy callback is ``orderError_callback(orderArgs, errMsg)``
+        and does not expose the MiniQMT ``XtOrderError`` structure.  In
+        particular, counter errors commonly look like
+        ``[COUNTER] [251005][...][p_stock_code=518880,...]``.  Preserve any
+        native structured fields and only infer missing canonical values.
+        """
+        if not isinstance(data, dict):
+            return data
+        # orderError_callback supplies QMT orderArgs names rather than the
+        # MiniQMT callback names. Preserve and canonicalize them first.
+        if not data.get("account_id") and data.get("accountID"):
+            data["account_id"] = data["accountID"]
+        if not data.get("stock_code") and data.get("orderCode"):
+            code = str(data["orderCode"]).strip().upper()
+            if code.startswith(("SH", "SZ", "BJ")) and "." not in code:
+                code = "%s.%s" % (code[2:], code[:2])
+            data["stock_code"] = code
+        if not data.get("strategy_name") and data.get("strategyName"):
+            data["strategy_name"] = data["strategyName"]
+        message = data.get("error_msg") or data.get("m_strErrorMsg") or data.get("message") or data.get("msg")
+        if not message:
+            return data
+        message = str(message)
+        if data.get("error_id") in (None, "", 0, "0") and data.get("m_nErrorID") in (None, "", 0, "0") and data.get("error_code") in (None, "", 0, "0"):
+            for token in re.findall(r"\[(\d+)\]", message):
+                try:
+                    error_id = int(token)
+                except (TypeError, ValueError):
+                    continue
+                if error_id:
+                    data["error_id"] = error_id
+                    break
+        if not data.get("stock_code"):
+            match = re.search(r"(?:^|[\[,;\s])p_stock_code\s*=\s*([A-Za-z0-9_.-]+)", message, re.IGNORECASE)
+            if match:
+                data["stock_code"] = match.group(1)
+        internal_strategy = data.get("strategy_name") or data.get("strategyName")
+        context = self._consume_order_error_context(
+            data.get("account_id") or data.get("accountID"),
+            data.get("stock_code") or data.get("orderCode"),
+            internal_strategy,
+        ) if internal_strategy else None
+        if context:
+            data["strategy_name"] = context.get("strategy_name", "")
+            data["m_strStrategyName"] = context.get("strategy_name", "")
+            data["strategyName"] = context.get("strategy_name", "")
+            data["order_remark"] = context.get("order_remark", "")
+            data["m_strRemark"] = context.get("order_remark", "")
+            data["cfquant_order_error_context_consumed"] = True
+        return data
+
+    def _accept_order_callback(self, data):
+        """Filter a stale partial-fill update emitted after a filled update."""
+        try:
+            status = int(data.get("order_status"))
+        except (TypeError, ValueError):
+            return True
+        partial = 55
+        succeeded = 56
+        if status not in (partial, succeeded):
+            return True
+        order_id = ""
+        for name in ("order_sysid", "order_id", "m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID"):
+            value = data.get(name)
+            if value not in (None, ""):
+                order_id = str(value).strip()
+                if order_id:
+                    break
+        if not order_id:
+            return True
+        key = (str(data.get("account_id") or ""), order_id)
+        with self.order_terminal_statuses_lock:
+            if status == partial and self.order_terminal_statuses.get(key) == succeeded:
+                self._log("drop stale partial order callback account=%s order=%s" % key)
+                return False
+            if status == succeeded:
+                self.order_terminal_statuses[key] = succeeded
+                if len(self.order_terminal_statuses) > 4096:
+                    self.order_terminal_statuses.pop(next(iter(self.order_terminal_statuses)))
+        return True
+
+    def _duplicate_asset_callback(self, scope, event_name, account_id, account_type, data):
+        if event_name != "trader:on_stock_asset" or not account_id:
+            return False
+        fingerprint = self._asset_callback_fingerprint(data)
+        key = (
+            str(scope or ""),
+            str(self.bridge_id or ""),
+            str(account_type or ""),
+            str(account_id or ""),
+            event_name,
+        )
+        with self.callback_asset_dedupe_lock:
+            if self.callback_asset_fingerprints.get(key) == fingerprint:
+                return True
+            self.callback_asset_fingerprints[key] = fingerprint
+            while len(self.callback_asset_fingerprints) > self.callback_asset_dedupe_max:
+                self.callback_asset_fingerprints.pop(next(iter(self.callback_asset_fingerprints)))
+        return False
+
+    def _asset_callback_fingerprint(self, data):
+        try:
+            payload = json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
+        except Exception:
+            payload = repr(sorted((str(key), repr(value)) for key, value in (data or {}).items()))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _callback_object_to_dict(self, obj):
+        fields = [
+            "account_id",
+            "accountID",
+            "account_type",
+            "m_strAccountID",
+            "m_strAccountId",
+            "m_strAccount",
+            "m_accountID",
+            "m_nAccountType",
+            "m_strAccountType",
+            "fund_account",
+            "m_strFundAccount",
+            "order_source",
+            "source",
+            "stock_code",
+            "orderCode",
+            "code",
+            "market",
+            "exchange_id",
+            "m_strMarket",
+            "m_strStockCode",
+            "order_id",
+            "order_ref",
+            "order_sysid",
+            "order_type",
+            "order_volume",
+            "price",
+            "price_type",
+            "user_order_id",
+            "client_order_id",
+            "order_remark",
+            "remark",
+            "strategy_name",
+            "strategyName",
+            "modelPrice",
+            "modelVolume",
+            "opType",
+            "orderType",
+            "prType",
+            "trade_id",
+            "deal_id",
+            "trade_time",
+            "deal_time",
+            "trade_amount",
+            "traded_amount",
+            "volume",
+            "traded_volume",
+            "traded_price",
+            "commission",
+            "seq",
+            "request_id",
+            "result",
+            "cancel_result",
+            "success",
+            "apply_id",
+            "available",
+            "cash",
+            "frozen",
+            "frozen_cash",
+            "frozen_balance",
+            "balance",
+            "total_asset",
+            "fetch_balance",
+            "market_value",
+            "position_profit",
+            "open_price",
+            "position_cost",
+            "avg_price",
+            "can_use_volume",
+            "frozen_volume",
+            "on_road_volume",
+            "yesterday_volume",
+            "last_price",
+            "profit_rate",
+            "stock_holder",
+            "secu_account",
+            "branch_id",
+            "branch_name",
+            "error_id",
+            "error_code",
+            "error_msg",
+            "message",
+            "msg",
+            "error",
+            "m_strStatus",
+            "m_strInstrumentID",
+            "m_strExchangeID",
+            "m_strMarket",
+            "m_strStockCode",
+            "m_nMarket",
+            "m_strInstrumentName",
+            "m_nOrderType",
+            "m_nBusinessType",
+            "m_nDirection",
+            "m_nOffsetFlag",
+            "m_nVolumeTotalOriginal",
+            "m_nVolumeTraded",
+            "m_nTradedVolume",
+            "m_nVolume",
+            "m_nPosition",
+            "m_nCanUseVolume",
+            "m_nAvailableVolume",
+            "m_nFrozenVolume",
+            "m_nFreezeVolume",
+            "m_nOnRoadVolume",
+            "m_nUncomeVolume",
+            "m_nYesterdayVolume",
+            "m_nYdPosition",
+            "m_nPriceType",
+            "m_nOrderPriceType",
+            "m_dLimitPrice",
+            "m_dOrderPrice",
+            "m_dPrice",
+            "m_dTradedPrice",
+            "m_dTradeAmount",
+            "m_dCommission",
+            "m_dComssion",
+            "m_dBalance",
+            "m_dAssureAsset",
+            "m_dEnableBalance",
+            "m_dFrozenCash",
+            "m_dFrozenBalance",
+            "m_dInstrumentValue",
+            "m_dMarketValue",
+            "m_dStockValue",
+            "m_dFetchBalance",
+            "m_dTotalDebit",
+            "m_dAvailable",
+            "m_dPositionProfit",
+            "m_dLastPrice",
+            "m_dProfitRate",
+            "m_dOpenPrice",
+            "m_dPositionCost",
+            "m_dAvgPrice",
+            "m_dAveragePrice",
+            "m_strRemark",
+            "m_strOrderRemark",
+            "m_strStrategyName",
+            "m_strTradeID",
+            "m_strDealID",
+            "m_nTradeID",
+            "m_nDealID",
+            "m_strTradeTime",
+            "m_strDealTime",
+            "m_nTradeTime",
+            "m_nDealTime",
+            "m_strTradeDate",
+            "m_strDealDate",
+            "m_strOrderSysID",
+            "m_strOrderID",
+            "m_nOrderID",
+            "m_strOrderRef",
+            "m_nRef",
+            "m_nOrderStatus",
+            "m_strOrderStatus",
+            "m_nOrderState",
+            "m_strStatusMsg",
+            "m_nErrorID",
+            "m_strErrorMsg",
+            "m_strCancelInfo",
+            "m_strMsg",
+            "m_strError",
+            "m_nSeq",
+            "m_nCancelResult",
+            "m_bSuccess",
+            "m_strApplyID",
+            "m_strApplyId",
+            "m_strStockHolder",
+            "m_strShareholderID",
+            "m_strShareHolder",
+            "m_strSecuAccount",
+            "m_strSecurityAccount",
+            "m_strStockAccount",
+            "m_strBranchID",
+            "m_nBranchID",
+            "m_strBranch",
+            "m_nBranch",
+            "m_strBranchName",
+            "m_strOrderTime",
+            "m_strEntrustTime",
+            "m_strInsertTime",
+            "m_nOrderTime",
+            "m_nEntrustTime",
+            "m_nInsertTime",
+            "m_strOrderDate",
+            "m_strEntrustDate",
+            "m_strTradingDay",
+        ]
+        data = {}
+        for field in fields:
+            value = self._get_value(obj, field)
+            if value is not None:
+                data[field] = value
+        code = data.get("m_strInstrumentID") or data.get("m_strStockCode") or data.get("code")
+        market = (
+            data.get("m_strExchangeID")
+            or data.get("m_strMarket")
+            or data.get("market")
+            or data.get("exchange_id")
+            or data.get("m_nMarket")
+        )
+        if code and market:
+            data["stock_code"] = "%s.%s" % (code, self._market_suffix(market))
+        source_text = " ".join(str(item or "") for item in (
+            data.get("order_source"),
+            data.get("source"),
+            data.get("order_remark"),
+            data.get("remark"),
+            data.get("strategy_name"),
+            data.get("m_strRemark"),
+            data.get("m_strOrderRemark"),
+            data.get("m_strStrategyName"),
+        )).strip().lower()
+        data["order_source"] = "cfquant" if "cfquant" in source_text else "other"
+        return data
+
+    def _market_suffix(self, value):
+        text = str(value or "").strip().upper()
+        aliases = {
+            "0": "SH",
+            "SH": "SH",
+            "SSE": "SH",
+            "SHSE": "SH",
+            "1": "SZ",
+            "SZ": "SZ",
+            "SZSE": "SZ",
+            "70": "BJ",
+            "BJ": "BJ",
+            "BSE": "BJ",
+            "3": "SF",
+            "SF": "SF",
+            "SHFE": "SF",
+            "SHF": "SF",
+            "4": "DF",
+            "DF": "DF",
+            "DCE": "DF",
+            "DLCE": "DF",
+            "5": "ZF",
+            "ZF": "ZF",
+            "CZCE": "ZF",
+            "ZCE": "ZF",
+            "2": "IF",
+            "IF": "IF",
+            "CFFEX": "IF",
+            "CFX": "IF",
+            "6": "INE",
+            "INE": "INE",
+            "75": "GF",
+            "GF": "GF",
+            "GFEX": "GF",
+            "7": "SHO",
+            "SHO": "SHO",
+            "SSEOPTION": "SHO",
+            "SSE_OPTION": "SHO",
+            "67": "SZO",
+            "SZO": "SZO",
+            "SZSEOPTION": "SZO",
+            "SZSE_OPTION": "SZO",
+        }
+        return aliases.get(text, text)
+
+    def _callback_account_id(self, obj, data):
+        for key in ("account_id", "m_strAccountID", "m_strAccountId", "m_strAccount", "m_accountID"):
+            value = data.get(key)
+            if value:
+                return str(value).strip()
+        for name in ("account_id", "m_strAccountID", "m_strAccountId", "m_strAccount", "m_accountID"):
+            value = self._get_value(obj, name)
+            if value:
+                return str(value).strip()
+        return str(self.account_id or "").strip()
+
+    def _callback_account_type(self, obj, data):
+        candidates = [
+            data.get("account_type") if isinstance(data, dict) else None,
+            data.get("m_nAccountType") if isinstance(data, dict) else None,
+            data.get("m_strAccountType") if isinstance(data, dict) else None,
+            data.get("m_nBrokerType") if isinstance(data, dict) else None,
+            self._get_value(obj, "account_type"),
+            self._get_value(obj, "m_nAccountType"),
+            self._get_value(obj, "m_strAccountType"),
+            self._get_value(obj, "m_nBrokerType"),
+        ]
+        for value in candidates:
+            if value in (None, ""):
+                continue
+            text = connect_account_type(value)
+            if text in ("2", "SECURITY", "SECURITY_ACCOUNT", "STOCK_ACCOUNT"):
+                return "STOCK"
+            if text in ("3", "CREDIT_ACCOUNT", "MARGIN"):
+                return "CREDIT"
+            if text in ("1", "FUTURE_ACCOUNT"):
+                return "FUTURE"
+            if text in ("5", "FUTURE_OPTION_ACCOUNT"):
+                return "FUTURE_OPTION"
+            if text in ("6", "STOCK_OPTION_ACCOUNT", "OPTION"):
+                return "STOCK_OPTION"
+            return text
+        return ""
+
+    def _status_extra(self):
+        with self.coalesce_lock:
+            coalesced_waiters = sum(len(item.get("waiters", [])) for item in self.coalesced_requests.values())
+            coalesced_group_count = len(self.coalesced_requests)
+        return {
+            "request_queue_size": self.request_queue.qsize(),
+            "recv_thread_alive": self.recv_thread.is_alive() if self.recv_thread else False,
+            "worker_thread_alive": self.worker_thread.is_alive() if self.worker_thread else False,
+            "whole_quote_sub_id": self.whole_quote_sub_id,
+            "schedule_key": self.schedule_key,
+            "quote_subscription_count": len(self.quote_subscriptions),
+            "whole_quote_publish_enabled": self.whole_quote_publish_enabled,
+            "whole_quote_publish_sub_id": self.whole_quote_publish_sub_id,
+            "schedule_timer": self.schedule_timer,
+            "pump_max_count": self.pump_max_count,
+            "pump_max_ms": self.pump_max_ms,
+            "dispatch_on_qmt_thread": self.dispatch_on_qmt_thread,
+            "dispatch_thread": (
+                "qmt_timer_or_handlebar"
+                if self.dispatch_on_qmt_thread and self.schedule_timer
+                else "qmt_caller_thread"
+                if self.dispatch_on_qmt_thread
+                else "worker"
+            ),
+            "coalesced_group_count": coalesced_group_count,
+            "coalesced_waiter_count": coalesced_waiters,
+            "coalesce_join_count": self.coalesce_join_count,
+            "coalesce_dispatch_count": self.coalesce_dispatch_count,
+        }
+
+
+def start_normal_bridge(
+    context,
+    ip="127.0.0.1",
+    port=2049,
+    token="LTtx",
+    request_channel="cfquant.request",
+    callback_event_channel="cfquant.callback.event",
+    bridge_id="default",
+    account_id="",
+    show=True,
+    schedule_timer=True,
+    pump_max_count=20,
+    pump_max_ms=0,
+    dispatch_on_qmt_thread=False,
+):
+    import sys
+
+    try:
+        globals_dict = sys._getframe(1).f_globals
+    except Exception:
+        globals_dict = {}
+    return NormalQmtBridge(
+        context,
+        ip=ip,
+        port=port,
+        token=token,
+        request_channel=request_channel,
+        callback_event_channel=callback_event_channel,
+        bridge_id=bridge_id,
+        account_id=account_id,
+        show=show,
+        globals_dict=globals_dict,
+        schedule_timer=schedule_timer,
+        pump_max_count=pump_max_count,
+        pump_max_ms=pump_max_ms,
+        dispatch_on_qmt_thread=dispatch_on_qmt_thread,
+    ).start()

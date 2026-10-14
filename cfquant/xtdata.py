@@ -1,0 +1,621 @@
+# -*- coding: utf-8 -*-
+import datetime
+import time
+
+from .client import configure, get_client
+from .level2 import l2_array
+from .protocol import new_id
+
+
+_subscription_callbacks = {}
+
+
+def get_market_data(
+    field_list=[],
+    stock_list=[],
+    period="1d",
+    start_time="",
+    end_time="",
+    count=-1,
+    dividend_type="none",
+    fill_data=True,
+):
+    return get_client().request("xtdata.get_market_data", {
+        "field_list": field_list,
+        "stock_list": stock_list,
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "count": count,
+        "dividend_type": dividend_type,
+        "fill_data": fill_data,
+    })
+
+
+def get_market_data_ex(
+    field_list=[],
+    stock_list=[],
+    period="1d",
+    start_time="",
+    end_time="",
+    count=-1,
+    dividend_type="none",
+    fill_data=True,
+):
+    return get_client().request("xtdata.get_market_data_ex", {
+        "field_list": field_list,
+        "stock_list": stock_list,
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "count": count,
+        "dividend_type": dividend_type,
+        "fill_data": fill_data,
+    })
+
+
+def get_full_tick(code_list):
+    return get_client().request("xtdata.get_full_tick", {
+        "code_list": code_list,
+    })
+
+
+def get_local_data(
+    field_list=[],
+    stock_list=[],
+    period="1d",
+    start_time="",
+    end_time="",
+    count=-1,
+    dividend_type="none",
+    fill_data=True,
+    data_dir=None,
+    stock_code="",
+    divid_type=None,
+):
+    return get_client().request("xtdata.get_local_data", {
+        "field_list": field_list,
+        "stock_list": stock_list,
+        "stock_code": stock_code,
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "count": count,
+        "dividend_type": dividend_type,
+        "divid_type": divid_type if divid_type is not None else dividend_type,
+        "fill_data": fill_data,
+        "data_dir": data_dir,
+    })
+
+
+def subscribe_quote(stock_code, period="1d", start_time="", end_time="", count=0, callback=None):
+    return _subscribe_quote_request("xtdata.subscribe_quote", {
+        "stock_code": stock_code,
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "count": count,
+    }, callback)
+
+
+def subscribe_whole_quote(code_list, callback=None):
+    return _subscribe_quote_request("xtdata.subscribe_whole_quote", {
+        "code_list": code_list,
+    }, callback)
+
+
+def subscribe_quote2(stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):
+    return _subscribe_quote_request("xtdata.subscribe_quote", {
+        "stock_code": stock_code,
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "count": count,
+        "dividend_type": dividend_type,
+    }, callback)
+
+
+def _subscribe_quote_request(action, params, callback):
+    if callback is not None and not callable(callback):
+        raise TypeError("callback must be callable")
+    client = get_client()
+    event_name = "quote:%s" % new_id("subscription") if callback is not None else None
+    if event_name:
+        params["callback_event"] = event_name
+        client.add_callback(event_name, callback)
+    try:
+        result = client.request(action, params)
+        subscribe_id = result.get("subscribe_id") if isinstance(result, dict) else result
+        if subscribe_id is None or isinstance(subscribe_id, bool) or int(subscribe_id) <= 0:
+            raise RuntimeError("%s failed: invalid subscription ID %r" % (action, subscribe_id))
+    except Exception:
+        if event_name:
+            client.remove_callback(event_name, callback)
+        raise
+    if event_name:
+        # Older bridges name events by ID, so retain their callback contract as well.
+        actual_event = result.get("callback_event") if isinstance(result, dict) else None
+        if actual_event != event_name:
+            client.remove_callback(event_name, callback)
+            event_name = "quote:%s" % subscribe_id
+            client.add_callback(event_name, callback)
+        _subscription_callbacks[subscribe_id] = (event_name, callback)
+    return subscribe_id
+
+
+def unsubscribe_quote(seq):
+    result = get_client().request("xtdata.unsubscribe_quote", {"subscribe_id": seq})
+    if result is False or (isinstance(result, (int, float)) and result < 0):
+        return result
+    item = _subscription_callbacks.pop(seq, None)
+    if item:
+        event_name, callback = item
+        get_client().remove_callback(event_name, callback)
+    return result
+
+
+def get_l2_quote(field_list=[], stock_code="", start_time="", end_time="", count=-1):
+    return _get_l2_data("get_l2_quote", field_list, stock_code, start_time, end_time, count)
+
+
+def get_l2_order(field_list=[], stock_code="", start_time="", end_time="", count=-1):
+    return _get_l2_data("get_l2_order", field_list, stock_code, start_time, end_time, count)
+
+
+def get_l2_transaction(field_list=[], stock_code="", start_time="", end_time="", count=-1):
+    return _get_l2_data("get_l2_transaction", field_list, stock_code, start_time, end_time, count)
+
+
+def _get_l2_data(method, fields, code, start, end, count):
+    result = get_client().request("xtdata." + method, {
+        "field_list": fields, "stock_code": code,
+        "start_time": start, "end_time": end, "count": count,
+    })
+    return l2_array(result)
+
+
+def subscribe_l2thousand(stock_code, gear_num=None, callback=None):
+    return _subscribe_quote_request("xtdata.subscribe_l2thousand", {
+        "stock_code": stock_code, "gear_num": gear_num,
+    }, callback)
+
+
+def subscribe_l2thousand_queue(stock_code, callback=None, gear_num=None, price=None):
+    if gear_num is not None and price is not None:
+        raise ValueError("gear_num and price cannot both be specified")
+    return _subscribe_quote_request("xtdata.subscribe_l2thousand_queue", {
+        "stock_code": stock_code, "gear_num": gear_num,
+        "price": price, "price_is_range": isinstance(price, tuple),
+    }, callback)
+
+
+def get_l2thousand_queue(stock_code, gear_num=None, price=None):
+    return get_client().request("xtdata.get_l2thousand_queue", {
+        "stock_code": stock_code, "gear_num": gear_num,
+        "price": price, "price_is_range": isinstance(price, tuple),
+    })
+
+
+def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None, callback=None):
+    if callback:
+        return download_history_data2([stock_code], period, start_time, end_time, callback=callback, incrementally=incrementally)
+    return get_client().request("xtdata.download_history_data", {
+        "stock_code": stock_code,
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "incrementally": incrementally,
+    })
+
+
+def download_history_data2(
+    stock_list,
+    period,
+    start_time="",
+    end_time="",
+    callback=None,
+    incrementally=None,
+    job_id=None,
+    keep_callback=False,
+):
+    event_name = None
+    if callback:
+        event_name = "download_history:%s:%s" % (period, int(time.time() * 1000))
+        get_client().add_callback(event_name, callback)
+    try:
+        return get_client().request("xtdata.download_history_data2", {
+            "stock_list": stock_list,
+            "period": period,
+            "start_time": start_time,
+            "end_time": end_time,
+            "incrementally": incrementally,
+            "callback_event": event_name,
+            "download_job_id": job_id,
+            "download_emit_lifecycle": bool(event_name),
+        })
+    finally:
+        if event_name and callback and not keep_callback:
+            get_client().remove_callback(event_name, callback)
+
+
+def get_instrument_detail(stock_code, iscomplete=False):
+    return get_client().request("xtdata.get_instrument_detail", {
+        "stock_code": stock_code,
+        "iscomplete": iscomplete,
+    })
+
+
+def get_stock_list_in_sector(sector_name, real_timetag=-1):
+    return get_client().request("xtdata.get_stock_list_in_sector", {
+        "sector_name": sector_name,
+        "real_timetag": real_timetag,
+    })
+
+
+def get_cb_info(stockcode):
+    """Return available CB fields; cfquant_partial marks the two-field QMT source."""
+    return get_client().request("xtdata.get_cb_info", {"args": [stockcode], "stock_code": stockcode})
+
+
+def get_divid_factors(stock_code, start_time="", end_time=""):
+    import pandas as pd
+
+    start = _divid_time_bound(start_time)
+    end = _divid_time_bound(end_time, end=True)
+    if start is not None and end is not None and start > end:
+        raise ValueError("start_time must not be after end_time")
+    data = get_client().request("xtdata.get_divid_factors", {"args": [stock_code], "stock_code": stock_code})
+    factor_columns = ["interest", "stockBonus", "stockGift", "allotNum", "allotPrice", "gugai", "dr"]
+    columns = ["time"] + factor_columns
+    if not isinstance(data, dict):
+        raise ValueError("QMT get_divid_factors must return a timestamp dictionary")
+    records = []
+    for timestamp, values in data.items():
+        # QMT builds have returned this key as milliseconds, Unix seconds, or
+        # an eight-digit exchange date. Normalize all forms to milliseconds.
+        raw_timestamp = timestamp
+        if isinstance(values, dict) and values.get("time") is not None:
+            raw_timestamp = values["time"]
+        timestamp = _normalize_divid_timestamp(raw_timestamp)
+        if (start is not None and timestamp < start) or (end is not None and timestamp > end):
+            continue
+        if isinstance(values, dict):
+            if any(column not in values for column in factor_columns):
+                raise ValueError("QMT dividend record is missing required fields")
+            values = [values[column] for column in factor_columns]
+        if not isinstance(values, (list, tuple)) or len(values) != len(factor_columns):
+            raise ValueError("QMT dividend record must contain seven factor values")
+        records.append((timestamp, [float(timestamp)] + list(values)))
+    records.sort(key=lambda item: item[0])
+    return pd.DataFrame(
+        [item[1] for item in records],
+        # xtquant uses the exchange date (YYYYMMDD) as the index and keeps the
+        # millisecond event timestamp in its explicit ``time`` column.
+        index=pd.Index([
+            datetime.datetime.fromtimestamp(item[0] / 1000, datetime.timezone.utc)
+            .astimezone(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y%m%d")
+            for item in records
+        ], dtype="object"),
+        columns=columns,
+    )
+
+
+def _divid_time_bound(value, end=False):
+    if value == "":
+        return None
+    if not isinstance(value, str) or len(value) not in (8, 14) or not value.isdigit():
+        raise ValueError("dividend time must be YYYYMMDD or YYYYMMDDhhmmss")
+    parsed = datetime.datetime.strptime(value, "%Y%m%d" if len(value) == 8 else "%Y%m%d%H%M%S")
+    # QMT timestamps are milliseconds; use exchange time, not the SDK host's timezone.
+    parsed = parsed.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+    result = int(parsed.timestamp() * 1000)
+    if end:
+        result += (86400000 if len(value) == 8 else 1000) - 1
+    return result
+
+
+def _normalize_divid_timestamp(value):
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("QMT dividend timestamp is invalid")
+    if 19000101 <= number <= 29991231:
+        parsed = datetime.datetime.strptime(str(number), "%Y%m%d").replace(
+            tzinfo=datetime.timezone(datetime.timedelta(hours=8))
+        )
+        return int(parsed.timestamp() * 1000)
+    if 0 < number < 100000000000:
+        return number * 1000
+    if number <= 0:
+        raise ValueError("QMT dividend timestamp is invalid")
+    return number
+
+
+def get_sector_list():
+    return _generic_xtdata_request("get_sector_list")
+
+
+def create_sector_folder(parent_node, folder_name, overwrite=True):
+    return _generic_xtdata_request("create_sector_folder", parent_node, folder_name, overwrite)
+
+
+def create_sector(parent_node, sector_name, overwrite=True):
+    return _generic_xtdata_request("create_sector", parent_node, sector_name, overwrite)
+
+
+def reset_sector(sector_name, stock_list):
+    return _generic_xtdata_request("reset_sector", sector_name, stock_list)
+
+
+def remove_stock_from_sector(sector_name, stock_list):
+    return _generic_xtdata_request("remove_stock_from_sector", sector_name, stock_list)
+
+
+def call_formula_batch(formula_names, stock_codes, period, start_time="", end_time="",
+                       count=-1, dividend_type="none", extend_params=None):
+    return get_client().request("xtdata.call_formula_batch", {
+        "args": [formula_names, stock_codes, period, start_time, end_time, count,
+                 dividend_type, [] if extend_params is None else extend_params],
+        "stock_codes": stock_codes,
+    })
+
+
+def get_financial_data(field_list, stock_list, start_time="", end_time="", report_type="announce_time"):
+    return get_client().request("xtdata.get_financial_data", {
+        "field_list": field_list,
+        "stock_list": stock_list,
+        "start_time": start_time,
+        "end_time": end_time,
+        "report_type": report_type,
+    })
+
+
+def get_financial_data_ori(field_list, stock_list, start_time="", end_time="", report_type="announce_time"):
+    return get_client().request("xtdata.get_financial_data_ori", {
+        "field_list": field_list,
+        "stock_list": stock_list,
+        "start_time": start_time,
+        "end_time": end_time,
+        "report_type": report_type,
+    })
+
+
+def get_raw_financial_data(field_list, stock_list, start_time="", end_time="", report_type="announce_time"):
+    return get_financial_data_ori(field_list, stock_list, start_time, end_time, report_type)
+
+
+def download_financial_data(stock_list, table_list=None, start_time="", end_time="", callback=None, job_id=None, keep_callback=False):
+    event_name = None
+    if callback:
+        event_name = "download_financial:%s" % int(time.time() * 1000)
+        get_client().add_callback(event_name, callback)
+    try:
+        return get_client().request("xtdata.download_financial_data", {
+            "stock_list": stock_list,
+            "table_list": table_list or [],
+            "start_time": start_time,
+            "end_time": end_time,
+            "callback_event": event_name,
+            "download_job_id": job_id,
+            "download_emit_lifecycle": bool(event_name),
+        })
+    finally:
+        if event_name and callback and not keep_callback:
+            get_client().remove_callback(event_name, callback)
+
+
+def download_financial_data2(stock_list, table_list=None, start_time="", end_time="", callback=None, job_id=None, keep_callback=False):
+    return download_financial_data(stock_list, table_list, start_time, end_time, callback, job_id, keep_callback)
+
+
+def get_trading_dates(market, start_time="", end_time="", count=-1):
+    """Return SH/SZ/BJ/HK session dates as UTC+8 midnight milliseconds.
+
+    Uses pandas_market_calendars locally; no QMT connection is required.
+    count=-1 returns all dates in range, count>0 the last N, count=0 none.
+    Dates stop at today. History starts in 1991 (BJ: 2021-11-15).
+    """
+    from .trading_calendar import get_trading_dates as calendar_dates
+
+    return calendar_dates(market, start_time, end_time, count)
+
+
+def is_stock(stock_code):
+    return _stock_basic_request("is_stock", stock_code)
+
+
+def is_fund(stock_code):
+    return _stock_basic_request("is_fund", stock_code)
+
+
+def is_future(stock_code):
+    return _stock_basic_request("is_future", stock_code)
+
+
+def get_stock_type(stock_code):
+    return _stock_basic_request("get_stock_type", stock_code)
+
+
+def get_stock_name(stock_code):
+    return _stock_basic_request("get_stock_name", stock_code)
+
+
+def get_open_date(stock_code):
+    return _stock_basic_request("get_open_date", stock_code)
+
+
+def get_contract_expire_date(stock_code):
+    return _stock_basic_request("get_contract_expire_date", stock_code)
+
+
+def get_contract_multiplier(stock_code):
+    return _stock_basic_request("get_contract_multiplier", stock_code)
+
+
+def get_weight_in_index(mtkindexcode, stockcode):
+    return get_client().request("xtdata.get_weight_in_index", {
+        "mtkindexcode": mtkindexcode,
+        "stockcode": stockcode,
+    })
+
+
+def get_turnover_rate(stock_code, start_time="", end_time=""):
+    return get_client().request("xtdata.get_turnover_rate", {
+        "stock_code": stock_code,
+        "start_time": start_time,
+        "end_time": end_time,
+    })
+
+
+def get_ETF_list(market="", stockcode="", typeList=None):
+    return get_client().request("xtdata.get_ETF_list", {
+        "market": market,
+        "stockcode": stockcode,
+        "typeList": typeList or [],
+    })
+
+
+def get_etf_list(market="", stockcode="", type_list=None):
+    return get_ETF_list(market, stockcode, type_list)
+
+
+def get_option_detail_data(stockcode):
+    return get_client().request("xtdata.get_option_detail_data", {
+        "stockcode": stockcode,
+    })
+
+
+def get_option_list(object, dedate, opttype="", isavailavle=False):
+    return get_client().request("xtdata.get_option_list", {
+        "object": object,
+        "dedate": dedate,
+        "opttype": opttype,
+        "isavailavle": isavailavle,
+    })
+
+
+def get_option_undl(opt_code):
+    return get_client().request("xtdata.get_option_undl", {
+        "opt_code": opt_code,
+    })
+
+
+def get_option_undl_data(undl_code_ref=""):
+    return get_client().request("xtdata.get_option_undl_data", {
+        "undl_code_ref": undl_code_ref,
+    })
+
+
+def get_his_st_data(stockCode):
+    return get_client().request("xtdata.get_his_st_data", {
+        "stockCode": stockCode,
+    })
+
+
+def get_his_index_data(stockCode):
+    return get_client().request("xtdata.get_his_index_data", {
+        "stockCode": stockCode,
+    })
+
+
+def get_factor_data(field_list, stock_list, start_date="", end_date=""):
+    return get_client().request("xtdata.get_factor_data", {
+        "field_list": field_list,
+        "stock_list": stock_list,
+        "start_date": start_date,
+        "end_date": end_date,
+    })
+
+
+def _callback_placeholder():
+    return {"__cfquant_callback_arg__": True}
+
+
+def _generic_xtdata_request(action, *args, **kwargs):
+    timeout = kwargs.pop("timeout", None)
+    keep_callback = bool(kwargs.pop("keep_callback", str(action).startswith("subscribe_")))
+    callback_name = str(kwargs.pop("callback_name", "callback") or "callback")
+    callback = kwargs.pop(callback_name, None)
+    callback_positions = []
+    wire_args = []
+    for index, value in enumerate(args):
+        if callable(value):
+            if callback is not None:
+                raise TypeError("only one callback can be passed to xtdata.%s" % action)
+            callback = value
+            callback_positions.append(index)
+            wire_args.append(_callback_placeholder())
+        else:
+            wire_args.append(value)
+    event_name = None
+    if callback is not None:
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        event_name = "xtdata:%s:%s" % (action, int(time.time() * 1000))
+        get_client().add_callback(event_name, callback)
+    try:
+        return get_client().request("xtdata.%s" % action, {
+            "args": wire_args,
+            "kwargs": kwargs,
+            "callback_event": event_name,
+            "callback_positions": callback_positions,
+            "callback_name": callback_name,
+        }, timeout=timeout)
+    finally:
+        if event_name and callback and not keep_callback:
+            get_client().remove_callback(event_name, callback)
+
+
+def _make_generic_xtdata_func(action):
+    def func(*args, **kwargs):
+        return _generic_xtdata_request(action, *args, **kwargs)
+    func.__name__ = action
+    func.__qualname__ = action
+    func.__doc__ = (
+        "Conditional xtdata compatibility wrapper. "
+        "It forwards to the same-named QMT callable when the running QMT environment exposes it."
+    )
+    return func
+
+
+_CONDITIONAL_XTDATA_METHODS = [
+    "get_trading_calendar",
+    "get_trading_period",
+    "get_kline_trading_period",
+    "get_all_trading_periods",
+    "get_period_list",
+    "add_sector",
+    "remove_sector",
+    "create_formula",
+    "call_formula",
+    "subscribe_formula",
+    "unsubscribe_formula",
+    "get_formula_result",
+    "get_tabular_data",
+    "download_tabular_data",
+    "push_custom_data",
+    "download_sector_data",
+    "download_index_weight",
+    "download_history_contracts",
+    "download_holiday_data",
+    "download_etf_info",
+    "download_cb_data",
+    "download_his_st_data",
+    "download_metatable_data",
+]
+
+for _method in _CONDITIONAL_XTDATA_METHODS:
+    globals()[_method] = _make_generic_xtdata_func(_method)
+del _method
+
+
+def _stock_basic_request(action, stock_code):
+    return get_client().request("xtdata.%s" % action, {
+        "stock_code": stock_code,
+    })
+
+
+def run():
+    get_client().start()
+    while True:
+        time.sleep(1)

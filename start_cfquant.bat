@@ -1,0 +1,241 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+cd /d "%~dp0"
+
+rem Hidden automation callers can explicitly skip the final display delay.
+for %%A in (%*) do if /i "%%~A"=="--no-pause" set "CFQUANT_START_NO_PAUSE=1"
+echo [STEP] Start operation started. Please wait...
+
+set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONIOENCODING=utf-8"
+if not defined CFQUANT_START_WAIT_SECONDS set "CFQUANT_START_WAIT_SECONDS=90"
+set "LOG_DIR=%~dp0log"
+set "STARTUP_LOG_DIR=%LOG_DIR%\startup"
+set "WEB_LOG_DIR=%LOG_DIR%\web"
+set "START_LOG=%STARTUP_LOG_DIR%\cfquant_startup.log"
+
+if not exist "%STARTUP_LOG_DIR%" mkdir "%STARTUP_LOG_DIR%" >nul 2>nul
+if not exist "%WEB_LOG_DIR%" mkdir "%WEB_LOG_DIR%" >nul 2>nul
+set "WEB_LOG_RUN_ID="
+for /f "usebackq delims=" %%T in (`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Date -Format 'yyyyMMdd_HHmmss_ffff'"`) do set "WEB_LOG_RUN_ID=%%T"
+if not defined WEB_LOG_RUN_ID set "WEB_LOG_RUN_ID=%RANDOM%"
+set "WEB_LOG_RUN_ID=%WEB_LOG_RUN_ID%_%RANDOM%"
+set "WEB_STDOUT=%WEB_LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stdout.log"
+set "WEB_STDERR=%WEB_LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.stderr.log"
+set "CFQUANT_START_PID_FILE="
+call :log "start_cfquant.bat invoked"
+
+set "PYTHON_EXE=python"
+if defined CFQUANT_PYTHON_EXE if exist "%CFQUANT_PYTHON_EXE%" set "PYTHON_EXE=%CFQUANT_PYTHON_EXE%"
+if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
+set "CFQUANT_START_ROOT=%~dp0"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$root=$env:CFQUANT_START_ROOT; $files=@((Join-Path $root 'runtime\config\cfquant_web_config.json'), (Join-Path $root 'cfquant_web_config.json')); foreach ($f in $files) { if (Test-Path -LiteralPath $f) { try { $c=Get-Content -Raw -LiteralPath $f | ConvertFrom-Json; if ($c.python_executable) { Write-Output ([string]$c.python_executable) }; break } catch {} } }"`) do set "CFQUANT_CONFIG_PYTHON=%%P"
+if defined CFQUANT_CONFIG_PYTHON if exist "%CFQUANT_CONFIG_PYTHON%" set "PYTHON_EXE=%CFQUANT_CONFIG_PYTHON%"
+set "CFQUANT_CONFIG_PYTHON="
+rem If PATH does not contain Python (common with Anaconda/Miniconda), probe
+rem standard Conda installations before reporting that Python is unavailable.
+set "CFQUANT_START_ROOT=%~dp0"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$root=$env:CFQUANT_START_ROOT; $candidates=@(); if ($env:CONDA_PREFIX) {$candidates += (Join-Path $env:CONDA_PREFIX 'python.exe')}; $bases=@($env:USERPROFILE,$env:LOCALAPPDATA,$env:PROGRAMDATA); $names=@('anaconda3','miniconda3','mambaforge','miniforge3','Anaconda3','Miniconda3'); foreach ($base in $bases) { if ($base) { foreach ($name in $names) {$candidates += (Join-Path (Join-Path $base $name) 'python.exe')}}}; $envFiles=@((Join-Path $env:USERPROFILE '.conda\environments.txt'),(Join-Path $env:USERPROFILE 'anaconda3\conda-meta\history')); foreach ($file in $envFiles) {if (Test-Path -LiteralPath $file) {foreach ($line in (Get-Content -LiteralPath $file -ErrorAction SilentlyContinue)) {if ($line -and (Test-Path -LiteralPath $line -PathType Container)) {$candidates += (Join-Path $line 'python.exe')}}}}; $candidates += (Join-Path $root '.venv\Scripts\python.exe'); foreach ($candidate in ($candidates | Select-Object -Unique)) {if (Test-Path -LiteralPath $candidate -PathType Leaf) {Write-Output $candidate; break}}"`) do if exist "%%P" set "PYTHON_EXE=%%P"
+set "CFQUANT_START_ROOT="
+if defined CFQUANT_PYTHON_EXE if exist "%CFQUANT_PYTHON_EXE%" set "PYTHON_EXE=%CFQUANT_PYTHON_EXE%"
+call :log "selected python executable=%PYTHON_EXE%"
+if not exist "%~dp0cfquant_web_server.py" (
+    echo [ERROR] cfquant_web_server.py not found in "%~dp0".
+    call :log "cfquant_web_server.py not found"
+    call :show_logs
+    call :pause_on_error
+    endlocal
+    exit /b 1
+)
+
+"%PYTHON_EXE%" --version >>"%START_LOG%" 2>&1
+if errorlevel 1 (
+    echo [ERROR] Python is not available. Set python_executable in the Web setup or install Python/Conda.
+    echo [ERROR] Tried: "%PYTHON_EXE%"
+    call :log "python unavailable"
+    call :show_logs
+    call :pause_on_error
+    endlocal
+    exit /b 1
+)
+
+call :ensure_cfquant_package
+if errorlevel 1 (
+    echo [ERROR] cfquant package version check or installation failed.
+    call :show_logs
+    call :pause_on_error
+    endlocal
+    exit /b 1
+)
+
+set "WEB_PORT=8765"
+set "CFQUANT_START_ROOT=%~dp0"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$p=8765; $root=$env:CFQUANT_START_ROOT; $files=@((Join-Path $root 'runtime\config\cfquant_web_config.json'), (Join-Path $root 'cfquant_web_config.json')); foreach ($f in $files) { if (Test-Path -LiteralPath $f) { try { $c=Get-Content -Raw -LiteralPath $f | ConvertFrom-Json; if ($c.web_port) { $p=[int]$c.web_port } elseif ($c.web_server -and $c.web_server.port) { $p=[int]$c.web_server.port }; break } catch {} } }; Write-Output $p"`) do set "WEB_PORT=%%P"
+set "CFQUANT_START_ROOT="
+if not defined WEB_PORT set "WEB_PORT=8765"
+if defined CFQUANT_WEB_PORT set "WEB_PORT=%CFQUANT_WEB_PORT%"
+if defined CFQUANT_START_WEB_PORT set "WEB_PORT=%CFQUANT_START_WEB_PORT%"
+set "CFQUANT_WEB_PORT=%WEB_PORT%"
+if not defined CFQUANT_START_REUSE_WAIT_SECONDS set "CFQUANT_START_REUSE_WAIT_SECONDS=10"
+call :log "web stdout/stderr run logs stdout=%WEB_STDOUT% stderr=%WEB_STDERR%"
+
+if /i "%~1"=="--foreground" goto foreground
+if /i "%~1"=="--debug" goto foreground
+
+echo Starting cfquant web dashboard on port %WEB_PORT%...
+echo Logs:
+echo   %WEB_STDOUT%
+echo   %WEB_STDERR%
+echo The web server will start LTtx first, then start PipeHub when the saved mode needs it.
+call :log "starting web dashboard port=%WEB_PORT%"
+
+call :is_port_open %WEB_PORT%
+if not errorlevel 1 (
+    call :wait_for_cfquant_web %WEB_PORT% %CFQUANT_START_REUSE_WAIT_SECONDS%
+    if not errorlevel 1 (
+        echo cfquant web dashboard already runs on %WEB_PORT%, reuse it.
+        call :log "existing cfquant web reused port=%WEB_PORT%"
+        call :open_browser
+        call :pause_on_success
+        endlocal
+        exit /b 0
+    )
+    echo [ERROR] Port %WEB_PORT% is already used by another process, not cfquant.
+    echo [ERROR] Please stop that process or set CFQUANT_WEB_PORT to another port.
+    call :log "port occupied by non-cfquant process port=%WEB_PORT%"
+    call :show_port_owner
+    call :pause_on_error
+    endlocal
+    exit /b 1
+)
+
+rem Hide only the new service process, never the management console.
+set "CFQUANT_START_PID_FILE=%LOG_DIR%\cfquant_web_server.%WEB_LOG_RUN_ID%.pid"
+set "CFQUANT_START_ROOT=%~dp0"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $script=Join-Path $env:CFQUANT_START_ROOT 'cfquant_web_server.py'; $arguments=[char]34 + $script + [char]34 + ' --port ' + $env:WEB_PORT; $child=Start-Process -PassThru -FilePath $env:PYTHON_EXE -ArgumentList $arguments -WorkingDirectory $env:CFQUANT_START_ROOT -WindowStyle Hidden -RedirectStandardOutput $env:WEB_STDOUT -RedirectStandardError $env:WEB_STDERR -ErrorAction Stop; [IO.File]::WriteAllText($env:CFQUANT_START_PID_FILE, [string]$child.Id); exit 0 } catch { Write-Output ('[ERROR] Cannot launch web service: ' + $_.Exception.Message); exit 1 }"
+if errorlevel 1 (
+    call :show_logs
+    call :pause_on_error
+    endlocal
+    exit /b 1
+)
+echo [STEP] Waiting for the web health check...
+
+call :wait_for_cfquant_web %WEB_PORT% %CFQUANT_START_WAIT_SECONDS%
+if errorlevel 1 (
+    echo [ERROR] cfquant web dashboard exited before becoming ready or did not start within %CFQUANT_START_WAIT_SECONDS% seconds.
+    echo [ERROR] Please check the logs below.
+    call :log "web dashboard failed to become ready port=%WEB_PORT%"
+    call :show_logs
+    call :pause_on_error
+    endlocal
+    exit /b 1
+)
+
+call :open_browser
+call :pause_on_success
+endlocal
+exit /b 0
+
+:open_browser
+if not "%CFQUANT_START_NO_BROWSER%"=="1" start "" "http://127.0.0.1:%WEB_PORT%/"
+echo cfquant started. Open http://127.0.0.1:%WEB_PORT%/ if the browser did not open.
+call :log "start completed port=%WEB_PORT%"
+exit /b 0
+
+:foreground
+echo Starting cfquant web dashboard in foreground mode on port %WEB_PORT%...
+echo Press Ctrl+C to stop the service.
+echo.
+call :log "starting foreground web dashboard port=%WEB_PORT%"
+"%PYTHON_EXE%" "%~dp0cfquant_web_server.py" --port %WEB_PORT%
+set "WEB_EXIT_CODE=0"
+if errorlevel 1 set "WEB_EXIT_CODE=1"
+if not "%WEB_EXIT_CODE%"=="0" (
+    echo.
+    echo [ERROR] cfquant web dashboard exited with code %WEB_EXIT_CODE%.
+    call :log "foreground web dashboard exited code=%WEB_EXIT_CODE%"
+    call :show_logs
+    call :pause_on_error
+)
+if "%WEB_EXIT_CODE%"=="0" call :pause_on_success
+endlocal & exit /b %WEB_EXIT_CODE%
+
+:ensure_cfquant_package
+echo Comparing installed cfquant with the project package version...
+call :log "checking cfquant package python=%PYTHON_EXE%"
+set "CFQUANT_INSTALL_HELPER=%~dp0cfquant\_editable_install.py"
+if not exist "%CFQUANT_INSTALL_HELPER%" (
+    echo [ERROR] cfquant install helper was not found: "%CFQUANT_INSTALL_HELPER%"
+    call :log "cfquant install helper missing"
+    set "CFQUANT_INSTALL_HELPER="
+    exit /b 1
+)
+"%PYTHON_EXE%" "%CFQUANT_INSTALL_HELPER%" . >>"%START_LOG%" 2>&1
+if errorlevel 1 (
+    call :log "cfquant package check or installation failed"
+    set "CFQUANT_INSTALL_HELPER="
+    exit /b 1
+)
+echo cfquant package is ready.
+call :log "cfquant package ready"
+set "CFQUANT_INSTALL_HELPER="
+exit /b 0
+
+:is_port_open
+set "CFQUANT_START_PORT=%~1"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$port=[int]$env:CFQUANT_START_PORT; try { $client=[Net.Sockets.TcpClient]::new(); $iar=$client.BeginConnect('127.0.0.1',$port,$null,$null); if ($iar.AsyncWaitHandle.WaitOne(500,$false)) { $client.EndConnect($iar); $client.Close(); exit 0 }; $client.Close(); exit 1 } catch { exit 1 }"
+set "PORT_RESULT=0"
+if errorlevel 1 set "PORT_RESULT=1"
+set "CFQUANT_START_PORT="
+exit /b %PORT_RESULT%
+
+:wait_for_cfquant_web
+set "CFQUANT_START_PORT=%~1"
+set "CFQUANT_START_WAIT=%~2"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$port=[int]$env:CFQUANT_START_PORT; $wait=[int]$env:CFQUANT_START_WAIT; $deadline=(Get-Date).AddSeconds($wait); $url='http://127.0.0.1:' + $port + '/api/health'; while ((Get-Date) -lt $deadline) { if ($env:CFQUANT_START_PID_FILE -and (Test-Path -LiteralPath $env:CFQUANT_START_PID_FILE)) { $childId=[int]([IO.File]::ReadAllText($env:CFQUANT_START_PID_FILE)); if (-not (Get-Process -Id $childId -ErrorAction SilentlyContinue)) { Write-Output ('[ERROR] Web service exited before readiness (PID=' + $childId + ').'); exit 1 } }; try { $req=[Net.WebRequest]::Create($url); $req.Method='GET'; $req.Timeout=1000; $req.ReadWriteTimeout=1000; $req.UserAgent='cfquant-start'; $res=$req.GetResponse(); try { if ([int]$res.StatusCode -eq 200) { $reader=[IO.StreamReader]::new($res.GetResponseStream(), [Text.Encoding]::UTF8); $content=$reader.ReadToEnd(); $reader.Close(); $payload=$content | ConvertFrom-Json; if ($payload.ok -eq $true -and $payload.data.status -eq 'ok') { exit 0 } } } finally { $res.Close() } } catch {}; Start-Sleep -Milliseconds 500 }; exit 1"
+set "WAIT_RESULT=0"
+if errorlevel 1 set "WAIT_RESULT=1"
+if defined CFQUANT_START_PID_FILE del /q "%CFQUANT_START_PID_FILE%" >nul 2>nul
+set "CFQUANT_START_PORT="
+set "CFQUANT_START_WAIT="
+exit /b %WAIT_RESULT%
+
+:show_port_owner
+set "CFQUANT_START_PORT=%WEB_PORT%"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$port=[int]$env:CFQUANT_START_PORT; try { $rows=Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue; foreach ($row in $rows) { $pidValue=$row.OwningProcess; $name='unknown'; try { $name=(Get-Process -Id $pidValue -ErrorAction Stop).ProcessName } catch {}; Write-Output ('Port owner PID={0} Process={1}' -f $pidValue,$name) } } catch {}"
+set "CFQUANT_START_PORT="
+exit /b 0
+
+:show_logs
+echo.
+echo ===== startup log =====
+if exist "%START_LOG%" powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath $env:START_LOG -Tail 40 -ErrorAction SilentlyContinue"
+echo.
+echo ===== stderr log =====
+if exist "%WEB_STDERR%" powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath $env:WEB_STDERR -Tail 80 -ErrorAction SilentlyContinue"
+echo.
+exit /b 0
+
+:pause_on_error
+if "%CFQUANT_START_NO_PAUSE%"=="1" exit /b 0
+echo.
+echo Startup failed. Closing in 5 seconds...
+powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 5"
+exit /b 0
+
+:pause_on_success
+if "%CFQUANT_START_NO_PAUSE%"=="1" exit /b 0
+if "%CFQUANT_RESTART_NO_PAUSE%"=="1" exit /b 0
+echo.
+echo cfquant is running in the background. Closing in 5 seconds...
+powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 5"
+exit /b 0
+
+:log
+set "CFQUANT_LOG_TS="
+for /f "usebackq delims=" %%T in (`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'"`) do set "CFQUANT_LOG_TS=%%T"
+if not defined CFQUANT_LOG_TS set "CFQUANT_LOG_TS=%time%"
+>>"%START_LOG%" echo [%CFQUANT_LOG_TS%] %~1
+set "CFQUANT_LOG_TS="
+exit /b 0

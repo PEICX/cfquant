@@ -1,0 +1,1432 @@
+# -*- coding: utf-8 -*-
+import itertools
+import json
+import os
+import threading
+import time
+import atexit
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+from .client import create_rpc_client
+from .config import get_config
+from .channels import channels_for_bridge, normalize_bridge_id
+from .protocol import new_id
+from .order_meta import positive_order_id
+from .order_identity import prepare_order_remark, order_remark_key, is_unique_order_remark
+from . import xtconstant
+from .stock_connect import connect_account_type, validate_connect_order
+from .xttype import (
+    CreditAssure,
+    CreditSloCode,
+    CreditSubjects,
+    DictObject,
+    StkCompacts,
+    XtAccountInfo,
+    XtCreditDetail,
+    XtAsset,
+    XtAccountStatus,
+    XtBankTransferResponse,
+    XtCancelOrderResponse,
+    XtCancelError,
+    XtCreditDeal,
+    XtCreditOrder,
+    XtOrder,
+    XtOrderError,
+    XtOrderResponse,
+    XtPosition,
+    XtPositionStatistics,
+    XtSmtAppointmentResponse,
+    XtTrade,
+    filter_cancelable_orders,
+    to_objects,
+)
+
+
+_trade_client = None
+_trade_client_lock = threading.Lock()
+_account_bridge_cache = {}
+_account_bridge_lock = threading.RLock()
+_session_id_seq = itertools.count(1)
+_session_id_lock = threading.Lock()
+
+# The wire bridge represents native QMT objects as dictionaries so they can
+# cross the process boundary. Restore the public xtquant object contract for
+# query methods whose native API returns typed objects. Query methods absent
+# from this table intentionally keep the bridge's native dict/list shape.
+_COMPAT_QUERY_OBJECT_TYPES = {
+    "query_account_info": XtAccountInfo,
+    "query_account_infos": XtAccountInfo,
+    "query_account_status": XtAccountStatus,
+    "query_position_statistics": XtPositionStatistics,
+    "query_credit_detail": XtCreditDetail,
+    "query_stk_compacts": StkCompacts,
+    "query_credit_subjects": CreditSubjects,
+    "query_credit_slo_code": CreditSloCode,
+    "query_credit_assure": CreditAssure,
+    "query_secu_account": DictObject,
+    "query_bank_info": DictObject,
+    "query_bank_amount": DictObject,
+    "query_bank_transfer_stream": DictObject,
+}
+
+
+_COMPAT_TRANSFER_RESULT_METHODS = {
+    "bank_transfer_in",
+    "bank_transfer_out",
+    "fund_transfer",
+    "secu_transfer",
+    "ctp_transfer_future_to_option",
+    "ctp_transfer_option_to_future",
+}
+
+
+_MISSING = object()
+
+
+def _result_field(value, *names):
+    if value is None:
+        return _MISSING
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value.get(name)
+        try:
+            return getattr(value, name)
+        except AttributeError:
+            pass
+    return _MISSING
+
+
+def _restore_transfer_result(result):
+    if isinstance(result, (list, tuple)) and len(result) >= 2:
+        return (result[0], result[1])
+    success = _result_field(result, "success", "m_bSuccess", "ok", "accepted")
+    msg = _result_field(result, "msg", "m_strMsg", "m_strError", "message", "error", "error_msg")
+    if success is not _MISSING or msg is not _MISSING:
+        return (
+            False if success is _MISSING else success,
+            "" if msg is _MISSING else msg,
+        )
+    return result
+
+
+def _async_transfer_response(method, result, seq):
+    if method not in _COMPAT_TRANSFER_RESULT_METHODS:
+        return result
+    if isinstance(result, (list, tuple)) and len(result) >= 2:
+        return {"seq": seq, "success": result[0], "msg": result[1]}
+    if isinstance(result, dict):
+        data = dict(result)
+        data.setdefault("seq", seq)
+        return data
+    if hasattr(result, "__dict__"):
+        data = dict(vars(result))
+        data.setdefault("seq", seq)
+        return data
+    return result
+
+
+def _restore_compat_query_result(method, result):
+    if method in _COMPAT_TRANSFER_RESULT_METHODS:
+        return _restore_transfer_result(result)
+    query_type = _COMPAT_QUERY_OBJECT_TYPES.get(method)
+    return to_objects(result, query_type) if query_type else result
+
+
+def get_trade_client():
+    global _trade_client
+
+    with _trade_client_lock:
+        if _trade_client is None:
+            _trade_client = _new_trade_client()
+        return _trade_client
+
+
+def close_trade_client():
+    global _trade_client
+
+    with _trade_client_lock:
+        client = _trade_client
+        _trade_client = None
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _trade_request(action, params=None, timeout=None):
+    return get_trade_client().request(action, params or {}, timeout=timeout)
+
+
+def _first_response_item(result):
+    if result is None:
+        return None
+    if isinstance(result, list):
+        return result[0] if result else None
+    return result
+
+
+def _truthy_param(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def _async_cancel_result_failed(value):
+    """Return whether a bridge result explicitly rejects an async cancel."""
+    if isinstance(value, dict):
+        if value.get("accepted") is False or value.get("seq") == -1:
+            return True
+        if "cancel_result" in value:
+            return _async_cancel_result_failed(value.get("cancel_result"))
+        if "request_result" in value:
+            return _async_cancel_result_failed(value.get("request_result"))
+        return False
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value < 0
+    text = str(value).strip().lower()
+    return text in ("-1", "false", "failed", "error", "none", "null")
+
+
+def _account_type_value(account_type):
+    if account_type is None or account_type == "":
+        return xtconstant.SECURITY_ACCOUNT
+    if isinstance(account_type, str):
+        text = connect_account_type(account_type)
+        if not text:
+            return xtconstant.SECURITY_ACCOUNT
+        if text.isdigit():
+            return int(text)
+        aliases = {
+            "FUTURE": xtconstant.FUTURE_ACCOUNT,
+            "FUTURE_ACCOUNT": xtconstant.FUTURE_ACCOUNT,
+            "SECURITY": xtconstant.SECURITY_ACCOUNT,
+            "SECURITY_ACCOUNT": xtconstant.SECURITY_ACCOUNT,
+            "STOCK_ACCOUNT": xtconstant.SECURITY_ACCOUNT,
+            "MARGIN": xtconstant.CREDIT_ACCOUNT,
+            "CREDIT_ACCOUNT": xtconstant.CREDIT_ACCOUNT,
+            "FUTURE_OPTION": xtconstant.FUTURE_OPTION_ACCOUNT,
+            "FUTURE_OPTION_ACCOUNT": xtconstant.FUTURE_OPTION_ACCOUNT,
+            "FUTUREOPTION": xtconstant.FUTURE_OPTION_ACCOUNT,
+            "STOCK_OPTION": xtconstant.STOCK_OPTION_ACCOUNT,
+            "STOCK_OPTION_ACCOUNT": xtconstant.STOCK_OPTION_ACCOUNT,
+            "STOCKOPTION": xtconstant.STOCK_OPTION_ACCOUNT,
+            "OPTION": xtconstant.STOCK_OPTION_ACCOUNT,
+        }
+        if text in aliases:
+            return aliases[text]
+        for int_type, str_type in xtconstant.ACCOUNT_TYPE_DICT.items():
+            if text == str(str_type).upper():
+                return int_type
+    return account_type
+
+
+def _attach_account_fields(value, account):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [_attach_account_fields(item, account) for item in value]
+    if not hasattr(value, "__dict__"):
+        return value
+    payload = _account_payload(account)
+    account_id = str(payload.get("account_id") or "").strip()
+    if account_id:
+        setattr(value, "account_id", account_id)
+    elif getattr(value, "account_id", None) in (None, ""):
+        setattr(value, "account_id", "")
+    setattr(value, "account_type", _account_type_value(payload.get("account_type", xtconstant.SECURITY_ACCOUNT)))
+    return value
+
+
+def _next_session_id():
+    with _session_id_lock:
+        return os.getpid() * 1000000 + next(_session_id_seq)
+
+
+def _normalize_session_id(session_id):
+    if session_id is None:
+        return _next_session_id()
+    if isinstance(session_id, str):
+        text = session_id.strip()
+        if not text:
+            return _next_session_id()
+        try:
+            session_id = int(text)
+        except Exception:
+            return _next_session_id()
+    try:
+        session_id = int(session_id)
+    except Exception:
+        return _next_session_id()
+    return session_id if session_id > 0 else _next_session_id()
+
+
+def _new_trade_client(client_id=None, bridge_id=None):
+    cfg = get_config()
+    bridge_id = normalize_bridge_id(bridge_id or cfg.get("bridge_id"))
+    trade_channel = channels_for_bridge(bridge_id)["trade"]
+    return create_rpc_client(
+        request_channel=trade_channel,
+        timeout=cfg["timeout"],
+        client_id=client_id or new_id("trade_client"),
+        bridge_id=bridge_id,
+    )
+
+
+atexit.register(close_trade_client)
+
+
+class XtQuantTraderCallback(object):
+    def on_connected(self):
+        pass
+
+    def on_disconnected(self):
+        pass
+
+    def on_account_status(self, status):
+        pass
+
+    def on_stock_asset(self, asset):
+        pass
+
+    def on_stock_order(self, order):
+        pass
+
+    def on_stock_trade(self, trade):
+        pass
+
+    def on_stock_position(self, position):
+        pass
+
+    def on_order_error(self, order_error):
+        pass
+
+    def on_cancel_error(self, cancel_error):
+        pass
+
+    def on_order_stock_async_response(self, response):
+        pass
+
+    def on_cancel_order_stock_async_response(self, response):
+        pass
+
+    def on_bank_transfer_async_response(self, response):
+        pass
+
+    def on_ctp_internal_transfer_async_response(self, response):
+        pass
+
+    def on_smt_appointment_async_response(self, response):
+        pass
+
+
+class XtQuantTrader(object):
+    _seq = itertools.count(1)
+    _event_types = {
+        "on_connected": None,
+        "on_disconnected": None,
+        "on_account_status": XtAccountStatus,
+        "on_stock_asset": XtAsset,
+        "on_stock_order": XtOrder,
+        "on_stock_trade": XtTrade,
+        "on_stock_position": XtPosition,
+        "on_order_error": XtOrderError,
+        "on_cancel_error": XtCancelError,
+        "on_order_stock_async_response": XtOrderResponse,
+        "on_cancel_order_stock_async_response": XtCancelOrderResponse,
+        "on_bank_transfer_async_response": XtBankTransferResponse,
+        "on_ctp_internal_transfer_async_response": XtBankTransferResponse,
+        "on_smt_appointment_async_response": XtSmtAppointmentResponse,
+    }
+
+    def __init__(self, path="", session_id=0, callback=None, account=None):
+        self.path = path
+        # 兼容 miniQMT：未显式传 session_id 或传 0 时，自动分配一个正整数标识。
+        self.session_id = _normalize_session_id(session_id)
+        self.callback = callback or XtQuantTraderCallback()
+        self.account = account
+        self.account_id = _account_id(account)
+        self.bridge_id = normalize_bridge_id(_bridge_id_from_account(account) or get_config().get("bridge_id"))
+        self.client_id = new_id("trade_client_%s" % _safe_client_part(self.account_id))
+        self._client = None
+        self._clients = {}
+        self.connected = False
+        self.last_connect_error = ""
+        self.last_connect_error_type = ""
+        self.last_connect_stage = ""
+        self._registered_events = set()
+        self._subscribed_accounts = {}
+        self._pending_async_orders = []
+        self._pending_async_orders_lock = threading.RLock()
+        self._completed_async_order_seqs = {}
+        self._pending_async_cancels = {}
+        self._completed_async_cancel_seqs = {}
+        self._pending_async_cancels_lock = threading.RLock()
+        self.timeout = 0
+        self.relaxed_response_order_enabled = True
+        self._query_lock = threading.RLock()
+        self._query_executor = None
+        self._query_callback_executor = None
+        self._queries_stopped = False
+        self._query_generation = 0
+        self._query_context = threading.local()
+        # QMT may deliver a delayed partial-fill notification after the
+        # terminal filled notification. Keep this local guard so consumers
+        # never observe a state regression for the same order.
+        self._order_terminal_statuses = {}
+        self._order_terminal_statuses_lock = threading.RLock()
+
+    def start(self):
+        with self._query_lock:
+            self._queries_stopped = False
+        self._get_client().start()
+        self._register_trader_events()
+        if self.account is not None and _subscription_key(self.account) not in self._subscribed_accounts:
+            self.subscribe(self.account)
+        self.connected = True
+
+    def stop(self):
+        self._stop_query_workers()
+        was_connected = self.connected
+        self.connected = False
+        for payload in list(self._subscribed_accounts.values()):
+            try:
+                self._trade_request("xttrader.unsubscribe", {
+                    "account": dict(payload),
+                }, timeout=2)
+            except Exception:
+                pass
+        self._subscribed_accounts.clear()
+        with self._query_lock:
+            clients = list(self._clients.values())
+            self._client = None
+            self._clients.clear()
+            self._registered_events.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        if was_connected:
+            self._emit_noarg_callback("on_disconnected")
+
+    def connect(self):
+        self.last_connect_error = ""
+        self.last_connect_error_type = ""
+        self.last_connect_stage = "start"
+        try:
+            self.start()
+            self.last_connect_stage = "ping"
+            self._trade_request("cfquant.ping", timeout=3)
+            self.connected = True
+            self.last_connect_stage = ""
+            self._emit_noarg_callback("on_connected")
+            return 0
+        except Exception as error:
+            self.last_connect_error = str(error) or repr(error)
+            self.last_connect_error_type = type(error).__name__
+            self.connected = False
+            return -1
+
+    def disconnect(self):
+        self.stop()
+        return 0
+
+    def register_callback(self, callback):
+        self.callback = callback
+        self._register_trader_events()
+
+    def subscribe(self, account):
+        account = self._resolve_account(account)
+        payload = _account_payload(account)
+        result = self._trade_request("xttrader.subscribe", {
+            "account": payload,
+        })
+        self._subscribed_accounts[_subscription_key_from_payload(payload)] = payload
+        return result
+
+    def unsubscribe(self, account):
+        account = self._resolve_account(account)
+        payload = _account_payload(account)
+        result = self._trade_request("xttrader.unsubscribe", {
+            "account": payload,
+        })
+        self._subscribed_accounts.pop(_subscription_key_from_payload(payload), None)
+        return result
+
+    def set_timeout(self, timeout=0):
+        self.timeout = timeout
+        if timeout:
+            for client in self._clients.values():
+                client.timeout = float(timeout)
+
+    def set_relaxed_response_order_enabled(self, enabled):
+        """RPC responses always bypass user callbacks to allow nested requests.
+
+        False is accepted for source compatibility, but strict response ordering
+        is not supported. It must not restore the receive-thread deadlock.
+        """
+        if not enabled:
+            logging.getLogger(__name__).warning(
+                "cfquant always enables relaxed response ordering; False is ignored"
+            )
+        self.relaxed_response_order_enabled = True
+
+    def sleep(self, time):
+        import time as _time
+
+        _time.sleep(time)
+
+    def common_op_sync_with_seq(self, seq, callable):
+        func = callable[0]
+        args = callable[1:]
+        return func(*args)
+
+    def common_op_async_with_seq(self, seq, callable, callback):
+        result = self.common_op_sync_with_seq(seq, callable)
+        if callable_callback(callback):
+            callback(result)
+        return seq
+
+    def order_stock(
+        self,
+        account,
+        stock_code,
+        order_type,
+        order_volume,
+        price_type,
+        price,
+        strategy_name="",
+        order_remark="",
+    ):
+        result = self._trade_request("xttrader.order_stock", {
+            "account": _account_payload(account),
+            "stock_code": validate_connect_order({"stock_code": stock_code}, _account_payload(account).get("account_type")),
+            "order_type": order_type,
+            "order_volume": order_volume,
+            "price_type": price_type,
+            "price": price,
+            "strategy_name": strategy_name,
+            "order_remark": order_remark,
+        })
+        if isinstance(result, dict):
+            return result.get("order_id", -1)
+        return result
+
+    def order_stock_async(self, account, stock_code, order_type, order_volume, price_type, price, strategy_name="", order_remark=""):
+        seq = next(self._seq)
+        request = {
+            "account": _account_payload(account),
+            "stock_code": validate_connect_order({"stock_code": stock_code}, _account_payload(account).get("account_type")),
+            "order_type": order_type,
+            "order_volume": order_volume,
+            "price_type": price_type,
+            "price": price,
+            "strategy_name": strategy_name,
+            "order_remark": order_remark,
+            "seq": seq,
+        }
+        self._register_pending_async_order(request)
+        try:
+            result = self._trade_request("xttrader.order_stock_async", request)
+        except Exception:
+            self._discard_pending_async_order(seq)
+            raise
+        if isinstance(result, dict):
+            if result.get("accepted") is False or result.get("seq") == -1:
+                self._discard_pending_async_order(seq)
+                return -1
+        elif result == -1:
+            self._discard_pending_async_order(seq)
+            return -1
+        return seq
+
+    def cancel_order_stock(self, account, order_id):
+        result = self._trade_request("xttrader.cancel_order_stock", {
+            "account": _account_payload(account),
+            "order_id": order_id,
+        })
+        if isinstance(result, dict):
+            return result.get("cancel_result", -1)
+        return result
+
+    def cancel_order_stock_async(self, account, order_id):
+        seq = next(self._seq)
+        self._register_pending_async_cancel(seq)
+        try:
+            result = self._trade_request("xttrader.cancel_order_stock_async", {
+                "account": _account_payload(account),
+                "order_id": order_id,
+                "seq": seq,
+            })
+        except Exception:
+            self._discard_pending_async_cancel(seq)
+            raise
+        if _async_cancel_result_failed(result):
+            self._discard_pending_async_cancel(seq)
+            return -1
+        return seq
+
+    def cancel_order_stock_sysid(self, account, market, sysid):
+        result = self._trade_request("xttrader.cancel_order_stock_sysid", {
+            "account": _account_payload(account),
+            "market": market,
+            "sysid": sysid,
+        })
+        if isinstance(result, dict):
+            return result.get("cancel_result", -1)
+        return result
+
+    def cancel_order_stock_sysid_async(self, account, market, sysid):
+        seq = next(self._seq)
+        self._register_pending_async_cancel(seq)
+        try:
+            result = self._trade_request("xttrader.cancel_order_stock_sysid_async", {
+                "account": _account_payload(account),
+                "market": market,
+                "sysid": sysid,
+                "seq": seq,
+            })
+        except Exception:
+            self._discard_pending_async_cancel(seq)
+            raise
+        if _async_cancel_result_failed(result):
+            self._discard_pending_async_cancel(seq)
+            return -1
+        return seq
+
+    def query_stock_asset(self, account):
+        result = self._trade_request("xttrader.query_stock_asset", {
+            "account": _account_payload(account),
+        })
+        return _attach_account_fields(XtAsset.from_any(_first_response_item(result)), account)
+
+    def query_stock_asset_async(self, account, callback):
+        return self._submit_query(self.query_stock_asset, (_account_payload(account),), callback)
+
+    def query_stock_orders(self, account, cancelable_only=False):
+        cancelable_only = _truthy_param(cancelable_only)
+        result = self._trade_request("xttrader.query_stock_orders", {
+            "account": _account_payload(account),
+            "cancelable_only": cancelable_only,
+        })
+        order_type = XtCreditOrder if _account_type_value(_account_payload(account).get("account_type")) == xtconstant.CREDIT_ACCOUNT else XtOrder
+        orders = to_objects(result, order_type)
+        if cancelable_only:
+            orders = filter_cancelable_orders(orders)
+        return _attach_account_fields(orders, account)
+
+    def query_stock_orders_async(self, account, callback, cancelable_only=False):
+        return self._submit_query(self.query_stock_orders, (_account_payload(account), cancelable_only), callback)
+
+    def query_stock_order(self, account, order_id):
+        orders = self.query_stock_orders(account) or []
+        target_order_id = str(order_id)
+        for order in orders:
+            if str(getattr(order, "order_id", "")) == target_order_id:
+                return order
+            if str(getattr(order, "m_strOrderSysID", "")) == target_order_id:
+                return order
+            if str(getattr(order, "order_sysid", "")) == target_order_id:
+                return order
+        return None
+
+    def query_stock_trades(self, account):
+        result = self._trade_request("xttrader.query_stock_trades", {
+            "account": _account_payload(account),
+        })
+        trade_type = XtCreditDeal if _account_type_value(_account_payload(account).get("account_type")) == xtconstant.CREDIT_ACCOUNT else XtTrade
+        return _attach_account_fields(to_objects(result, trade_type), account)
+
+    def query_stock_trades_async(self, account, callback):
+        return self._submit_query(self.query_stock_trades, (_account_payload(account),), callback)
+
+    def query_stock_positions(self, account):
+        result = self._trade_request("xttrader.query_stock_positions", {
+            "account": _account_payload(account),
+        })
+        return _attach_account_fields(to_objects(result, XtPosition), account)
+
+    def query_stock_positions_async(self, account, callback):
+        return self._submit_query(self.query_stock_positions, (_account_payload(account),), callback)
+
+    def query_stock_position(self, account, stock_code):
+        positions = self.query_stock_positions(account) or []
+        for position in positions:
+            if getattr(position, "stock_code", None) == stock_code:
+                return position
+            qmt_code = "%s.%s" % (getattr(position, "m_strInstrumentID", ""), getattr(position, "m_strExchangeID", ""))
+            if qmt_code == stock_code:
+                return position
+        return None
+
+    def query_account_info(self):
+        return self._compat_request("query_account_info")
+
+    def query_account_infos(self):
+        return self._compat_request("query_account_infos")
+
+    def query_account_infos_async(self, callback):
+        return self._async_compat_request("query_account_infos", {}, callback)
+
+    def query_account_status(self):
+        return self._compat_request("query_account_status")
+
+    def query_account_status_async(self, callback):
+        return self._async_compat_request("query_account_status", {}, callback)
+
+    def query_com_fund(self, account):
+        return self._compat_account_request("query_com_fund", account)
+
+    def query_com_position(self, account):
+        return self._compat_account_request("query_com_position", account)
+
+    def get_hkt_exchange_rate(self, account):
+        """Return QMT's Stock Connect reference rates without synthesizing FX values."""
+        payload = _account_payload(account)
+        if connect_account_type(payload.get("account_type")) not in ("HUGANGTONG", "SHENGANGTONG"):
+            raise ValueError("get_hkt_exchange_rate requires a Stock Connect account")
+        return self._trade_request("xttrader.get_hkt_exchange_rate", {"account": payload})
+
+    def query_position_statistics(self, account):
+        return self._compat_account_request("query_position_statistics", account)
+
+    def query_secu_account(self, account):
+        return self._compat_account_request("query_secu_account", account)
+
+    def query_credit_detail(self, account):
+        return self._compat_account_request("query_credit_detail", account)
+
+    def query_credit_detail_async(self, account, callback):
+        return self._async_compat_request("query_credit_detail", self._account_params(account), callback)
+
+    def query_credit_subjects(self, account):
+        return self._compat_account_request("query_credit_subjects", account)
+
+    def query_credit_subjects_async(self, account, callback):
+        return self._async_compat_request("query_credit_subjects", self._account_params(account), callback)
+
+    def query_credit_slo_code(self, account):
+        return self._compat_account_request("query_credit_slo_code", account)
+
+    def query_credit_slo_code_async(self, account, callback):
+        return self._async_compat_request("query_credit_slo_code", self._account_params(account), callback)
+
+    def query_credit_assure(self, account):
+        return self._compat_account_request("query_credit_assure", account)
+
+    def query_credit_assure_async(self, account, callback):
+        return self._async_compat_request("query_credit_assure", self._account_params(account), callback)
+
+    def query_stk_compacts(self, account):
+        return self._compat_account_request("query_stk_compacts", account)
+
+    def query_stk_compacts_async(self, account, callback):
+        return self._async_compat_request("query_stk_compacts", self._account_params(account), callback)
+
+    def query_ipo_data(self):
+        return self._compat_request("query_ipo_data")
+
+    def query_ipo_data_async(self, callback):
+        return self._async_compat_request("query_ipo_data", {}, callback)
+
+    def query_new_purchase_limit(self, account):
+        return self._compat_account_request("query_new_purchase_limit", account)
+
+    def query_new_purchase_limit_async(self, account, callback):
+        return self._async_compat_request("query_new_purchase_limit", self._account_params(account), callback)
+
+    def query_bank_info(self, account):
+        return self._compat_account_request("query_bank_info", account)
+
+    def query_bank_amount(self, account, bank_no, bank_account, bank_pwd):
+        return self._compat_account_request("query_bank_amount", account, [bank_no, bank_account, bank_pwd])
+
+    def query_bank_transfer_stream(self, account, start_date, end_date, bank_no="", bank_account=""):
+        return self._compat_account_request("query_bank_transfer_stream", account, [start_date, end_date, bank_no, bank_account])
+
+    def bank_transfer_in(self, account, bank_no, bank_account, balance, bank_pwd="", fund_pwd=""):
+        return self._compat_account_request("bank_transfer_in", account, [bank_no, bank_account, balance, bank_pwd, fund_pwd])
+
+    def bank_transfer_in_async(self, account, bank_no, bank_account, balance, bank_pwd="", fund_pwd=""):
+        return self._async_compat_request(
+            "bank_transfer_in",
+            self._account_params(account, [bank_no, bank_account, balance, bank_pwd, fund_pwd]),
+            self._object_callback("on_bank_transfer_async_response", XtBankTransferResponse),
+        )
+
+    def bank_transfer_out(self, account, bank_no, bank_account, balance, bank_pwd="", fund_pwd=""):
+        return self._compat_account_request("bank_transfer_out", account, [bank_no, bank_account, balance, bank_pwd, fund_pwd])
+
+    def bank_transfer_out_async(self, account, bank_no, bank_account, balance, bank_pwd="", fund_pwd=""):
+        return self._async_compat_request(
+            "bank_transfer_out",
+            self._account_params(account, [bank_no, bank_account, balance, bank_pwd, fund_pwd]),
+            self._object_callback("on_bank_transfer_async_response", XtBankTransferResponse),
+        )
+
+    def fund_transfer(self, account, transfer_direction, price):
+        return self._compat_account_request("fund_transfer", account, [transfer_direction, price])
+
+    def secu_transfer(self, account, transfer_direction, stock_code, volume, transfer_type):
+        return self._compat_account_request("secu_transfer", account, [transfer_direction, stock_code, volume, transfer_type])
+
+    def ctp_transfer_future_to_option(self, opt_account_id, ft_account_id, balance):
+        return self._compat_request("ctp_transfer_future_to_option", {"args": [opt_account_id, ft_account_id, balance]})
+
+    def ctp_transfer_future_to_option_async(self, opt_account_id, ft_account_id, balance):
+        return self._async_compat_request(
+            "ctp_transfer_future_to_option",
+            {"args": [opt_account_id, ft_account_id, balance]},
+            self._object_callback("on_ctp_internal_transfer_async_response", XtBankTransferResponse),
+        )
+
+    def ctp_transfer_option_to_future(self, opt_account_id, ft_account_id, balance):
+        return self._compat_request("ctp_transfer_option_to_future", {"args": [opt_account_id, ft_account_id, balance]})
+
+    def ctp_transfer_option_to_future_async(self, opt_account_id, ft_account_id, balance):
+        return self._async_compat_request(
+            "ctp_transfer_option_to_future",
+            {"args": [opt_account_id, ft_account_id, balance]},
+            self._object_callback("on_ctp_internal_transfer_async_response", XtBankTransferResponse),
+        )
+
+    def query_data(self, account, result_path, data_type, start_time=None, end_time=None, user_param={}):
+        return self._compat_account_request("query_data", account, [result_path, data_type, start_time, end_time, user_param])
+
+    def export_data(self, account, result_path, data_type, start_time=None, end_time=None, user_param={}):
+        return self._compat_account_request("export_data", account, [result_path, data_type, start_time, end_time, user_param])
+
+    def sync_transaction_from_external(self, operation, data_type, account, deal_list):
+        return self._compat_account_request("sync_transaction_from_external", account, [operation, data_type, deal_list])
+
+    def smt_query_compact(self, account):
+        return self._compat_account_request("smt_query_compact", account)
+
+    def smt_query_order(self, account):
+        return self._compat_account_request("smt_query_order", account)
+
+    def smt_query_quoter(self, account):
+        return self._compat_account_request("smt_query_quoter", account)
+
+    def smt_appointment_order_async(self, account, order_code, date, amount, apply_rate):
+        return self._async_compat_request(
+            "smt_appointment_order",
+            self._account_params(account, [order_code, date, amount, apply_rate]),
+            self._object_callback("on_smt_appointment_async_response", XtSmtAppointmentResponse),
+        )
+
+    def smt_appointment_cancel_async(self, account, apply_id):
+        return self._async_compat_request(
+            "smt_appointment_cancel",
+            self._account_params(account, [apply_id]),
+            self._object_callback("on_smt_appointment_async_response", XtSmtAppointmentResponse),
+        )
+
+    def smt_negotiate_order_async(self, account, src_group_id, order_code, date, amount, apply_rate, dict_param={}):
+        return self._async_compat_request(
+            "smt_negotiate_order",
+            self._account_params(account, [src_group_id, order_code, date, amount, apply_rate, dict_param]),
+            self._object_callback("on_smt_appointment_async_response", XtSmtAppointmentResponse),
+        )
+
+    def smt_compact_return_async(self, account, src_group_id, cash_compact_id, order_code, occur_amount):
+        return self._async_compat_request(
+            "smt_compact_return",
+            self._account_params(account, [src_group_id, cash_compact_id, order_code, occur_amount]),
+            self._object_callback("on_smt_appointment_async_response", XtSmtAppointmentResponse),
+        )
+
+    def smt_compact_renewal_async(self, account, cash_compact_id, order_code, defer_days, defer_num, apply_rate):
+        return self._async_compat_request(
+            "smt_compact_renewal",
+            self._account_params(account, [cash_compact_id, order_code, defer_days, defer_num, apply_rate]),
+            self._object_callback("on_smt_appointment_async_response", XtSmtAppointmentResponse),
+        )
+
+    def run_forever(self):
+        import time
+
+        self.start()
+        while True:
+            time.sleep(1)
+
+    def _register_trader_events(self, bridge_id=None):
+        bridge_id = normalize_bridge_id(bridge_id or self.bridge_id)
+        with self._query_lock:
+            client = self._get_client(bridge_id)
+            for name in self._event_types:
+                event_name = "%s:trader:%s" % (bridge_id, name)
+                if event_name in self._registered_events:
+                    continue
+                client.add_callback("trader:%s" % name, self._make_trader_handler(name))
+                self._registered_events.add(event_name)
+
+    def _make_trader_handler(self, name):
+        def handler(data):
+            data_account_id = _event_account_id(data)
+            if self.account_id and data_account_id and data_account_id != self.account_id:
+                return
+            cls = self._event_types.get(name)
+            raw_account_type = (
+                data.get("account_type") if isinstance(data, dict)
+                else getattr(data, "account_type", None)
+            )
+            if raw_account_type in (None, ""):
+                raw_account_type = getattr(self.account, "account_type", xtconstant.SECURITY_ACCOUNT)
+            account_type = _account_type_value(raw_account_type)
+            if name == "on_stock_order" and account_type == xtconstant.CREDIT_ACCOUNT:
+                cls = XtCreditOrder
+            elif name == "on_stock_trade" and account_type == xtconstant.CREDIT_ACCOUNT:
+                cls = XtCreditDeal
+            if cls is not None:
+                data = cls.from_any(data)
+            if name == "on_stock_order" and not self._accept_order_update(data):
+                return
+            if name == "on_order_stock_async_response" and not self._accept_async_order_response(data):
+                return
+            if name == "on_cancel_order_stock_async_response" and not self._accept_async_cancel_response(data):
+                return
+            async_response = None
+            if name == "on_stock_order":
+                async_response = self._async_order_response_from_order(data)
+            func = getattr(self.callback, name, None)
+            if callable(func):
+                if name in ("on_connected", "on_disconnected"):
+                    func()
+                else:
+                    func(data)
+            if async_response is not None:
+                response_func = getattr(self.callback, "on_order_stock_async_response", None)
+                if callable(response_func):
+                    response_func(async_response)
+
+        return handler
+
+    def _accept_order_update(self, order):
+        """Drop a late QMT PART_SUCC event after the order was SUCCEEDED."""
+        status = getattr(order, "order_status", None)
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            return True
+        if status not in (
+            getattr(xtconstant, "ORDER_PART_SUCC", 55),
+            getattr(xtconstant, "ORDER_SUCCEEDED", 56),
+        ):
+            return True
+        order_id = None
+        for name in ("order_sysid", "order_id", "m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID"):
+            value = getattr(order, name, None)
+            if value not in (None, ""):
+                order_id = str(value).strip()
+                if order_id:
+                    break
+        if not order_id:
+            return True
+        key = (_event_account_id(order), order_id)
+        partial = getattr(xtconstant, "ORDER_PART_SUCC", 55)
+        succeeded = getattr(xtconstant, "ORDER_SUCCEEDED", 56)
+        with self._order_terminal_statuses_lock:
+            if status == partial and self._order_terminal_statuses.get(key) == succeeded:
+                return False
+            if status == succeeded:
+                self._order_terminal_statuses[key] = succeeded
+                if len(self._order_terminal_statuses) > 4096:
+                    self._order_terminal_statuses.pop(next(iter(self._order_terminal_statuses)))
+        return True
+
+    def _register_pending_async_order(self, request):
+        internal_remark = prepare_order_remark(request)
+        account = request.get("account") or {}
+        record = {
+            "seq": request.get("seq"),
+            "account_id": str(account.get("account_id") or "").strip(),
+            "account_type": account.get("account_type", xtconstant.SECURITY_ACCOUNT),
+            "stock_code": str(request.get("stock_code") or "").strip().upper(),
+            "strategy_name": str(request.get("strategy_name") or ""),
+            "order_remark": str(request.get("order_remark") or ""),
+            "cfquant_order_remark": internal_remark,
+            "created_at": time.time(),
+        }
+        with self._pending_async_orders_lock:
+            self._prune_async_order_state_locked()
+            self._pending_async_orders.append(record)
+
+    def _discard_pending_async_order(self, seq):
+        with self._pending_async_orders_lock:
+            self._pending_async_orders[:] = [
+                item for item in self._pending_async_orders if item.get("seq") != seq
+            ]
+
+    def _prune_async_order_state_locked(self):
+        cutoff = time.time() - 120.0
+        self._pending_async_orders[:] = [
+            item for item in self._pending_async_orders if item.get("created_at", 0) >= cutoff
+        ]
+        self._completed_async_order_seqs = {
+            seq: completed_at
+            for seq, completed_at in self._completed_async_order_seqs.items()
+            if completed_at >= cutoff
+        }
+
+    def _accept_async_order_response(self, response):
+        seq = getattr(response, "seq", None)
+        if seq is None:
+            return True
+        with self._pending_async_orders_lock:
+            self._prune_async_order_state_locked()
+            if seq in self._completed_async_order_seqs:
+                return False
+            self._pending_async_orders[:] = [
+                item for item in self._pending_async_orders if item.get("seq") != seq
+            ]
+            self._completed_async_order_seqs[seq] = time.time()
+        return True
+
+    def _async_order_response_from_order(self, order):
+        # Cross-QMT notifications can carry a market-prefixed broker sysid.
+        # It must not complete the seq and suppress the real async response.
+        order_id = None
+        for name in ("order_id", "m_nRef", "m_nOrderID", "m_strOrderRef", "m_strOrderID"):
+            order_id = positive_order_id(getattr(order, name, None))
+            if order_id is not None:
+                break
+        if order_id is None:
+            return None
+        account_id = _event_account_id(order)
+        stock_code = str(getattr(order, "stock_code", "") or "").strip().upper()
+        stock_code_base = stock_code.split(".", 1)[0]
+        order_remark = order_remark_key(order)
+        with self._pending_async_orders_lock:
+            self._prune_async_order_state_locked()
+            matched = None
+            for index, item in enumerate(self._pending_async_orders):
+                if account_id and item.get("account_id") and item.get("account_id") != account_id:
+                    continue
+                expected_code = str(item.get("stock_code") or "").upper()
+                if expected_code and stock_code and expected_code.split(".", 1)[0] != stock_code_base:
+                    continue
+                expected_remark = order_remark_key(item)
+                if is_unique_order_remark(expected_remark) and order_remark != expected_remark:
+                    continue
+                if order_remark and expected_remark and order_remark != expected_remark:
+                    continue
+                matched = self._pending_async_orders.pop(index)
+                break
+            if matched is None:
+                return None
+            self._completed_async_order_seqs[matched.get("seq")] = time.time()
+        order.order_remark = matched.get("order_remark", "")
+        order.strategy_name = matched.get("strategy_name", "")
+        return XtOrderResponse.from_any({
+            "account_type": matched.get("account_type"),
+            "account_id": matched.get("account_id", ""),
+            "order_id": order_id,
+            "strategy_name": matched.get("strategy_name", ""),
+            "order_remark": matched.get("order_remark", ""),
+            "cfquant_order_remark": matched.get("cfquant_order_remark", ""),
+            "seq": matched.get("seq"),
+        })
+
+    def _register_pending_async_cancel(self, seq):
+        with self._pending_async_cancels_lock:
+            self._prune_async_cancel_state_locked()
+            self._pending_async_cancels[seq] = time.time()
+
+    def _discard_pending_async_cancel(self, seq):
+        with self._pending_async_cancels_lock:
+            self._pending_async_cancels.pop(seq, None)
+
+    def _prune_async_cancel_state_locked(self):
+        cutoff = time.time() - 120.0
+        self._pending_async_cancels = {
+            seq: created_at
+            for seq, created_at in self._pending_async_cancels.items()
+            if created_at >= cutoff
+        }
+        self._completed_async_cancel_seqs = {
+            seq: completed_at
+            for seq, completed_at in self._completed_async_cancel_seqs.items()
+            if completed_at >= cutoff
+        }
+
+    def _accept_async_cancel_response(self, response):
+        seq = getattr(response, "seq", None)
+        if seq is None:
+            return True
+        with self._pending_async_cancels_lock:
+            self._prune_async_cancel_state_locked()
+            if seq in self._completed_async_cancel_seqs:
+                return False
+            self._pending_async_cancels.pop(seq, None)
+            self._completed_async_cancel_seqs[seq] = time.time()
+        return True
+
+    def _emit_noarg_callback(self, name):
+        func = getattr(self.callback, name, None)
+        if callable(func):
+            try:
+                func()
+            except Exception:
+                pass
+
+    def _object_callback(self, name, cls):
+        func = getattr(self.callback, name, None)
+        if not callable(func):
+            return None
+
+        def handler(data):
+            func(cls.from_any(data))
+
+        return handler
+
+    def _get_client(self, bridge_id=None):
+        bridge_id = normalize_bridge_id(bridge_id or self.bridge_id)
+        with self._query_lock:
+            generation = getattr(self._query_context, "generation", None)
+            if generation is not None and (self._queries_stopped or generation != self._query_generation):
+                raise RuntimeError("asynchronous query cancelled because trader stopped")
+            client = self._clients.get(bridge_id)
+            if client is None:
+                client_id = self.client_id
+                if bridge_id != normalize_bridge_id(self.bridge_id):
+                    client_id = "%s_%s" % (self.client_id, _safe_client_part(bridge_id))
+                client = _new_trade_client(client_id=client_id, bridge_id=bridge_id)
+                if self.timeout:
+                    client.timeout = float(self.timeout)
+                self._clients[bridge_id] = client
+                if self._client is None:
+                    self._client = client
+            return client
+
+    def _trade_request(self, action, params=None, timeout=None):
+        params = params or {}
+        bridge_id = _bridge_id_from_params(params) or self.bridge_id
+        self._register_trader_events(bridge_id)
+        return self._get_client(bridge_id).request(action, params, timeout=timeout)
+
+    def _resolve_account(self, account):
+        account = account or self.account
+        if account is None:
+            raise ValueError("account is required")
+        return account
+
+    def _compat_request(self, method, params=None):
+        result = self._trade_request("xttrader.%s" % method, params or {})
+        return _restore_compat_query_result(method, result)
+
+    def _compat_account_request(self, method, account, args=None, kwargs=None):
+        return self._compat_request(method, self._account_params(account, args=args, kwargs=kwargs))
+
+    def _account_params(self, account, args=None, kwargs=None):
+        return {
+            "account": _account_payload(account),
+            "args": list(args or []),
+            "kwargs": kwargs or {},
+        }
+
+    def _async_compat_request(self, method, params=None, callback=None):
+        seq = next(self._seq)
+        body = dict(params or {})
+        body["seq"] = seq
+        if method.startswith("query_"):
+            return self._submit_query(self._compat_request, (method, body), callback, seq=seq)
+        if method.startswith("smt_"):
+            result = self._compat_request(method, body)
+            if not isinstance(result, dict) or result.get("accepted") is not True:
+                return -1
+            if result.get("seq") != seq:
+                raise RuntimeError("SMT bridge returned a different request seq")
+            # The bridge delivers the actual business response through the
+            # registered trader event; the request acknowledgement is not a callback.
+            return seq
+        result = self._compat_request(method, body)
+        if callable_callback(callback):
+            callback(_async_transfer_response(method, result, seq))
+        return seq
+
+    def _submit_query(self, function, args, callback, seq=None):
+        with self._query_lock:
+            if self._queries_stopped:
+                raise RuntimeError("trader is stopped; start it before submitting asynchronous queries")
+            if self._query_executor is None:
+                self._query_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cfquant-query")
+                self._query_callback_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cfquant-query-callback")
+            seq = next(self._seq) if seq is None else seq
+            generation = self._query_generation
+            self._query_executor.submit(self._run_query, generation, seq, function, args, callback)
+        return seq
+
+    def _run_query(self, generation, seq, function, args, callback):
+        with self._query_lock:
+            if self._queries_stopped or generation != self._query_generation:
+                return
+        self._query_context.generation = generation
+        try:
+            result = function(*args)
+        except Exception:
+            logging.getLogger(__name__).exception("asynchronous query failed seq=%s", seq)
+            return
+        finally:
+            del self._query_context.generation
+        with self._query_lock:
+            if self._queries_stopped or generation != self._query_generation or not callable_callback(callback):
+                return
+            self._query_callback_executor.submit(self._deliver_query, generation, seq, callback, result)
+
+    def _deliver_query(self, generation, seq, callback, result):
+        with self._query_lock:
+            if self._queries_stopped or generation != self._query_generation:
+                return
+        try:
+            callback(result)
+        except Exception:
+            logging.getLogger(__name__).exception("asynchronous query callback failed seq=%s", seq)
+
+    def _stop_query_workers(self):
+        with self._query_lock:
+            self._queries_stopped = True
+            self._query_generation += 1
+            workers = (self._query_executor, self._query_callback_executor)
+            self._query_executor = self._query_callback_executor = None
+        # No self-join when a query callback calls stop(). Queued old tasks are
+        # suppressed by generation checks, including after a subsequent start().
+        for worker in workers:
+            if worker is not None:
+                worker.shutdown(wait=False)
+
+
+def _account_payload(account):
+    if isinstance(account, dict):
+        payload = {
+            "account_id": account.get("account_id") or account.get("m_strAccountID") or "",
+            "account_type": account.get("account_type", xtconstant.SECURITY_ACCOUNT),
+        }
+    else:
+        payload = {
+            "account_id": account.account_id,
+            "account_type": getattr(account, "account_type", xtconstant.SECURITY_ACCOUNT),
+        }
+    bridge_id = _bridge_id_from_account(account)
+    if bridge_id:
+        payload["bridge_id"] = bridge_id
+    return payload
+
+
+def _bridge_id_from_params(params):
+    if not isinstance(params, dict):
+        return ""
+    bridge_id = _bridge_id_value(params.get("bridge_id") or params.get("qmt_bridge_id"))
+    if bridge_id:
+        return bridge_id
+    if "account" in params:
+        return _bridge_id_from_account(params.get("account")) or _default_bridge_id()
+    return ""
+
+
+def _bridge_id_from_account(account):
+    if account is None:
+        return ""
+    if isinstance(account, dict):
+        bridge_id = _bridge_id_value(account.get("bridge_id") or account.get("qmt_bridge_id"))
+        account_id = str(account.get("account_id") or account.get("m_strAccountID") or "").strip()
+        account_type = account.get("account_type", xtconstant.SECURITY_ACCOUNT)
+    else:
+        bridge_id = _bridge_id_value(getattr(account, "bridge_id", "") or getattr(account, "qmt_bridge_id", ""))
+        account_id = _account_id(account)
+        account_type = getattr(account, "account_type", xtconstant.SECURITY_ACCOUNT)
+    if bridge_id:
+        return bridge_id
+    return _bridge_id_for_account(account_id, account_type)
+
+
+def _bridge_id_value(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    return normalize_bridge_id(value)
+
+
+def _subscription_key(account):
+    return _subscription_key_from_payload(_account_payload(account))
+
+
+def _subscription_key_from_payload(payload):
+    bridge_id = _bridge_id_from_account(payload) or _default_bridge_id()
+    return (
+        normalize_bridge_id(bridge_id),
+        _account_type_name(payload.get("account_type", xtconstant.SECURITY_ACCOUNT)),
+        str(payload.get("account_id") or "").strip(),
+    )
+
+
+def _default_bridge_id():
+    return normalize_bridge_id(get_config().get("bridge_id"))
+
+
+def _bridge_id_for_account(account_id, account_type=xtconstant.SECURITY_ACCOUNT):
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return ""
+    account_type = _account_type_name(account_type)
+    pairs = _account_bridge_pairs()
+    for value in pairs.values():
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("account_id") or "").strip() != account_id:
+            continue
+        if _account_type_name(value.get("account_type", xtconstant.SECURITY_ACCOUNT)) != account_type:
+            continue
+        return _bridge_id_value(value.get("bridge_id"))
+    legacy = pairs.get(account_id)
+    if isinstance(legacy, dict):
+        return _bridge_id_value(legacy.get("bridge_id"))
+    return legacy or ""
+
+
+def _account_bridge_pairs():
+    paths = _account_bridge_config_paths()
+    stamp_parts = []
+    for path in paths:
+        try:
+            stat = os.stat(path)
+            stamp_parts.append((path, stat.st_mtime, stat.st_size))
+        except Exception:
+            stamp_parts.append((path, 0, 0))
+    stamp = tuple(stamp_parts)
+    with _account_bridge_lock:
+        cached = _account_bridge_cache.get("stamp")
+        if cached == stamp:
+            return dict(_account_bridge_cache.get("pairs") or {})
+        pairs = {}
+        for path, mtime, _size in stamp_parts:
+            if not mtime:
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                values = (raw.get("account_pairs") or {}) if isinstance(raw, dict) else {}
+                if not values and isinstance(raw, dict):
+                    values = raw.get("account_configs") or {}
+                if isinstance(values, dict):
+                    items = []
+                    for key, item in values.items():
+                        if isinstance(item, dict):
+                            row = dict(item)
+                            row.setdefault("account_key", key)
+                            items.append(row)
+                        else:
+                            items.append({"account_key": key, "account_id": key, "bridge_id": item})
+                else:
+                    items = values
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    account_id = str(item.get("account_id") or "").strip()
+                    account_type = _account_type_name(item.get("account_type", xtconstant.SECURITY_ACCOUNT))
+                    bridge_id = _bridge_id_value(item.get("bridge_id"))
+                    if account_id and bridge_id:
+                        account_key = str(item.get("account_key") or "").strip()
+                        if not account_key:
+                            account_key = "%s:%s:%s" % (bridge_id, account_type, account_id)
+                        pairs[account_key] = {
+                            "account_key": account_key,
+                            "account_id": account_id,
+                            "account_type": account_type,
+                            "bridge_id": bridge_id,
+                        }
+                        pairs.setdefault(account_id, bridge_id)
+            except Exception:
+                pass
+        _account_bridge_cache["stamp"] = stamp
+        _account_bridge_cache["pairs"] = pairs
+        return dict(pairs)
+
+
+def _account_bridge_config_paths():
+    paths = []
+    env_path = os.environ.get("CFQUANT_WEB_CONFIG_FILE")
+    if env_path:
+        paths.append(os.path.abspath(env_path))
+    project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    cwd = os.path.abspath(os.getcwd())
+    paths.extend([
+        os.path.join(project_dir, "runtime", "config", "cfquant_web_config.json"),
+        os.path.join(cwd, "runtime", "config", "cfquant_web_config.json"),
+        os.path.join(project_dir, "cfquant_web_config.json"),
+        os.path.join(cwd, "cfquant_web_config.json"),
+    ])
+    result = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _account_id(account):
+    if account is None:
+        return ""
+    if isinstance(account, dict):
+        return str(account.get("account_id") or account.get("m_strAccountID") or "").strip()
+    return str(getattr(account, "account_id", "") or getattr(account, "m_strAccountID", "") or "").strip()
+
+
+def _account_type_name(account_type):
+    mapping = dict((value, name) for value, name in xtconstant.ACCOUNT_TYPE_DICT.items())
+    if isinstance(account_type, str):
+        text = connect_account_type(account_type)
+        aliases = {
+            "1": "FUTURE",
+            "FUTURE_ACCOUNT": "FUTURE",
+            "2": "STOCK",
+            "SECURITY": "STOCK",
+            "SECURITY_ACCOUNT": "STOCK",
+            "STOCK_ACCOUNT": "STOCK",
+            "3": "CREDIT",
+            "CREDIT_ACCOUNT": "CREDIT",
+            "MARGIN": "CREDIT",
+            "5": "FUTURE_OPTION",
+            "FUTURE_OPTION_ACCOUNT": "FUTURE_OPTION",
+            "FUTUREOPTION": "FUTURE_OPTION",
+            "6": "STOCK_OPTION",
+            "STOCK_OPTION_ACCOUNT": "STOCK_OPTION",
+            "STOCKOPTION": "STOCK_OPTION",
+            "OPTION": "STOCK_OPTION",
+        }
+        return aliases.get(text, text or "STOCK")
+    return mapping.get(account_type, "STOCK")
+
+
+def _safe_client_part(value):
+    text = str(value or "account").strip()
+    result = []
+    for char in text:
+        result.append(char if char.isalnum() else "_")
+    return "".join(result) or "account"
+
+
+def callable_callback(callback):
+    return callback is not None and callable(callback)
+
+
+def _event_account_id(data):
+    if isinstance(data, dict):
+        for key in ("account_id", "m_strAccountID", "m_strAccountId", "m_strAccount", "m_accountID"):
+            value = data.get(key)
+            if value:
+                return str(value).strip()
+    for name in ("account_id", "m_strAccountID", "m_strAccountId", "m_strAccount", "m_accountID"):
+        value = getattr(data, name, None)
+        if value:
+            return str(value).strip()
+    return ""

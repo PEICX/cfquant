@@ -1,0 +1,3228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cfquant 控制台</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/styles.css?v=web_20261014_01">
+</head>
+<body>
+  <div id="webAuthOverlay" class="auth-overlay hidden" aria-live="polite">
+    <div class="login-shell" role="dialog" aria-modal="true" aria-labelledby="webAuthTitle">
+      <section class="login-showcase" aria-label="系统架构轮播">
+        <div class="login-brandline">
+          <div class="login-brandmark">cf</div>
+          <div>
+            <strong>cfquant</strong>
+            <span>QMT Bridge Console</span>
+          </div>
+        </div>
+        <div class="login-carousel" aria-live="off">
+          <article class="login-slide login-slide-1">
+            <div class="login-slide-copy">
+              <span>Architecture</span>
+              <h2>本地 Web 到 QMT 的交易与行情桥接</h2>
+              <p>统一处理鉴权、账号路由、行情订阅和交易请求，让外部程序通过稳定接口接入 QMT 能力。</p>
+            </div>
+            <div class="architecture-map" aria-hidden="true">
+              <div class="arch-node source">外部程序</div>
+              <div class="arch-link"></div>
+              <div class="arch-node web">cfquant Web</div>
+              <div class="arch-link"></div>
+              <div class="arch-node bridge">Socket / Pipe</div>
+              <div class="arch-link"></div>
+              <div class="arch-node qmt">QMT 终端</div>
+            </div>
+          </article>
+          <article class="login-slide login-slide-2">
+            <div class="login-slide-copy">
+              <span>Operations</span>
+              <h2>多账号运行配置集中管理</h2>
+              <p>默认账号、通用模式、高级模式和数据源状态集中呈现，减少部署和排障时的切换成本。</p>
+            </div>
+            <div class="login-metrics" aria-hidden="true">
+              <div><strong>HTTP</strong><span>外部接口</span></div>
+              <div><strong>WS</strong><span>回调推送</span></div>
+              <div><strong>QMT</strong><span>柜台链路</span></div>
+            </div>
+          </article>
+          <article class="login-slide login-slide-3">
+            <div class="login-slide-copy">
+              <span>Security</span>
+              <h2>管理员登录与自动会话保持</h2>
+              <p>网页登录管理可在初始化时选择开启；开启后首次设置管理员账号，后续自动登录。</p>
+            </div>
+            <div class="login-security-grid" aria-hidden="true">
+              <div>加盐哈希</div>
+              <div>Token 会话</div>
+              <div>API Key</div>
+              <div>访问白名单</div>
+            </div>
+          </article>
+        </div>
+        <div class="login-carousel-dots" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+      </section>
+      <section class="login-panel">
+        <div class="login-panel-head">
+          <span>安全入口</span>
+          <h1 id="webAuthTitle">登录 cfquant 控制台</h1>
+          <p>登录后可管理 QMT 桥接、行情订阅、交易请求和外部接口配置。</p>
+        </div>
+        <form id="webAuthForm" class="auth-form login-form">
+          <div class="login-form-card">
+            <label class="login-field wide" for="webAuthLoginUserInput">
+              <span class="login-field-label">管理员账号</span>
+              <span class="login-input-wrap login-input-account">
+                <input id="webAuthLoginUserInput" autocomplete="username" placeholder="admin">
+              </span>
+            </label>
+            <label class="login-field wide" for="webAuthLoginPasswordInput">
+              <span class="login-field-label">管理员密码</span>
+              <span class="login-input-wrap login-input-password">
+                <input id="webAuthLoginPasswordInput" type="password" autocomplete="current-password" placeholder="请输入密码">
+              </span>
+            </label>
+            <div class="login-session-note wide">
+              <strong>自动登录</strong>
+              <span>登录成功后保持会话，主动退出前不再要求输入密码。</span>
+            </div>
+            <button id="webAuthLoginBtn" class="primary login-submit wide" type="submit"><span>登录</span></button>
+            <button id="webAuthLoginResetBtn" type="button" class="wide">忘记密码？本机重置并生成文件</button>
+            <span id="webAuthLoginStatus" class="metric-note login-status" role="status"></span>
+          </div>
+        </form>
+        <div class="login-footnote">
+          <strong>本地优先</strong>
+          <span>默认只监听本机地址，远程访问可在登录后进入设置页开启。</span>
+        </div>
+      </section>
+    </div>
+  </div>
+  <div id="setupOverlay" class="auth-overlay hidden" aria-live="polite">
+    <div class="auth-card setup-card">
+      <div class="setup-head">
+        <div>
+          <span class="setup-kicker">第一次启动</span>
+          <h2>先连接 QMT</h2>
+          <p>填写账号和目录，保存后系统会自动完成部署。</p>
+        </div>
+        <button type="button" data-open-tutorial data-tutorial-return="返回初始化">阅读教程</button>
+      </div>
+      <ol class="setup-steps" id="setupSteps" aria-label="初始化步骤">
+        <li class="active" data-setup-step="config">
+          <span class="setup-step-index">1</span>
+          <span class="setup-step-copy"><strong>填写</strong><em>账号与 QMT</em></span>
+        </li>
+        <li data-setup-step="identity">
+          <span class="setup-step-index">2</span>
+          <span class="setup-step-copy"><strong>保存</strong><em>写入本机配置</em></span>
+        </li>
+        <li data-setup-step="qmt">
+          <span class="setup-step-index">3</span>
+          <span class="setup-step-copy"><strong>进入</strong><em>启动项目</em></span>
+        </li>
+      </ol>
+      <form id="setupForm" class="auth-form">
+        <section class="setup-section setup-auth-choice">
+          <div class="setup-section-head">
+            <div class="setup-section-copy">
+              <strong>网页登录管理</strong>
+              <span>可选项</span>
+            </div>
+            <button type="button" class="help-tooltip-trigger" aria-label="网页登录管理说明" aria-expanded="false" data-help-text="关闭后不创建网页登录管理员，初始化仍可继续；以后可以在设置页开启。">?</button>
+          </div>
+          <label class="toggle">
+            <input id="setupEnableWebAuth" type="checkbox">
+            <span>启用网页登录管理</span>
+          </label>
+          <span class="metric-note">可选；关闭时不设置管理员，也能完成初始化。</span>
+        </section>
+        <section id="setupAdminFields" class="setup-section setup-admin-fields hidden">
+          <div class="setup-section-head">
+            <div class="setup-section-copy">
+              <strong>管理员</strong>
+              <span>创建登录账号</span>
+            </div>
+            <button type="button" class="help-tooltip-trigger" aria-label="管理员设置说明" aria-expanded="false" data-help-text="只有勾选启用网页登录管理时才需要填写。管理员密码至少 6 位，与 QMT 资金账号无关。">?</button>
+          </div>
+          <div class="setup-fields-grid">
+            <label class="field">
+              <span>管理员账号</span>
+              <input id="setupAdminUsername" name="admin_username" autocomplete="username" placeholder="admin">
+            </label>
+            <label class="field">
+              <span>管理员密码</span>
+              <input id="setupAdminPassword" name="admin_password" type="password" autocomplete="new-password" placeholder="至少 6 位">
+            </label>
+            <label class="field">
+              <span>确认密码</span>
+              <input id="setupAdminPasswordConfirm" name="admin_password_confirm" type="password" autocomplete="new-password">
+            </label>
+          </div>
+        </section>
+        <section class="setup-section">
+          <div class="setup-section-head">
+            <div class="setup-section-copy">
+              <strong>交易账号</strong>
+              <span>默认账号</span>
+            </div>
+            <button type="button" class="help-tooltip-trigger" aria-label="交易账号说明" aria-expanded="false" data-help-text="这里填写 QMT 登录使用的资金账号和账户类型，不是网页登录管理员账号。">?</button>
+          </div>
+          <div class="setup-fields-grid">
+            <label class="field">
+              <span>账号</span>
+              <input id="setupAccountId" name="account_id" autocomplete="off" placeholder="请输入资金账号">
+            </label>
+            <label class="field">
+              <span>账户类型</span>
+              <select id="setupAccountType" name="account_type">
+                <option value="STOCK">普通证券账户</option>
+                <option value="CREDIT">信用账户</option>
+                <option value="FUTURE">期货账户</option>
+                <option value="FUTURE_OPTION">期货期权账户</option>
+                <option value="STOCK_OPTION">股票期权账户</option>
+                <option value="HUGANGTONG">沪港通账户</option>
+                <option value="SHENGANGTONG">深港通账户</option>
+              </select>
+              <small>按 QMT 账户类别选择，期货和期权账户需在 QMT 侧具备对应权限</small>
+            </label>
+          </div>
+        </section>
+        <section class="setup-section">
+          <div class="setup-section-head">
+            <div class="setup-section-copy">
+              <strong>QMT 连接</strong>
+              <span>填写安装目录或 <code>bin.x64</code></span>
+            </div>
+            <button type="button" class="help-tooltip-trigger" aria-label="QMT 连接说明" aria-expanded="false" data-help-text="保存后系统自动同步 cfquant 项目代码、QMT 内部策略代码和身份配置，并按选择配置自动启动。无需手工复制，只需先确认对应 QMT 已完成 Python 库下载。">?</button>
+          </div>
+          <div class="setup-fields-grid">
+            <label class="field wide">
+              <span>普通端 QMT 安装目录或核心目录</span>
+              <input id="setupQmtDir" name="qmt_dir" autocomplete="off" placeholder="D:\国金证券QMT交易端 或 D:\国金证券QMT交易端\bin.x64">
+              <small>安装后自动同步项目代码、QMT 内部策略代码和身份配置到对应目录；无需手工复制，请先完成 QMT Python 库下载。</small>
+            </label>
+            <label class="field wide">
+              <span>运行模式</span>
+              <select id="setupMode" name="mode">
+                <option value="ctypes">通用模式（推荐）</option>
+                <option value="lite">极致模式</option>
+                <option value="lttx">高级模式（两个 QMT）</option>
+              </select>
+            </label>
+            <label class="field wide">
+              <span>cfquant Python 环境</span>
+              <select id="setupPythonEnvironmentMode"><option value="default">使用默认 Python 环境</option><option value="custom">使用指定 Python 解释器</option></select>
+              <input id="setupPythonExecutable" autocomplete="off" placeholder="例如 D:\Python311\python.exe">
+              <small>后续 Web、PipeHub、LTtx 和更新安装操作都使用此解释器。</small>
+            </label>
+            <label id="setupQmtTradeDirField" class="field wide hidden">
+              <span>极速交易端 QMT 安装目录或核心目录</span>
+              <input id="setupQmtTradeDir" name="qmt_trade_dir" autocomplete="off" placeholder="D:\国金证券QMT交易端-交易端 或 D:\国金证券QMT交易端-交易端\bin.x64">
+              <small>高级模式需填写另一个 QMT，保存后系统会自动同步对应代码和身份配置。</small>
+            </label>
+            <div id="setupStrategySettings" class="qmt-strategy-settings wide"></div>
+            <label class="toggle wide">
+              <input id="setupQmtAutoLogin" type="checkbox" checked>
+              <span>自动启动 QMT</span>
+            </label>
+            <div class="qmt-login-prerequisite wide" role="note">
+              <div class="qmt-login-prerequisite-head">
+                <strong>自动启动前提</strong>
+                <button type="button" class="help-tooltip-trigger" aria-label="QMT 自动启动前提说明" aria-expanded="false" data-help-text="系统可以启动 QMT 进程，但登录和 QMT 内部初始化仍取决于券商客户端设置。">?</button>
+              </div>
+              <div class="qmt-login-prerequisite-grid">
+                <div>
+                  <strong>国金 QMT</strong>
+                  <span>请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。</span>
+                </div>
+                <div>
+                  <strong>非国金 QMT</strong>
+                  <span>请在登录界面勾选自动登录和记住密码，之后等待自动登录完成。</span>
+                </div>
+              </div>
+              <small>所有 QMT 都要先完成 Python 库下载，否则自动启动后策略可能无法加载。</small>
+            </div>
+          </div>
+        </section>
+        <div class="setup-actions">
+          <button class="primary" type="submit">保存并进入</button>
+          <span id="setupStatus" class="metric-note"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="admin-layout">
+    <aside class="sidebar">
+      <div class="side-brand">
+        <div class="brand-mark">cf</div>
+        <div class="brand-copy">
+          <strong>cfquant</strong>
+          <span>QMT Bridge</span>
+        </div>
+        <div id="versionWidget" class="version-widget" tabindex="0" aria-label="版本信息">
+          <button id="versionBadge" class="version-badge" type="button" aria-describedby="versionPopover" aria-expanded="false">
+            <span class="version-badge-head">
+              <span class="version-badge-state">
+                <span id="versionBadgeDot" class="version-dot"></span>
+                <span id="versionBadgeState">等待 QMT 上报</span>
+              </span>
+              <span class="version-badge-chevron" aria-hidden="true"></span>
+            </span>
+            <span class="version-badge-value">
+              <span>当前版本</span>
+              <strong id="versionBadgeLabel">--</strong>
+            </span>
+            <span class="version-badge-value version-badge-latest">
+              <span>最新版本</span>
+              <strong id="versionBadgeLatestLabel">--</strong>
+            </span>
+            <span id="versionBadgeEntry" class="version-badge-entry">点击查看更新</span>
+            <small id="versionBadgeMeta">正在读取版本信息</small>
+          </button>
+          <div id="versionPopover" class="version-popover" role="tooltip">
+            <div class="version-popover-head">
+              <div>
+                <span>运行状态</span>
+                <strong>版本与部署</strong>
+              </div>
+              <span id="versionCheckState">未检查远端</span>
+            </div>
+            <div id="versionPopoverBody" class="version-popover-body">正在加载版本信息...</div>
+          </div>
+        </div>
+      </div>
+      <nav class="side-nav">
+        <button class="nav-item active" data-view="overview">首页</button>
+        <button class="nav-item" data-view="trade">交易</button>
+        <button class="nav-item" data-view="orders">委托</button>
+        <button class="nav-item" data-view="status">状态</button>
+        <button class="nav-item" data-view="bindings">绑定</button>
+        <button class="nav-item" data-view="callbacks">回调</button>
+        <button class="nav-item" data-view="api">接口</button>
+        <button class="nav-item" data-view="tests">测试</button>
+        <button class="nav-item" data-view="docs">文档</button>
+        <button class="nav-item" data-view="settings">设置</button>
+        <button class="nav-item" data-view="tutorial">教程</button>
+      </nav>
+    </aside>
+
+    <div class="main-area">
+      <header class="topbar">
+        <div>
+          <h1 id="viewTitle">首页</h1>
+          <div class="subline" id="clock">--</div>
+        </div>
+      <div class="status-strip">
+        <div class="status-pill" id="lttxStatus"><span></span><strong id="lttxStatusLabel">LTtx（库通信）</strong></div>
+        <div class="status-pill" id="normalStatus"><span></span><strong id="normalStatusLabel">通用查询通道</strong></div>
+        <div class="status-pill" id="tradeStatus"><span></span><strong id="tradeStatusLabel">通用交易通道</strong></div>
+        <div class="status-pill" id="transportStatus"><span></span><strong id="transportStatusLabel">通用模式</strong></div>
+        <div id="versionAlert" class="topbar-alert hidden" title="">版本探测失败，不影响交易和行情功能</div>
+        <button id="topbarProfileBtn" class="topbar-profile" type="button" title="个人资料">
+          <img id="topbarAvatarImg" src="/avatars/market-blue.svg" alt="">
+          <span id="topbarProfileName">管理员</span>
+        </button>
+        <button id="webAuthLogoutBtn" class="topbar-logout hidden" type="button">退出登录</button>
+      </div>
+      </header>
+
+      <main class="shell">
+        <section class="toolbar">
+          <label id="bridgeField" class="field compact">
+            <span>内部通道</span>
+            <select id="bridgeSelect"></select>
+          </label>
+          <label class="field compact">
+            <span>账号</span>
+            <select id="accountInput" aria-label="账号"></select>
+          </label>
+          <button id="switchAccountBtn" class="primary" type="button">切换账号</button>
+          <button id="openOnboardingGlobalBtn" type="button">新手引导</button>
+          <label id="queryChannelField" class="field compact">
+            <span>查询通道</span>
+            <select id="queryChannel">
+              <option value="normal">普通 QMT 请求</option>
+              <option value="trade">交易端请求</option>
+            </select>
+          </label>
+          <label id="tradeChannelField" class="field compact">
+            <span>交易通道</span>
+            <select id="tradeChannel">
+              <option value="trade">交易端请求</option>
+              <option value="normal">普通 QMT 请求</option>
+            </select>
+          </label>
+          <button id="refreshBtn" class="primary">刷新</button>
+          <label id="autoRefreshField" class="toggle">
+            <input id="autoRefresh" type="checkbox" checked>
+            <span>回调委托</span>
+          </label>
+        </section>
+
+        <section class="grid">
+          <div class="panel span-12 view-panel view-overview home-intro-panel">
+            <div class="home-intro">
+              <div class="home-intro-copy">
+                <span class="home-kicker">QMT 能力转接控制台</span>
+                <h2>用 cfquant 替代 miniqmt，把大 QMT 的交易、行情和多账号能力统一接出来。</h2>
+                <p>项目在本机启动 Web 服务，外部 Python 默认先通过 LTtx 发现 Web 路由，网页请求直接进入 Web；两者最终都由账号配置自动路由到通用端或高级端。新用户优先使用通用模式，一个 QMT 加载一个 ctypes 文件即可完成资金、持仓、委托、下单、撤单和回调验证。</p>
+                <div class="home-intro-tags" aria-label="核心能力">
+                  <span>通用模式单文件部署</span>
+                  <span>高级模式低延迟交易</span>
+                  <span>LTtx 自动发现</span>
+                  <span>PipeHub 通用后端</span>
+                  <span>多账号自动路由</span>
+                  <span>WebSocket 回调</span>
+                </div>
+                <div class="home-intro-actions">
+                  <button class="primary" type="button" data-view-jump="tutorial" data-guide="web_console">查看网页端教程</button>
+                  <button type="button" data-view-jump="tutorial" data-guide="project">查看架构说明</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel span-4 view-panel view-overview view-trade asset-panel">
+            <div class="panel-head">
+              <h2>资产</h2>
+              <span id="assetLatency" class="metric-note"></span>
+            </div>
+            <div class="asset-grid" id="assetGrid">
+              <div><span>总资产</span><strong>--</strong></div>
+              <div><span>可用资金</span><strong>--</strong></div>
+              <div><span>总市值</span><strong>--</strong></div>
+              <div><span>持仓盈亏</span><strong>--</strong></div>
+            </div>
+          </div>
+
+          <div class="panel span-4 view-panel view-overview view-status home-status-panel">
+            <div class="panel-head">
+              <h2>操作</h2>
+              <span id="lastRefresh" class="metric-note"></span>
+            </div>
+            <div class="action-row">
+              <button id="lttxStartBtn">启动 LTtx</button>
+              <button id="lttxStopBtn" disabled>完整退出停止</button>
+              <button id="statusBtn">状态检查</button>
+              <button id="ordersBtn">刷新委托</button>
+            </div>
+            <div id="lttxRuntime" class="runtime-note"></div>
+            <div class="runtime-status-grid" aria-label="LTtx 运行状态">
+              <div><span>LTtx 地址</span><strong id="lttxAddress">--</strong></div>
+              <div><span>LTtx PID</span><strong id="lttxPid">--</strong></div>
+              <div><span>cfquant 库</span><strong id="lttxLibraryStatus">--</strong></div>
+              <div><span>重启策略</span><strong id="lttxRestartPolicy">保留</strong></div>
+            </div>
+            <div class="remote-access-box">
+              <div id="serverAccessStatus" class="runtime-note"></div>
+              <button id="openAccessSettingsBtn" type="button">访问设置</button>
+            </div>
+            <div class="pair-box">
+              <div class="pair-head">
+                <strong>账号配置</strong>
+                <span id="accountPairCount" class="metric-note"></span>
+              </div>
+              <div class="pair-actions">
+                <button id="savePairBtn">保存当前账号</button>
+                <button id="removePairBtn">删除当前账号</button>
+              </div>
+              <div id="accountPairList" class="pair-list"></div>
+            </div>
+            <div class="overview-binding-box">
+              <div class="pair-head">
+                <strong>绑定实时状态</strong>
+                <span id="overviewBindingCount" class="metric-note"></span>
+              </div>
+              <div class="mini-table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>账号</th>
+                      <th>首选模式</th>
+                      <th>实际模式</th>
+                      <th>QMT 目录</th>
+                      <th>数据源</th>
+                    </tr>
+                  </thead>
+                  <tbody id="overviewBindingBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel span-8 view-panel view-overview positions-panel">
+            <div class="panel-head">
+              <h2>持仓</h2>
+              <span id="positionCount" class="metric-note"></span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>代码</th>
+                    <th>名称</th>
+                    <th class="num">持仓</th>
+                    <th class="num">可用</th>
+                    <th class="num">成本价</th>
+                    <th class="num">市值</th>
+                    <th class="num">盈亏</th>
+                  </tr>
+                </thead>
+                <tbody id="positionsBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-overview view-orders orders-panel">
+            <div class="panel-head">
+              <h2>实时委托</h2>
+              <div class="head-actions">
+                <span id="orderCount" class="metric-note"></span>
+                <button id="cancelSelectedBtn">撤选中</button>
+              </div>
+            </div>
+            <div class="table-wrap compact-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th><input id="selectAllOrders" type="checkbox"></th>
+                    <th>序号</th>
+                    <th><button class="sort-header" type="button" data-order-sort="time">时间<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th><button class="sort-header" type="button" data-order-sort="source">来源<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th><button class="sort-header" type="button" data-order-sort="code">代码<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th><button class="sort-header" type="button" data-order-sort="name">名称<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th class="num"><button class="sort-header" type="button" data-order-sort="volume">数量<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th class="num"><button class="sort-header" type="button" data-order-sort="traded">成交<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th><button class="sort-header" type="button" data-order-sort="status">状态<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    <th>最后回调</th>
+                    <th><button class="sort-header" type="button" data-order-sort="id">编号<span class="sort-mark" aria-hidden="true"></span></button></th>
+                  </tr>
+                </thead>
+                <tbody id="ordersBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel span-6 view-panel view-trade trade-ticket">
+            <div class="panel-head">
+              <h2>提交委托</h2>
+              <span id="orderHint" class="metric-note"></span>
+            </div>
+            <form id="orderForm" class="form-grid">
+              <div class="trade-tabs wide">
+                <button class="trade-tab active" type="button" data-side="buy">买入</button>
+                <button class="trade-tab" type="button" data-side="sell">卖出</button>
+              </div>
+              <input name="side" type="hidden" value="buy">
+              <label id="creditOrderActionField" class="field wide hidden">
+                <span>信用业务</span>
+                <select name="credit_action"></select>
+              </label>
+              <label id="derivativeOrderActionField" class="field wide hidden">
+                <span>交易业务</span>
+                <select name="order_action"></select>
+              </label>
+              <label class="field">
+                <span>代码</span>
+                <input name="stock_code" placeholder="000001.SZ" autocomplete="off">
+              </label>
+              <label class="field">
+                <span>报价类型</span>
+                <select name="price_type">
+                  <option value="11">FIX_PRICE 11</option>
+                  <option value="5">LATEST_PRICE 5</option>
+                  <option value="12">PRTP_MARKET 12</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>价格</span>
+                <input name="price" type="number" min="0" step="0.001">
+              </label>
+              <label class="field">
+                <span>数量</span>
+                <input name="volume" type="number" min="100" step="100">
+              </label>
+              <label class="field wide">
+                <span>确认文本</span>
+                <input name="confirm_text" autocomplete="off">
+              </label>
+              <button class="danger wide" type="submit">提交委托</button>
+            </form>
+          </div>
+
+          <div class="panel span-6 view-panel view-trade batch-ticket">
+            <div class="panel-head">
+              <h2>批量买入</h2>
+              <span id="batchOrderHint" class="metric-note"></span>
+            </div>
+            <form id="batchOrderForm" class="form-grid">
+              <label id="batchCreditOrderActionField" class="field wide hidden">
+                <span>默认信用业务</span>
+                <select name="credit_action"></select>
+              </label>
+              <label id="batchDerivativeOrderActionField" class="field wide hidden">
+                <span>默认交易业务</span>
+                <select name="order_action"></select>
+              </label>
+              <label class="field wide">
+                <span>默认报价类型</span>
+                <select name="price_type">
+                  <option value="11">FIX_PRICE 11</option>
+                  <option value="5">LATEST_PRICE 5</option>
+                  <option value="12">PRTP_MARKET 12</option>
+                </select>
+              </label>
+              <label class="field wide">
+                <span>委托列表</span>
+                <textarea name="orders_text" class="code-textarea" placeholder="000001.SZ,10.000,100&#10;600000.SH,8.500,200"></textarea>
+              </label>
+              <label class="field wide">
+                <span>确认文本</span>
+                <input name="confirm_text" autocomplete="off" placeholder="BATCH 2">
+              </label>
+              <button class="danger wide" type="submit">批量提交</button>
+            </form>
+          </div>
+
+          <div class="panel span-8 view-panel view-trade trade-data-panel">
+            <div class="panel-head">
+              <h2>交易数据</h2>
+              <div class="head-actions">
+                <button class="data-tab active" data-tab="positions" type="button">持仓</button>
+                <button class="data-tab" data-tab="orders" type="button">委托</button>
+                <button class="data-tab" data-tab="trades" type="button">成交</button>
+              </div>
+            </div>
+            <div class="tab-pane active" data-pane="positions">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>代码</th>
+                      <th>名称</th>
+                      <th class="num">持仓</th>
+                      <th class="num">可用</th>
+                      <th class="num">成本价</th>
+                      <th class="num">市值</th>
+                      <th class="num">盈亏</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tradePositionsBody"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="tab-pane" data-pane="orders">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th><input id="selectAllTradeOrders" type="checkbox"></th>
+                      <th>序号</th>
+                      <th><button class="sort-header" type="button" data-order-sort="time">时间<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th><button class="sort-header" type="button" data-order-sort="source">来源<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th><button class="sort-header" type="button" data-order-sort="code">代码<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th><button class="sort-header" type="button" data-order-sort="name">名称<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th class="num"><button class="sort-header" type="button" data-order-sort="volume">数量<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th class="num"><button class="sort-header" type="button" data-order-sort="traded">成交<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th><button class="sort-header" type="button" data-order-sort="status">状态<span class="sort-mark" aria-hidden="true"></span></button></th>
+                      <th>最后回调</th>
+                      <th><button class="sort-header" type="button" data-order-sort="id">编号<span class="sort-mark" aria-hidden="true"></span></button></th>
+                    </tr>
+                  </thead>
+                  <tbody id="tradeOrdersBody"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="tab-pane" data-pane="trades">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>代码</th>
+                      <th>名称</th>
+                      <th class="num">价格</th>
+                      <th class="num">数量</th>
+                      <th class="num">金额</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tradeTradesBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-status">
+            <div class="panel-head">
+              <h2>系统状态</h2>
+              <span class="metric-note">LTtx / normal / trade</span>
+            </div>
+            <pre id="statusDetail" class="json-box"></pre>
+          </div>
+
+          <div class="panel span-12 view-panel view-bindings binding-action-panel">
+            <div class="panel-head binding-action-head">
+              <h2>绑定操作</h2>
+              <div class="binding-action-buttons">
+                <button id="openBindingDialogBtn" class="primary" type="button">添加绑定</button>
+                <button id="openOnboardingGuideBtn" type="button">新手引导</button>
+              </div>
+            </div>
+            <div class="binding-action-body">
+              <div class="panel-title-stack">
+                <strong>账号绑定</strong>
+                <span id="bindingCount" class="metric-note">--</span>
+              </div>
+              <div class="binding-guide">
+                <strong>列表维护账号绑定</strong>
+                <span>绑定信息、运行状态和验证入口集中显示。</span>
+              </div>
+              <div id="bindingPageNotice" class="binding-page-notice hidden" role="status" aria-live="polite"></div>
+            </div>
+          </div>
+
+
+          <div class="panel span-12 view-panel view-bindings bindings-panel">
+            <div class="panel-head bindings-head">
+              <h2>绑定列表</h2>
+              <span class="metric-note">账号 / 通道 / QMT 目录</span>
+            </div>
+            <div class="table-wrap binding-table-wrap">
+              <table class="binding-table">
+                <thead>
+                  <tr>
+                    <th>操作</th>
+                    <th>账号名称</th>
+                    <th>资金账号</th>
+                    <th>连接状态</th>
+                    <th>首选模式</th>
+                    <th>实际模式</th>
+                    <th>内部通道</th>
+                    <th>QMT 目录</th>
+                    <th>数据源</th>
+                  </tr>
+                </thead>
+                <tbody id="bindingStatusBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-bindings binding-verify-panel">
+            <div class="panel-head">
+              <h2>绑定验证</h2>
+              <span id="pairVerifyNote" class="metric-note"></span>
+            </div>
+            <div class="verify-grid">
+              <div>
+                <h3>资金</h3>
+                <div id="pairAssetGrid" class="asset-grid">
+                  <div><span>总资产</span><strong>--</strong></div>
+                  <div><span>可用资金</span><strong>--</strong></div>
+                  <div><span>总市值</span><strong>--</strong></div>
+                  <div><span>持仓盈亏</span><strong>--</strong></div>
+                </div>
+              </div>
+              <div>
+                <h3>持仓</h3>
+                <div class="table-wrap compact-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>代码</th>
+                        <th>名称</th>
+                        <th class="num">持仓</th>
+                        <th class="num">可用</th>
+                        <th class="num">市值</th>
+                      </tr>
+                    </thead>
+                    <tbody id="pairPositionsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-callbacks">
+            <div class="panel-head">
+              <h2>交易回调</h2>
+              <div class="head-actions">
+                <span id="callbackCount" class="metric-note"></span>
+                <button id="callbackRefreshBtn" type="button">刷新</button>
+                <button id="callbackReconnectBtn" type="button">重连</button>
+                <button id="callbackClearBtn" type="button">清空</button>
+              </div>
+            </div>
+            <div class="callback-status-grid">
+              <div><span>连接状态</span><strong id="callbackSocketStatus">未连接</strong></div>
+              <div><span>订阅过滤</span><strong id="callbackFilterStatus">--</strong></div>
+              <div><span>最后事件</span><strong id="callbackLastEventStatus">尚未收到真实回调</strong></div>
+              <div><span>服务端序号</span><strong id="callbackSeqStatus">seq 0</strong></div>
+            </div>
+            <fieldset class="callback-event-filters">
+              <legend>显示事件</legend>
+              <div id="callbackEventFilters"></div>
+              <small>资金回调默认隐藏，可勾选显示；记住本浏览器的选择。</small>
+            </fieldset>
+            <div class="table-wrap callback-table-wrap">
+              <table class="callback-table">
+                <thead>
+                  <tr>
+                    <th>接收时间</th>
+                    <th>事件</th>
+                    <th>账号</th>
+                    <th>代码</th>
+                    <th>委托 / 成交编号</th>
+                    <th class="num">价格</th>
+                    <th class="num">数量</th>
+                    <th class="num">成交量</th>
+                    <th>状态 / 摘要</th>
+                    <th>来源</th>
+                    <th>完整信息</th>
+                  </tr>
+                </thead>
+                <tbody id="callbacksBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-api api-panel">
+            <div class="panel-head">
+              <div class="api-title-actions">
+                <h2>接口文档</h2>
+                <button id="apiGroupsToggleBtn" type="button" aria-controls="apiEndpointList">全部展开</button>
+              </div>
+              <span class="metric-note">HTTP / WebSocket / Python SDK</span>
+            </div>
+            <div class="api-layout">
+              <aside class="api-sidebar">
+                <div id="apiEndpointList" class="api-endpoint-list"></div>
+              </aside>
+              <section class="api-workbench">
+                <div class="api-settings-tip">
+                  <span>API Key 和 IP 访问策略在设置页配置，文档调试会自动使用已保存的配置。</span>
+                  <button id="openSettingsBtn" type="button">打开设置</button>
+                </div>
+                <div class="api-head">
+                  <div>
+                    <strong id="apiTitle">--</strong>
+                    <span id="apiDesc"></span>
+                  </div>
+                  <code id="apiRoute">--</code>
+                </div>
+                <form id="apiForm" class="api-form"></form>
+                <div id="apiDocDetail" class="api-doc-detail"></div>
+                <div id="downloadProgressPanel" class="download-progress-panel hidden">
+                  <div class="download-progress-head">
+                    <div>
+                      <h3>任务进度</h3>
+                      <span id="downloadProgressStatus" class="metric-note">未开始</span>
+                    </div>
+                    <div class="download-progress-actions">
+                      <code id="downloadProgressJob">--</code>
+                      <button id="downloadProgressClearBtn" type="button">清空</button>
+                    </div>
+                  </div>
+                  <div class="download-progress-meter" aria-hidden="true">
+                    <span id="downloadProgressBar"></span>
+                  </div>
+                  <div id="downloadProgressMeta" class="download-progress-meta">耗时 --，事件 0 条，进度 未返回百分比</div>
+                  <div id="downloadProgressEvents" class="download-progress-events">
+                    <div><span>--</span><strong>暂无下载回调</strong></div>
+                  </div>
+                </div>
+                <div id="quoteLivePanel" class="quote-live-panel hidden">
+                  <div class="quote-live-head">
+                    <div>
+                      <h3>实时行情</h3>
+                      <span id="quoteLiveStatus" class="metric-note">未连接</span>
+                    </div>
+                    <div class="quote-live-actions">
+                      <button id="quoteConnectBtn" type="button">连接推送</button>
+                      <button id="quoteStopBtn" type="button">停止推送</button>
+                    </div>
+                  </div>
+                  <div class="table-wrap quote-live-table">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>代码</th>
+                          <th class="num">最新价</th>
+                          <th class="num">涨跌幅</th>
+                          <th class="num">成交量</th>
+                          <th>时间</th>
+                        </tr>
+                      </thead>
+                      <tbody id="quoteLiveBody"></tbody>
+                    </table>
+                  </div>
+                </div>
+                <div id="apiHttpPreview" class="api-preview">
+                  <div>
+                    <h3>请求</h3>
+                    <pre id="apiRequestPreview" class="json-box small-json"></pre>
+                  </div>
+                  <div>
+                    <div class="api-test-result-heading"><h3>响应</h3><button type="button" id="apiCopyResultBtn">复制结果</button><button type="button" id="apiClearResultBtn">清空结果</button></div>
+                    <div id="apiResultSummary"></div>
+                    <div id="apiResponseLatency" class="api-response-latency hidden" aria-live="polite">
+                      <span id="apiResponseLatencyLabel" class="api-response-latency-label">接口耗时</span>
+                      <strong id="apiResponseLatencyValue">--</strong>
+                      <span id="apiResponseLatencyMeta" class="api-response-latency-meta"></span>
+                    </div>
+                    <pre id="apiResponseBox" class="json-box small-json"></pre>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-tests tests-panel">
+            <div class="panel-head">
+              <h2>测试</h2>
+              <div class="head-actions">
+                <span id="testSourceSummary" class="metric-note">从 cfquant/tests 读取测试脚本</span>
+                <button id="refreshTestsBtn" type="button">刷新</button>
+              </div>
+            </div>
+            <div class="tests-layout">
+              <aside class="tests-sidebar">
+                <label class="field compact test-search-field">
+                  <span>搜索测试</span>
+                  <input id="testSearchInput" type="search" autocomplete="off" placeholder="输入名称、文件或说明">
+                </label>
+                <div class="tests-root-note">
+                  <strong>来源目录</strong>
+                  <span>cfquant/tests</span>
+                </div>
+                <div id="testSourceList" class="test-source-list" aria-label="测试脚本列表"></div>
+              </aside>
+              <section class="test-source-viewer">
+                <div class="test-source-toolbar">
+                  <div class="test-source-title-block">
+                    <strong id="testSourceTitle">请选择测试脚本</strong>
+                    <span id="testSourceDesc">左侧列表会逐个罗列 tests 目录下的脚本。</span>
+                  </div>
+                  <div class="test-source-actions">
+                    <button id="copyTestCommandBtn" type="button">复制命令</button>
+                    <button id="copyTestSourceBtn" class="primary" type="button">复制代码</button>
+                  </div>
+                </div>
+                <div id="testConfigSummary" class="tests-config-summary"></div>
+                <div id="testSourceMeta" class="test-selected-meta"></div>
+                <pre id="testSourceCode" class="test-source-code"><code>正在读取测试脚本...</code></pre>
+              </section>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-settings settings-panel">
+            <div class="panel-head">
+              <h2>设置</h2>
+              <span class="metric-note">访问 / 日志 / 更新</span>
+            </div>
+            <div class="settings-layout">
+              <aside class="settings-menu" aria-label="设置菜单">
+                <button class="settings-menu-item" type="button" data-settings-tab="profile">
+                  <strong>个人资料</strong>
+                  <span>头像和名称</span>
+                </button>
+                <button class="settings-menu-item active" type="button" data-settings-tab="api-key">
+                  <strong>API Key</strong>
+                  <span>访问密钥</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="web-access">
+                  <strong>Web 访问</strong>
+                  <span>端口和登录</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="log-cleanup">
+                  <strong>日志清理</strong>
+                  <span>过期日志</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="qmt-log">
+                  <strong>QMT 日志</strong>
+                  <span>显示开关</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="python-environment">
+                  <strong>Python 环境</strong>
+                  <span>运行解释器</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="transport">
+                  <strong>通信模式</strong>
+                  <span>桥接模式</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="system-info">
+                  <strong>系统信息</strong>
+                  <span>版本和安装位置</span>
+                </button>
+                <button class="settings-menu-item" type="button" data-settings-tab="update">
+                  <strong>系统更新</strong>
+              <span>版本检查与更新</span>
+                </button>
+              </aside>
+              <section class="settings-section" data-settings-tab="profile">
+                <h3>个人资料</h3>
+                <div class="profile-settings">
+                  <div class="profile-preview">
+                    <img id="profileAvatarPreview" src="/avatars/market-blue.svg" alt="">
+                    <div>
+                      <strong id="profilePreviewName">管理员</strong>
+                      <span id="profileAvatarMeta">内置头像</span>
+                    </div>
+                  </div>
+                  <form id="userProfileForm" class="profile-form">
+                    <label class="field">
+                      <span>显示名称</span>
+                      <input id="profileDisplayNameInput" type="text" maxlength="40" autocomplete="off" placeholder="管理员">
+                    </label>
+                    <div class="profile-upload-row">
+                      <label class="field">
+                        <span>上传头像</span>
+                        <input id="profileAvatarFileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+                      </label>
+                      <button id="uploadUserAvatarBtn" type="button">上传头像</button>
+                    </div>
+                    <div class="profile-avatar-picker">
+                      <div class="profile-avatar-picker-head">
+                        <strong>内置头像</strong>
+                        <span>选择后点击保存资料生效</span>
+                      </div>
+                      <div id="builtinAvatarGrid" class="builtin-avatar-grid"></div>
+                    </div>
+                    <div class="profile-actions">
+                      <span id="userProfileStatus" class="metric-note"></span>
+                      <button id="saveUserProfileBtn" class="primary" type="submit">保存资料</button>
+                    </div>
+                  </form>
+                </div>
+              </section>
+              <section class="settings-section active" data-settings-tab="api-key">
+                <h3>API Key</h3>
+                <form id="apiKeyForm" class="api-keybar">
+                  <label class="field">
+                    <span>API Key</span>
+                    <input id="apiKeyInput" type="password" autocomplete="off" placeholder="自定义或随机生成">
+                  </label>
+                  <button id="generateApiKeyBtn" type="button">随机生成</button>
+                  <button id="toggleApiKeyBtn" type="button">显示</button>
+                  <button id="copyApiKeyBtn" type="button">复制</button>
+                  <button id="saveApiKeyBtn" class="primary" type="button">保存 API Key</button>
+                  <span id="apiKeyStatus" class="metric-note"></span>
+                </form>
+              </section>
+              <section class="settings-section" data-settings-tab="web-access">
+                <h3>Web 访问</h3>
+                <form id="apiServerForm" class="server-settings-form">
+                  <div class="server-access-summary" aria-live="polite">
+                    <div>
+                      <span>当前监听</span>
+                      <strong id="webCurrentListenValue">--</strong>
+                    </div>
+                    <div>
+                      <span>配置端口</span>
+                      <strong id="webConfiguredPortValue">--</strong>
+                    </div>
+                    <div>
+                      <span>访问范围</span>
+                      <strong id="webAccessScopeValue">--</strong>
+                    </div>
+                    <div>
+                      <span>网页登录</span>
+                      <strong id="webAuthStateValue">--</strong>
+                    </div>
+                  </div>
+                  <div class="server-settings-groups">
+              <div class="server-settings-group">
+                <h4>通信模式</h4>
+                <div class="server-settings-grid">
+                  <label class="field">
+                    <span>Web 通信模式</span>
+                    <select id="transportModeSelect">
+                      <option value="ctypes">通用模式（ctypes 单桥）</option>
+                      <option value="lite">极致模式（纯 ctypes 自包含）</option>
+                      <option value="lttx">高级模式（两个 QMT）</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+              <div class="server-settings-group">
+                <h4>监听与访问</h4>
+                <div class="server-settings-grid">
+                  <label class="field">
+                    <span>网页端口</span>
+                          <input id="webPortInput" type="number" min="1" max="65535" step="1" autocomplete="off" placeholder="8765">
+                        </label>
+                        <label class="toggle api-remote-toggle">
+                          <input id="allowApiRemoteAccess" type="checkbox">
+                          <span>允许外网访问</span>
+                        </label>
+                        <label class="field wide">
+                          <span>域名白名单</span>
+                          <input id="webAllowedDomainsInput" type="text" autocomplete="off" placeholder="example.com,*.example.com,192.168.1.70">
+                        </label>
+                      </div>
+                      <div class="server-settings-actions">
+                        <span id="apiServerStatus" class="metric-note"></span>
+                        <div class="server-action-buttons">
+                          <button id="saveApiServerBtn" class="primary" type="submit">保存设置</button>
+                          <button id="reloadWebServerBtn" type="button">保存并重载</button>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="server-settings-group">
+                      <h4>网页登录</h4>
+                      <div class="server-settings-grid">
+                        <label class="toggle api-remote-toggle">
+                          <input id="webAuthEnabledInput" type="checkbox">
+                          <span>需要账号密码</span>
+                        </label>
+                        <label class="field">
+                          <span>账号</span>
+                          <input id="webAuthUsernameInput" autocomplete="username" placeholder="admin">
+                        </label>
+                        <label class="field">
+                          <span>密码</span>
+                          <input id="webAuthPasswordInput" type="password" autocomplete="new-password" placeholder="留空则保持不变">
+                        </label>
+                        <div class="server-auth-reset wide">
+                          <button id="resetWebAuthPasswordBtn" type="button">重置密码并生成文件</button>
+                          <span id="webAuthResetStatus" class="metric-note" role="status">新密码只写入项目目录文本文件，不会显示在网页中。</span>
+                        </div>
+                        <div class="server-auth-reset wide">
+                          <span class="settings-note">密码文件位置（重置后生成）</span>
+                          <code id="webAuthPasswordFilePath">--</code>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="server-settings-group">
+                      <h4>外部 API 地址</h4>
+                      <div class="server-url-row">
+                        <label class="field">
+                          <span>接口访问地址</span>
+                          <input id="apiBaseUrlInput" type="text" autocomplete="off" placeholder="http://192.168.1.70:8765">
+                        </label>
+                        <button id="useCurrentOriginBtn" type="button">当前地址</button>
+                        <button id="useLanOriginBtn" type="button">局域网地址</button>
+                      </div>
+                    </div>
+                  </div>
+                </form>
+              </section>
+              <section class="settings-section" data-settings-tab="log-cleanup">
+                <h3>日志清理</h3>
+                <p class="settings-note">本地服务日志统一写入项目 <code>log/</code> 目录，默认自动保留最近 30 天；根目录旧日志也会纳入过期清理。</p>
+                <form id="logCleanupForm" class="api-serverbar">
+                  <label>保留天数 <input id="logRetentionDays" type="number" min="1" max="3650" step="1" value="30" required></label>
+                  <label class="toggle api-remote-toggle">
+                    <input id="cleanupQmtUserdataLogs" type="checkbox">
+                    <span>清理 QMT userdata/log 过期日志</span>
+                  </label>
+                  <button id="saveLogCleanupBtn" class="primary" type="submit">保存日志设置</button>
+                  <button id="runLogCleanupBtn" type="button">立即清理</button>
+                  <span id="logCleanupStatus" class="metric-note"></span>
+                </form>
+                <h4>按日期查看日志</h4>
+                <p class="settings-note">按文件日期或最后写入日期筛选。旧版连续日志可能跨天；每次显示文件末尾最多 256 KB，不加载整个文件。</p>
+                <form id="logFilesForm" class="api-serverbar">
+                  <label>日期 <input id="logFilesDate" type="date" required></label>
+                  <button type="submit">查询日志</button>
+                  <label>日志文件 <select id="logFileSelect"><option value="">请选择日志文件</option></select></label>
+                  <button id="readLogFileBtn" type="button">查看 / 刷新</button>
+                </form>
+                <p id="logFileStatus" role="status"></p>
+                <pre id="logFileContent" style="max-height:420px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+              </section>
+              <section class="settings-section" data-settings-tab="qmt-log">
+                <h3>QMT 日志</h3>
+                <form id="qmtLogLanguageForm" class="api-serverbar">
+                  <label class="toggle api-remote-toggle">
+                    <input id="qmtLogEnabled" type="checkbox" checked>
+                    <span>显示 QMT 桥接日志</span>
+                  </label>
+                  <label class="field">
+                    <span>显示语言</span>
+                    <select id="qmtLogLanguageSelect">
+                      <option value="zh">中文</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                  <button id="saveQmtLogLanguageBtn" class="primary" type="submit">保存日志设置</button>
+                  <span id="qmtLogLanguageStatus" class="metric-note"></span>
+                </form>
+              </section>
+              <section class="settings-section" data-settings-tab="python-environment">
+                <h3>Python 环境</h3>
+                <p class="settings-note">选择后，PipeHub、LTtx、更新安装和重启流程都会使用该解释器。</p>
+                <form id="pythonEnvironmentForm" class="api-serverbar">
+                  <label class="field">
+                    <span>运行环境</span>
+                    <select id="settingsPythonEnvironmentMode"><option value="default">使用默认 Python 环境</option><option value="custom">使用指定 Python 解释器</option></select>
+                  </label>
+                  <label class="field wide">
+                    <span>Python 解释器路径</span>
+                    <input id="settingsPythonExecutable" autocomplete="off" placeholder="例如 D:\Python311\python.exe">
+                  </label>
+                  <button id="savePythonEnvironmentBtn" class="primary" type="submit">保存 Python 环境</button>
+                  <span id="pythonEnvironmentStatus" class="metric-note" role="status"></span>
+                </form>
+              </section>
+              <section class="settings-section" data-settings-tab="transport">
+                <h3>通信模式</h3>
+                <div class="api-serverbar">
+                  <label class="field">
+                    <span>当前模式</span>
+                    <select id="transportModeSelect2">
+                      <option value="ctypes">通用模式（ctypes 单桥）</option>
+                      <option value="lite">极致模式（纯 ctypes 自包含）</option>
+                      <option value="lttx">高级模式（两个 QMT）</option>
+                    </select>
+                  </label>
+                  <button id="saveTransportModeBtn" class="primary" type="button">保存模式</button>
+                  <button id="startPipeHubBtn" type="button">启动 PipeHub</button>
+                  <button id="stopPipeHubBtn" type="button">停止 PipeHub</button>
+                  <span id="transportStatusText" class="metric-note"></span>
+                </div>
+                <div id="pipeHubStatusBox" class="guide-callout">
+                  <strong>PipeHub 状态</strong>
+                  <span>--</span>
+                </div>
+              </section>
+              <section class="settings-section" data-settings-tab="system-info">
+                <div class="settings-section-head">
+                  <div>
+                    <h3>系统信息</h3>
+                    <p class="settings-note">查看当前 Web 服务加载的版本、安装目录和启动脚本位置。</p>
+                  </div>
+                  <button id="refreshSystemInfoBtn" type="button">刷新</button>
+                </div>
+                <div class="system-info-overview">
+                  <div class="system-info-primary">
+                    <span>当前版本</span>
+                    <strong id="systemInfoVersion">--</strong>
+                    <small id="systemInfoVersionMeta">正在读取版本信息</small>
+                  </div>
+                  <div class="system-info-primary">
+                    <span>版本更新日期</span>
+                    <strong id="systemInfoUpdatedAt">--</strong>
+                    <small id="systemInfoCheckedAt">--</small>
+                  </div>
+                  <div class="system-info-primary">
+                    <span>Python SDK 版本</span>
+                    <strong id="systemInfoPythonSdkVersion">--</strong>
+                    <small id="systemInfoPythonSdkVersionMeta">正在读取安装版本</small>
+                    <small id="systemInfoPythonSdkReleaseDate">--</small>
+                  </div>
+                </div>
+                <div class="system-info-grid">
+                  <section class="system-info-card important">
+                    <div>
+                      <span>项目安装目录</span>
+                      <strong id="systemInfoProjectDir">--</strong>
+                    </div>
+                    <button type="button" data-copy-system-info="project_dir">复制</button>
+                  </section>
+                  <section class="system-info-card important">
+                    <div>
+                      <span>启动脚本</span>
+                      <strong id="systemInfoStartScript">--</strong>
+                      <small id="systemInfoStartScriptState">--</small>
+                    </div>
+                    <button type="button" data-copy-system-info="start_script">复制</button>
+                  </section>
+                  <section class="system-info-card">
+                    <div>
+                      <span>Python 解释器</span>
+                      <strong id="systemInfoPython">--</strong>
+                    </div>
+                    <button type="button" data-copy-system-info="python_executable">复制</button>
+                  </section>
+                  <section class="system-info-card">
+                    <div>
+                      <span>运行数据目录</span>
+                      <strong id="systemInfoRuntimeDir">--</strong>
+                    </div>
+                    <button type="button" data-copy-system-info="runtime_dir">复制</button>
+                  </section>
+                  <section class="system-info-card">
+                    <div>
+                      <span>日志目录</span>
+                      <strong id="systemInfoLogDir">--</strong>
+                    </div>
+                    <button type="button" data-copy-system-info="log_dir">复制</button>
+                  </section>
+                  <section class="system-info-card">
+                    <div>
+                      <span>静态资源目录</span>
+                      <strong id="systemInfoStaticDir">--</strong>
+                    </div>
+                    <button type="button" data-copy-system-info="static_dir">复制</button>
+                  </section>
+                </div>
+              </section>
+              <section class="settings-section" data-settings-tab="update">
+                <div class="settings-section-head">
+                  <div>
+                    <h3>系统更新</h3>
+                    <p class="settings-note">一次更新完整版本，并把最新 cfquant 核心同步到所有已绑定 QMT 目录。</p>
+                  </div>
+                </div>
+                <div class="update-workspace">
+                  <section class="update-lane">
+                    <div class="update-lane-head">
+                      <div>
+                        <span>版本信息</span>
+                        <strong>完整版本更新</strong>
+                        <small>更新完成后，请完全退出并重启 QMT 加载新版本。</small>
+                      </div>
+                    </div>
+                    <div class="update-status-row">
+                      <span id="projectUpdateStatus" class="metric-note" aria-live="polite">未加载项目更新状态</span>
+                    </div>
+                    <div class="update-safety-panel">
+                      <div>
+                        <span>更新保护</span>
+                        <strong>先备份，再更新</strong>
+                        <small>每次更新前自动创建完整回退点。更新期间网页新委托会暂时锁定；系统会先关闭已绑定且正在运行的 QMT，再覆盖入口文件，请在非交易时段操作。</small>
+                        <label class="update-auto-close-option"><input id="updateAutoCloseQmt" type="checkbox" checked> 更新前自动关闭已绑定且正在运行的 QMT</label>
+                      </div>
+                      <span id="projectUpdateBackupSummary" class="metric-note" aria-live="polite">暂无可回退版本</span>
+                    </div>
+                    <div id="projectUpdateVersionInfo" class="update-version-info"></div>
+                    <div class="update-primary-actions">
+                      <button id="runProjectGithubUpdateBtn" class="primary" type="button">立即更新</button>
+                      <button id="refreshProjectUpdateStatusBtn" type="button">刷新版本</button>
+                    </div>
+                    <div class="update-rollback-row">
+                      <div class="update-rollback-copy">
+                        <span>回退版本</span>
+                        <strong>恢复到更新前的项目版本</strong>
+                        <small>回退前会再次备份当前版本；完成后 Web 服务会重启，QMT 入口脚本需要重新启动。</small>
+                      </div>
+                      <label class="field">
+                        <span>可回退版本备份</span>
+                        <select id="projectRollbackBackupSelect"></select>
+                      </label>
+                      <button id="rollbackProjectUpdateBtn" class="danger" type="button">回滚版本并重启</button>
+                    </div>
+                    <details class="update-advanced">
+                      <summary>高级选项</summary>
+                      <div class="update-action-grid">
+                        <label class="field">
+                          <span>GitHub 回退仓库</span>
+                          <input id="projectUpdateRepoInput" type="text" autocomplete="off" value="https://github.com/95ge/cfquant.git" placeholder="owner/repo 或 https://github.com/owner/repo">
+                        </label>
+                        <label class="field compact">
+                          <span>分支 / 标签</span>
+                          <input id="projectUpdateRefInput" type="text" autocomplete="off" value="main" placeholder="main，可空">
+                        </label>
+                      </div>
+                      <div class="update-action-grid">
+                        <label class="field">
+                          <span>完整版本 zip</span>
+                          <input id="projectUpdateZipInput" type="file" accept=".zip,application/zip">
+                        </label>
+                        <button id="uploadProjectZipUpdateBtn" class="primary" type="button">上传 zip 更新</button>
+                      </div>
+                    </details>
+                    <div id="projectUpdateNoticeBox" class="update-notice hidden"></div>
+                    <details class="update-result-details">
+                      <summary>执行结果</summary>
+                      <pre id="projectUpdateResultBox" class="json-box small-json update-result"></pre>
+                    </details>
+                  </section>
+
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-tutorial tutorial-panel">
+            <div class="panel-head">
+              <h2>教程中心</h2>
+              <span class="metric-note">部署 / 网页 / 接口</span>
+            </div>
+            <div class="tutorial-layout">
+              <aside class="tutorial-menu" aria-label="教程菜单">
+                <button class="tutorial-menu-item recommended active" type="button" data-guide="deploy">
+                  <strong>QMT 部署教程 <em>推荐</em></strong>
+                  <span>通用、极致、高级三种模式</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="onboarding">
+                  <strong>新手引导</strong>
+                  <span>单账号通用模式，最快跑通</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="project">
+                  <strong>项目架构</strong>
+                  <span>架构、链路和运行目录</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="quickstart">
+                  <strong>快速开始</strong>
+                  <span>启动、部署、验证</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="web_console">
+                  <strong>网页端教程</strong>
+                  <span>页面分工和操作顺序</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="python">
+                  <strong>Python 接入</strong>
+                  <span>新旧调用对照、完整示例、迁移排查</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="cftrader">
+                  <strong>cftrader 批量交易与撤单</strong>
+                  <span>批量下单、批量撤单、原回调</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="same_account_market">
+                  <strong>同账号独立市场</strong>
+                  <span>沪深两个交易端自动分流</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="bridge">
+                  <strong>多账号通道</strong>
+                  <span>多 QMT 的内部路由</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="account">
+                  <strong>账号绑定</strong>
+                  <span>多账号、信用账户、共享行情源</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="trade">
+                  <strong>交易与回调</strong>
+                  <span>下单、撤单、回调确认</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="latency">
+                  <strong>实测延迟</strong>
+                  <span>链路量级和测试口径</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="api">
+                  <strong>外部接口</strong>
+                  <span>HTTP、WebSocket、API Key</span>
+                </button>
+                <button class="tutorial-menu-item" type="button" data-guide="troubleshooting">
+                  <strong>排查问题</strong>
+                  <span>按层定位故障</span>
+                </button>
+              </aside>
+
+              <section class="tutorial-content">
+                <article class="tutorial-topic" data-guide-panel="onboarding">
+                  <div class="guide-section">
+                    <h3>先把 cfquant 跑起来</h3>
+                    <p>填写账号、选择模式并保存，系统自动同步项目代码和 QMT 内部策略代码，然后按提示启动并登录 QMT。</p>
+                    <div class="guide-callout">
+                      <strong>推荐</strong>
+                      <span>第一次用通用模式，QMT 目录填 <code>bin.x64</code>；无需手工复制代码，只需先完成 QMT Python 库下载。</span>
+                    </div>
+                    <div class="onboarding-inline-actions">
+                      <button id="openOnboardingInlineBtn" class="primary" type="button">开始初始化向导</button>
+                    </div>
+                    <div id="onboardingBackdrop" class="onboarding-backdrop hidden" aria-hidden="true"></div>
+                    <div class="onboarding-wizard hidden" id="onboardingWizard" role="dialog" aria-modal="true" aria-labelledby="onboardingWizardTitle">
+                      <div class="onboarding-modal-head">
+                        <div>
+                          <strong id="onboardingWizardTitle">新手初始化向导</strong>
+                          <span id="onboardingWizardSubtitle">只保留启动必需项。</span>
+                        </div>
+                        <div class="onboarding-head-actions">
+                          <button type="button" data-open-tutorial data-tutorial-return="返回引导">阅读教程</button>
+                          <button id="closeOnboardingBtn" type="button" aria-label="关闭新手初始化向导">关闭</button>
+                        </div>
+                      </div>
+                      <div class="onboarding-progress" aria-label="新手初始化步骤">
+                        <button class="active" type="button" data-onboarding-step="intro"><span>1</span><strong>开始</strong></button>
+                        <button type="button" data-onboarding-step="config"><span>2</span><strong>账号</strong></button>
+                        <button type="button" data-onboarding-step="deploy"><span>3</span><strong>启动</strong></button>
+                        <button type="button" data-onboarding-step="bridge"><span>4</span><strong>通道</strong></button>
+                        <button type="button" data-onboarding-step="data"><span>5</span><strong>接口</strong></button>
+                      </div>
+
+                      <section class="onboarding-panel onboarding-panel-intro active" data-onboarding-panel="intro">
+                        <div class="onboarding-panel-head">
+                          <strong>先按默认路径跑通</strong>
+                          <span>第一次不用理解全部架构，完成这四步即可。</span>
+                        </div>
+                        <div class="onboarding-quick-list" aria-label="初始化步骤">
+                          <div class="onboarding-quick-item">
+                            <span>1</span>
+                            <strong>填资金账号</strong>
+                            <small>不要使用示例账号。</small>
+                          </div>
+                          <div class="onboarding-quick-item">
+                            <span>2</span>
+                            <strong>选择模式</strong>
+                            <small>不确定就选通用模式。</small>
+                          </div>
+                          <div class="onboarding-quick-item">
+                            <span>3</span>
+                            <strong>自动同步</strong>
+                            <small>保存后自动同步项目和内部策略代码。</small>
+                          </div>
+                          <div class="onboarding-quick-item">
+                            <span>4</span>
+                            <strong>验证数据</strong>
+                            <small>能查资金或持仓即可。</small>
+                          </div>
+                        </div>
+                        <div class="guide-callout compact">
+                          <strong>高级模式</strong>
+                          <span>只有确认要双 QMT 低延迟交易时再选。</span>
+                        </div>
+                        <div class="onboarding-actions">
+                          <button id="onboardingStartConfigBtn" class="primary" type="button">开始配置</button>
+                        </div>
+                      </section>
+
+                      <form id="onboardingConfigForm" class="onboarding-panel" data-onboarding-panel="config">
+                        <div class="onboarding-panel-head">
+                          <div class="onboarding-panel-copy">
+                            <strong>账号配置</strong>
+                            <span>填资金账号、模式和 QMT 目录。</span>
+                          </div>
+                          <button type="button" class="help-tooltip-trigger" aria-label="账号配置说明" aria-expanded="false" data-help-text="保存后系统会自动同步项目代码、QMT 内部策略代码和身份配置；不需要手工复制文件。">?</button>
+                        </div>
+                        <div class="onboarding-grid">
+                          <label class="field">
+                            <span>资金账号</span>
+                            <input id="onboardingAccountId" autocomplete="off" placeholder="请输入资金账号">
+                          </label>
+                          <label class="field">
+                            <span>账户类型</span>
+                            <select id="onboardingAccountType">
+                              <option value="STOCK">普通证券账户</option>
+                              <option value="CREDIT">信用账户</option>
+                              <option value="FUTURE">期货账户</option>
+                              <option value="FUTURE_OPTION">期货期权账户</option>
+                              <option value="STOCK_OPTION">股票期权账户</option>
+                <option value="HUGANGTONG">沪港通账户</option>
+                <option value="SHENGANGTONG">深港通账户</option>
+                            </select>
+                          </label>
+                          <label class="field">
+                            <span>运行模式</span>
+                            <select id="onboardingMode">
+                              <option value="ctypes">通用模式（推荐）</option>
+                              <option value="lite">极致模式</option>
+                              <option value="lttx">高级模式</option>
+                            </select>
+                            <small>首次建议通用模式；高级模式会要求第二个 QMT 目录。</small>
+                          </label>
+                          <label class="field wide">
+                            <span>QMT 安装目录或核心目录</span>
+                            <input id="onboardingQmtDir" autocomplete="off" placeholder="D:\国金证券QMT交易端 或 D:\国金证券QMT交易端\bin.x64">
+                            <small>保存后系统会自动同步项目代码、QMT 内部策略代码和身份配置；无需手工复制，请先完成 QMT Python 库下载。</small>
+                          </label>
+                          <label class="field wide">
+                            <span>cfquant Python 环境</span>
+                            <select id="onboardingPythonEnvironmentMode"><option value="default">使用默认 Python 环境</option><option value="custom">使用指定 Python 解释器</option></select>
+                            <input id="onboardingPythonExecutable" autocomplete="off" placeholder="例如 D:\Python311\python.exe">
+                            <small>后续 Web、PipeHub、LTtx 和更新安装操作都使用此解释器。</small>
+                          </label>
+                          <label id="onboardingQmtTradeDirField" class="field wide hidden">
+                            <span>第二个 QMT 安装目录或核心目录</span>
+                            <input id="onboardingQmtTradeDir" autocomplete="off" placeholder="D:\国金证券QMT交易端-交易端 或 D:\国金证券QMT交易端-交易端\bin.x64">
+                            <small>仅高级模式必填，保存后系统会自动同步对应代码和身份配置。</small>
+                          </label>
+                          <label class="toggle wide">
+                            <input id="onboardingDataProvider" type="checkbox" checked>
+                            <span>作为默认共享行情数据源</span>
+                          </label>
+                          <div id="onboardingStrategySettings" class="qmt-strategy-settings wide"></div>
+                          <label class="toggle wide">
+                            <input id="onboardingQmtAutoLogin" type="checkbox" checked>
+                            <span>自动启动 QMT</span>
+                          </label>
+                          <div class="qmt-login-prerequisite wide" role="note">
+                            <div class="qmt-login-prerequisite-head">
+                              <strong>自动启动前提</strong>
+                              <button type="button" class="help-tooltip-trigger" aria-label="QMT 自动启动前提说明" aria-expanded="false" data-help-text="系统可以启动 QMT 进程，但登录和 QMT 内部初始化仍取决于券商客户端设置。">?</button>
+                            </div>
+                            <div class="qmt-login-prerequisite-grid">
+                              <div>
+                                <strong>国金 QMT</strong>
+                                <span>请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。</span>
+                              </div>
+                              <div>
+                                <strong>非国金 QMT</strong>
+                                <span>请在登录界面勾选自动登录和记住密码，之后等待自动登录完成。</span>
+                              </div>
+                            </div>
+                            <small>所有 QMT 都要先完成 Python 库下载，否则自动启动后策略可能无法加载。</small>
+                          </div>
+                        </div>
+                        <div class="onboarding-actions">
+                          <button id="onboardingBackConfigBtn" class="onboarding-back-step" type="button">返回上一步</button>
+                          <button id="onboardingUseCurrentBtn" type="button">读取当前配置</button>
+                          <button id="onboardingSaveConfigBtn" class="primary" type="submit">保存账号配置</button>
+                          <span id="onboardingConfigStatus" class="metric-note"></span>
+                        </div>
+                      </form>
+
+                      <section class="onboarding-panel" data-onboarding-panel="deploy">
+                        <div class="onboarding-panel-head">
+                          <div class="onboarding-panel-copy">
+                            <strong>QMT 启动提醒</strong>
+                            <span>保存绑定后，按同步状态提示重启或登录 QMT。</span>
+                          </div>
+                          <button type="button" class="help-tooltip-trigger" aria-label="QMT 启动说明" aria-expanded="false" data-help-text="系统负责同步代码和配置并启动 QMT；QMT 登录界面的选项及国金 QMT 内部初始化需要在 QMT 中完成。">?</button>
+                        </div>
+                        <div id="onboardingDeployPaths" class="onboarding-deploy-list"></div>
+                        <div id="onboardingDeployNotice" class="guide-callout"></div>
+                        <div class="qmt-login-prerequisite compact" role="note">
+                          <div class="qmt-login-prerequisite-head">
+                            <strong>登录前提</strong>
+                            <button type="button" class="help-tooltip-trigger" aria-label="QMT 登录前提说明" aria-expanded="false" data-help-text="登录前提不由 cfquant 自动修改，请按 QMT 类型完成对应设置。">?</button>
+                          </div>
+                          <div class="qmt-login-prerequisite-grid">
+                            <div>
+                              <strong>国金 QMT</strong>
+                              <span>请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。</span>
+                            </div>
+                            <div>
+                              <strong>非国金 QMT</strong>
+                              <span>请在登录界面勾选自动登录和记住密码，之后等待自动登录完成。</span>
+                            </div>
+                          </div>
+                          <small>所有 QMT 都要先完成 Python 库下载。</small>
+                        </div>
+                        <div class="onboarding-actions">
+                          <button id="onboardingBackDeployBtn" class="onboarding-back-step" type="button">返回上一步</button>
+                          <button id="onboardingGoBridgeBtn" class="primary" type="button">检测连接</button>
+                          <span id="onboardingDeployStatus" class="metric-note"></span>
+                        </div>
+                      </section>
+
+                      <section class="onboarding-panel" data-onboarding-panel="bridge">
+                        <div class="onboarding-panel-head">
+                          <div class="onboarding-panel-copy">
+                            <strong>QMT 连接检测</strong>
+                            <span>完成 QMT 登录和内部初始化后检测通道；未启用策略自动运行时，请在“模型交易”运行已同步的托管策略。</span>
+                          </div>
+                          <button type="button" class="help-tooltip-trigger" aria-label="QMT 连接检测说明" aria-expanded="false" data-help-text="只有 QMT 登录完成、Python 库可用且托管策略已上线，连接检测才会通过。">?</button>
+                        </div>
+                        <div id="onboardingRestartChecklist" class="onboarding-restart-checklist"></div>
+                        <div id="onboardingBridgeWaiting" class="onboarding-bridge-waiting hidden" aria-live="polite">
+                          <span class="onboarding-bridge-spinner" aria-hidden="true"></span>
+                          <div>
+                            <strong>正在等待 QMT 策略上线</strong>
+                            <span id="onboardingBridgeWaitingText">系统将持续检测，请保持本页面打开。</span>
+                          </div>
+                        </div>
+                        <div id="onboardingBridgeSummary" class="onboarding-summary"></div>
+                        <div class="onboarding-actions">
+                          <button id="onboardingBackBridgeBtn" class="onboarding-back-step" type="button">返回上一步</button>
+                          <button id="onboardingRefreshBridgeBtn" class="primary" type="button">检测连接</button>
+                          <button id="onboardingForceCloseBtn" class="onboarding-force-close" type="button">强制关闭本次绑定流程</button>
+                          <span id="onboardingBridgeStatus" class="metric-note"></span>
+                        </div>
+                      </section>
+
+                      <section class="onboarding-panel" data-onboarding-panel="data">
+                        <div class="onboarding-panel-head">
+                          <div class="onboarding-panel-copy">
+                            <strong>QMT 已在线，完成接口测试</strong>
+                            <span>可以直接验证资金和持仓，也可以进入接口调试页测试具体接口。</span>
+                          </div>
+                          <button type="button" class="help-tooltip-trigger" aria-label="接口测试说明" aria-expanded="false" data-help-text="资金和持仓查询成功，说明账号路由、QMT 通道和基础策略已经基本可用。">?</button>
+                        </div>
+                        <div class="onboarding-api-ready">
+                          <strong>下一步：测试“查资金”接口</strong>
+                          <span>进入接口调试后，账号参数会使用当前绑定账号。点击“发送请求”，能够返回资金数据即表示配置完成。</span>
+                        </div>
+                        <div id="onboardingDataSummary" class="onboarding-summary"></div>
+                        <div class="onboarding-actions">
+                          <button id="onboardingBackDataBtn" class="onboarding-back-step" type="button">返回上一步</button>
+                          <button id="onboardingOpenApiBtn" class="primary" type="button">打开“查资金”接口</button>
+                          <button id="onboardingVerifyDataBtn" type="button">直接验证资金/持仓</button>
+                          <button id="onboardingOpenHomeBtn" type="button">稍后测试，进入首页</button>
+                          <span id="onboardingDataStatus" class="metric-note"></span>
+                        </div>
+                      </section>
+                      <div id="onboardingSuccess" class="onboarding-success hidden" role="dialog" aria-modal="true" aria-labelledby="onboardingSuccessTitle" aria-hidden="true">
+                        <div class="onboarding-success-mark" aria-hidden="true"></div>
+                        <div class="onboarding-success-copy">
+                          <strong id="onboardingSuccessTitle">部署成功，可以开始使用</strong>
+                          <span id="onboardingSuccessText">基础数据验证已通过。</span>
+                        </div>
+                        <div class="onboarding-success-actions">
+                          <button id="onboardingSuccessHomeBtn" class="primary" type="button">进入首页</button>
+                          <button id="onboardingSuccessApiBtn" type="button">接口调试</button>
+                          <button id="onboardingSuccessBindingsBtn" type="button">继续添加账号</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>跑通后再看</h3>
+                    <div class="guide-kv wide">
+                      <span>多账号</span>
+                      <strong>在“绑定”继续添加账号，QMT 目录填实际登录该账号的 <code>bin.x64</code>。</strong>
+                      <span>高级模式</span>
+                      <strong>需要两个 QMT，普通端和极速交易端都在线后再使用。</strong>
+                      <span>排查</span>
+                      <strong>先看绑定状态和 QMT 日志，再看 PipeHub 是否在线。</strong>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="project">
+                  <div class="guide-section">
+                    <h3>项目架构</h3>
+                    <p>cfquant 是本机 QMT 桥接控制台。它把 Web 页面、外部 Python 和大 QMT 策略脚本连在一起，由 Web 统一管理账号、运行模式、回调和更新。</p>
+                    <div class="guide-kv wide">
+                      <span>用户侧</span>
+                      <strong>网页操作，或在外部 Python 中按 xtquant 习惯调用。</strong>
+                      <span>本地服务</span>
+                      <strong>Web Server 管账号路由；PipeHub 管通用/极致模式；LTtx 管高级模式和自动发现。</strong>
+                      <span>QMT 侧</span>
+                      <strong>根据模式加载一个或两个入口脚本，再调用 QMT 原生函数。</strong>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>三种运行链路</h3>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>模式</th>
+                            <th>QMT 入口</th>
+                            <th>适合场景</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>通用模式</td>
+                            <td><code>CFQUANT_CTYPE_ALL_LOWLAT.py</code></td>
+                            <td>默认推荐。一个 QMT 即可跑通行情、查询、交易和回调。</td>
+                          </tr>
+                          <tr>
+                            <td>极致模式</td>
+                            <td><code>CFQUANT_LITE.py</code></td>
+                            <td>入口自包含，适合国泰君安、国泰海通等导入受限环境。</td>
+                          </tr>
+                          <tr>
+                            <td>高级模式</td>
+                            <td><code>CFQUANT.py</code> + <code>CFQUANT_TRADE_LOWLAT.py</code></td>
+                            <td>两个 QMT，普通端做查询和回调，极速交易端做低延迟交易请求。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>关键文件</h3>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>位置</th>
+                            <th>作用</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td><code>runtime/config/cfquant_web_config.json</code></td>
+                            <td>保存账号、QMT 目录、运行模式、共享行情源和市场路由。</td>
+                          </tr>
+                          <tr>
+                            <td><code>qmt_scripts/</code></td>
+                            <td>放给 QMT 加载的入口脚本。</td>
+                          </tr>
+                          <tr>
+                            <td><code>bin.x64/cfquant_bridge_config.json</code></td>
+                            <td>Web 为 QMT 写入的身份文件，用于区分不同 QMT 终端。</td>
+                          </tr>
+                          <tr>
+                            <td><code>log/</code></td>
+                            <td>Web、PipeHub、LTtx 和 QMT 桥接日志。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="quickstart">
+                  <div class="guide-section">
+                    <h3>快速开始</h3>
+                    <ol class="guide-list detailed">
+                      <li><strong>启动服务。</strong>运行 <code>start_cfquant.bat</code>，或执行 <code>cfquant --open-browser</code>。</li>
+                      <li><strong>完成初始化。</strong>填写资金账号、账户类型、QMT 安装目录或 <code>bin.x64</code> 目录和运行模式。</li>
+                      <li><strong>启动 QMT。</strong>保存绑定后系统自动同步项目代码和 QMT 内部策略代码，并按选择配置启动；随后按登录前提完成 QMT 登录。</li>
+                      <li><strong>启动脚本。</strong>通用模式启动一个入口；高级模式分别启动普通端和极速交易端。</li>
+                      <li><strong>验证账号。</strong>回到“绑定”页刷新状态，再查资金、持仓。</li>
+                      <li><strong>接入外部程序。</strong>先在“接口”页调通参数，再改外部 Python 代码。</li>
+                    </ol>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>启动后看哪里</h3>
+                    <div class="guide-kv wide">
+                      <span>首页</span>
+                      <strong>看当前账号资金、持仓和实时委托。</strong>
+                      <span>绑定</span>
+                      <strong>维护账号、QMT 目录、模式和共享行情源。</strong>
+                      <span>状态</span>
+                      <strong>确认 Web、PipeHub、LTtx 和 QMT 入口是否在线。</strong>
+                      <span>接口</span>
+                      <strong>调试 HTTP、WebSocket、行情下载和回调。</strong>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="web_console">
+                  <div class="guide-section">
+                    <h3>网页端</h3>
+                    <p>网页端负责配置、验证和排查。外部策略接入前，先用网页确认账号和 QMT 链路是通的。</p>
+                    <div class="web-tutorial-grid">
+                      <div class="web-tutorial-card"><strong>首页</strong><span>当前账号的资产、持仓、委托和基础状态。</span></div>
+                      <div class="web-tutorial-card"><strong>绑定</strong><span>账号、账户类型、QMT 目录、运行模式、共享行情源。</span></div>
+                      <div class="web-tutorial-card"><strong>交易</strong><span>单笔下单、批量下单、撤单和委托刷新。</span></div>
+                      <div class="web-tutorial-card"><strong>状态</strong><span>查看普通端、交易端、PipeHub、LTtx 是否在线。</span></div>
+                      <div class="web-tutorial-card"><strong>回调</strong><span>查看委托、成交、下单错误、撤单错误事件。</span></div>
+                      <div class="web-tutorial-card"><strong>接口</strong><span>在线调试行情、交易、下载和 WebSocket。</span></div>
+                      <div class="web-tutorial-card"><strong>设置</strong><span>API Key、远程访问、日志、版本检查和更新。</span></div>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>推荐顺序</h3>
+                    <ol class="guide-list detailed">
+                      <li>先在“绑定”保存账号配置。</li>
+                      <li>再在 QMT 启动对应入口脚本。</li>
+                      <li>回网页刷新绑定状态，确认实际模式在线。</li>
+                      <li>查资金和持仓，确认账号没有串。</li>
+                      <li>最后再测试下单、撤单和外部接口。</li>
+                    </ol>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="python">
+                  <div class="guide-section" id="python-prepare">
+                    <h3>1. 安装与运行前提</h3>
+                    <p>这里的“原来”指 MiniQMT / 原版 <code>xtquant</code>，“现在”指外部 Python 通过 <code>cfquant</code> 接入大 QMT。示例运行在 PyCharm、VS Code 或命令行的外部 Python 环境中；QMT 内部运行的是“部署教程”中的桥接入口脚本。</p>
+                    <ol class="guide-list detailed">
+                      <li>在运行策略的同一个 Python 环境安装 cfquant；源码开发时，在项目根目录执行可编辑安装。</li>
+                      <li>启动本地 Web，在“绑定”页配置资金账号、账户类型和 QMT 目录，并按模式部署、运行 QMT 入口脚本。</li>
+                      <li>在网页先查到资金和持仓，再运行下面的脚本；把 <code>YOUR_ACCOUNT_ID</code> 换成绑定的资金账号，保留字符串引号。</li>
+                    </ol>
+                    <pre class="guide-code" data-language="powershell">python -m pip install --upgrade cfquant
+# 需要 ZMQ 能力时安装：python -m pip install "cfquant[zmq]"
+# 使用本地源码时，在项目根目录执行：python -m pip install -e .
+python -c "import cfquant; print(cfquant.__version__, cfquant.__file__)"</pre>
+                    <pre class="guide-code">cfquant --open-browser
+cfquant qmt-scripts --output D:\QMT\cfquant</pre>
+                    <p>以上命令用于首次准备；Web 和 QMT 入口已运行时，直接执行策略即可。安装包和导出脚本不会自动完成 QMT 侧的部署。</p>
+                    <nav class="python-guide-toc" aria-label="Python 接入章节">
+                      <a href="#python-migration">新旧调用对照</a>
+                      <a href="#python-query">完整查询示例</a>
+                      <a href="#python-market">行情与历史数据</a>
+                      <a href="#python-quote">行情订阅</a>
+                      <a href="#python-callback">交易回调</a>
+                      <a href="#python-order">下单与撤单</a>
+                      <a href="#python-accounts">多账号</a>
+                      <a href="#python-routing">路由配置</a>
+                      <a href="#python-troubleshooting">迁移排查</a>
+                    </nav>
+                  </div>
+
+                  <div class="guide-section" id="python-migration">
+                    <h3>2. 原来怎么调用，现在怎么改</h3>
+                    <p>常用接口保留了接近 xtquant 的名称与参数。迁移先调整导入和连接初始化，再逐项核对策略实际用到的接口；同名入口不代表所有返回字段、异步时序和券商能力都完全一致。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">位置</th><th scope="col">原来：xtquant / MiniQMT</th><th scope="col">现在：cfquant / 大 QMT</th></tr></thead>
+                        <tbody>
+                          <tr><td>导入模块</td><td><code>from xtquant import xtdata, xtconstant</code></td><td><code>from cfquant import xtdata, xtconstant</code>；交易类、账号类和回调类的导入前缀一起替换。</td></tr>
+                          <tr><td>交易连接</td><td><code>XtQuantTrader(path, session_id)</code>，path 指向 MiniQMT 的 <code>userdata_mini</code>。</td><td><code>XtQuantTrader("", session_id)</code>；QMT 目录由 Web 账号绑定管理，构造函数中的 path 只作兼容保留。</td></tr>
+                          <tr><td>会话标识</td><td>传入用于区分连接的 session_id。</td><td>可继续传正整数；省略或传 <code>0</code> 时自动生成正整数，可读取 <code>trader.session_id</code>。</td></tr>
+                          <tr><td>账号对象</td><td><code>StockAccount("YOUR_ACCOUNT_ID", "STOCK")</code></td><td>相同写法；资金账号和账户类型必须与 Web 绑定一致，账号不能写成整数。</td></tr>
+                          <tr><td>启动与订阅</td><td><code>start → connect → subscribe</code></td><td>可保留这个顺序。若构造时传 <code>account=account</code>，<code>start()</code> 会尝试自动订阅；下文用显式订阅检查结果。</td></tr>
+                          <tr><td>行情与查询</td><td><code>get_full_tick</code>、<code>query_stock_asset</code>、<code>query_stock_positions</code> 等。</td><td>常用调用参数可沿用；数据来自当前大 QMT 桥接链路。</td></tr>
+                          <tr><td>下单与回调</td><td><code>order_stock</code>、<code>cancel_order_stock</code>、<code>XtQuantTraderCallback</code>。</td><td>沿用常用签名和回调名；返回请求结果后仍需核对委托、成交或错误回报。</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <h4>原来的导入</h4>
+                    <pre class="guide-code" data-language="python">from xtquant import xtdata, xtconstant
+from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+from xtquant.xttype import StockAccount</pre>
+                    <h4>现在的导入</h4>
+                    <pre class="guide-code" data-language="python">from cfquant import xtdata, xtconstant
+from cfquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+from cfquant.xttype import StockAccount</pre>
+                    <p>同一份策略里的交易类、常量、账号和行情模块应一起迁移，避免一部分请求仍然发往原版 MiniQMT。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-query">
+                    <h3>3. 连接、资金、持仓、委托和成交</h3>
+                    <p>这两个示例展示同一条查询流程。当前示例可单独保存为 <code>query_account.py</code> 后运行，只查询数据，不提交订单。</p>
+                    <h4>原来：连接 MiniQMT 的 userdata_mini</h4>
+                    <pre class="guide-code" data-language="python">import time
+from xtquant.xttrader import XtQuantTrader
+from xtquant.xttype import StockAccount
+
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+trader = XtQuantTrader(r"D:\QMT\userdata_mini", int(time.time()))
+try:
+    trader.start()
+    if trader.connect() != 0:
+        raise RuntimeError("MiniQMT connection failed")
+    if trader.subscribe(account) != 0:
+        raise RuntimeError("Account subscription failed")
+    print(trader.query_stock_asset(account))
+    print(trader.query_stock_positions(account))
+    print(trader.query_stock_orders(account))
+    print(trader.query_stock_trades(account))
+finally:
+    trader.stop()</pre>
+                    <h4>现在：通过 cfquant 自动路由到大 QMT</h4>
+                    <pre class="guide-code" data-language="python">from cfquant.xttrader import XtQuantTrader
+from cfquant.xttype import StockAccount
+
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+trader = XtQuantTrader("", 0)
+try:
+    trader.start()
+    if trader.connect() != 0:
+        raise RuntimeError("CFQuant connection failed; check Web and QMT")
+    if trader.subscribe(account) != 0:
+        raise RuntimeError("Account subscription failed; check binding")
+
+    print("session_id:", trader.session_id)
+    asset = trader.query_stock_asset(account)
+    if asset is None:
+        print("No asset data returned")
+    else:
+        print("account:", asset.account_id)
+        print("cash:", asset.cash, "total_asset:", asset.total_asset)
+
+    positions = trader.query_stock_positions(account)
+    for position in positions:
+        print(position.stock_code, position.volume, position.can_use_volume)
+    print("position_count:", len(positions))
+
+    for order in trader.query_stock_orders(account):
+        print("order:", order.order_id, order.stock_code,
+              order.order_status, order.traded_volume, order.order_remark)
+    for trade in trader.query_stock_trades(account):
+        print("trade:", trade.order_id, trade.stock_code,
+              trade.traded_volume, trade.traded_price)
+finally:
+    trader.stop()</pre>
+                    <p><code>query_stock_asset()</code> 返回资产对象；持仓、委托和成交查询返回对象列表，可用点号读取字段。空持仓或当日没有委托时列表可以为空。<code>connect() == 0</code> 说明连接检查通过，仍需用实际账号查询确认绑定和 QMT 数据可用。脚本结束时调用 <code>stop()</code> 释放本进程的交易订阅和连接。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-market">
+                    <h3>4. 实时行情与历史 K 线</h3>
+                    <p>仅查询行情时无需创建 <code>XtQuantTrader</code>。证券代码仍带市场后缀，例如 <code>000001.SZ</code>、<code>600000.SH</code>；先确认网页中的行情源已在线。</p>
+                    <h4>原来：xtquant 行情快照</h4>
+                    <pre class="guide-code" data-language="python">from xtquant import xtdata
+
+ticks = xtdata.get_full_tick(["000001.SZ", "600000.SH"])
+print(ticks)</pre>
+                    <h4>现在：同样的参数，改用 cfquant</h4>
+                    <pre class="guide-code" data-language="python">from cfquant import xtdata
+
+ticks = xtdata.get_full_tick(["000001.SZ", "600000.SH"])
+for code, tick in ticks.items():
+    print(code, tick.get("lastPrice"), tick.get("volume"))</pre>
+                    <h4>历史数据：先补数据，再读取指定区间</h4>
+                    <p>原来的 <code>download_history_data()</code> 和 <code>get_market_data_ex()</code> 常用参数可保留，导入前缀改为 cfquant。下面读取固定日期范围的日线；日期用于演示历史查询，可按需要调整。</p>
+                    <pre class="guide-code" data-language="python">from cfquant import xtdata
+
+code = "000001.SZ"
+xtdata.download_history_data(
+    code, period="1d", start_time="20260803", end_time="20260831"
+)
+bars = xtdata.get_market_data_ex(
+    field_list=["open", "high", "low", "close", "volume"],
+    stock_list=[code],
+    period="1d",
+    start_time="20260803",
+    end_time="20260831",
+    count=-1,
+    dividend_type="none",
+    fill_data=True,
+)
+print(type(bars), bars)
+if isinstance(bars, dict):
+    data = bars.get(code)
+    print("last five rows:", data.tail(5) if hasattr(data, "tail") else data)</pre>
+                    <p><code>period="1d"</code> 表示日线，<code>count=-1</code> 表示读取区间内的数据，<code>dividend_type="none"</code> 表示不复权。常见返回为“证券代码 → DataFrame”；具体结构取决于大 QMT 返回值，迁移时先打印类型和字段。桥接传输后的索引、类型也需核对，再接入原策略计算。</p>
+                    <p>下载操作发生在 QMT 侧。首次下载可能较慢，空结果时先检查时间区间、下载状态、行情权限和数据源；批量回测读取速度与 MiniQMT 本地数据读取不同。<code>get_local_data(data_dir=...)</code> 的同名参数不代表接管原来的 MiniQMT 本地数据目录。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-quote">
+                    <h3>5. 行情订阅、回调与取消订阅</h3>
+                    <p>原来用 <code>from xtquant import xtdata</code>，现在改为下面的导入。保留 <code>subscribe_quote(..., callback=...)</code> 和 <code>unsubscribe_quote(seq)</code>；订阅返回的序号用于取消对应订阅。</p>
+                    <pre class="guide-code" data-language="python">from cfquant import xtdata
+
+def on_quote(data):
+    print("quote:", data)
+
+seq = xtdata.subscribe_quote("000001.SZ", period="tick", callback=on_quote)
+if seq is None or int(seq) &lt;= 0:
+    raise RuntimeError("Quote subscription failed")
+print("subscribe_id:", seq)
+try:
+    xtdata.run()  # 保持进程运行，Ctrl+C 结束
+except KeyboardInterrupt:
+    pass
+finally:
+    xtdata.unsubscribe_quote(seq)</pre>
+                    <p>订阅成功不等于立即有行情变化，非交易时段可能没有推送。回调里先打印实际数据结构，再接入策略；耗时计算和网络请求应交给独立队列处理，避免阻塞回调线程。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-callback">
+                    <h3>6. 交易回调：委托、成交和错误</h3>
+                    <p>原来的 <code>XtQuantTraderCallback</code> 子类可保留常用方法名，把导入前缀改成 <code>cfquant</code>。下面是独立的监听脚本，不主动下单；账号有对应事件时才会输出。</p>
+                    <pre class="guide-code" data-language="python">from cfquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+from cfquant.xttype import StockAccount
+
+class TradeCallback(XtQuantTraderCallback):
+    def on_stock_order(self, order):
+        print("order:", order.order_id, order.order_status,
+              order.traded_volume, order.order_remark)
+
+    def on_stock_trade(self, trade):
+        print("trade:", trade.order_id, trade.stock_code,
+              trade.traded_volume, trade.traded_price)
+
+    def on_order_error(self, error):
+        print("order_error:", error.error_id, error.error_msg)
+
+    def on_cancel_error(self, error):
+        print("cancel_error:", error.error_id, error.error_msg)
+
+    def on_order_stock_async_response(self, response):
+        print("async_order:", response.seq, response.order_id,
+              response.order_remark)
+
+    def on_disconnected(self):
+        print("Trading connection closed")
+
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+trader = XtQuantTrader("", 0)
+try:
+    trader.register_callback(TradeCallback())
+    trader.start()
+    if trader.connect() != 0:
+        raise RuntimeError("Connection failed")
+    if trader.subscribe(account) != 0:
+        raise RuntimeError("Account subscription failed")
+    trader.run_forever()  # 保持进程运行，Ctrl+C 结束
+except KeyboardInterrupt:
+    pass
+finally:
+    trader.stop()</pre>
+                    <p>行情订阅和账号交易订阅是两件事：前者用 <code>xtdata.subscribe_quote()</code>，后者用 <code>trader.subscribe(account)</code>。监听不到交易事件时，检查账号订阅、QMT 入口状态和网页“回调”页；不要把 <code>run_forever()</code> 放在后续还要执行的下单代码之前。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-order">
+                    <h3>7. 下单、撤单与异步返回值</h3>
+                    <p>原版和当前的常用下单签名都是 <code>order_stock(account, stock_code, order_type, order_volume, price_type, price, strategy_name, order_remark)</code>。股票买卖用 <code>xtconstant.STOCK_BUY</code> / <code>STOCK_SELL</code>，限价用 <code>xtconstant.FIX_PRICE</code>；迁移时同时替换常量模块的导入。</p>
+                    <p>下面是完整的当前写法，默认只打印参数。确认账号、代码、数量和价格后，显式开启 <code>ENABLE_ORDER</code> 才会提交真实委托；示例价格仅用于展示参数。</p>
+                    <pre class="guide-code" data-language="python">from uuid import uuid4
+from cfquant import xtconstant
+from cfquant.xttrader import XtQuantTrader
+from cfquant.xttype import StockAccount
+
+ENABLE_ORDER = False
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+order_params = dict(
+    stock_code="000001.SZ",
+    order_type=xtconstant.STOCK_BUY,
+    order_volume=100,
+    price_type=xtconstant.FIX_PRICE,
+    price=10.00,
+    strategy_name="python_demo",
+    order_remark="demo_" + uuid4().hex[:12],
+)
+
+if not ENABLE_ORDER:
+    print("Preview only:", account.account_id, order_params)
+else:
+    trader = XtQuantTrader("", 0)
+    try:
+        trader.start()
+        if trader.connect() != 0 or trader.subscribe(account) != 0:
+            raise RuntimeError("Connection or subscription failed")
+        order_id = trader.order_stock(account, **order_params)
+        print("order_id:", order_id)
+        print("order:", trader.query_stock_order(account, order_id))
+    finally:
+        trader.stop()</pre>
+                    <p>与原来相比，这个下单调用本身可沿用，连接改用 <code>XtQuantTrader("", 0)</code>。<code>order_volume</code> 在此股票例子中以股为单位，其他品种按各自交易单位填写。每次请求使用可追踪的备注；备注有助于关联查询和回调，并不提供自动去重保证。</p>
+                    <h4>撤单：明确指定要撤的委托</h4>
+                    <p>原来的 <code>cancel_order_stock(account, order_id)</code> 调用可保留。下面先查询可撤委托，只有开启撤单且填入对应编号才提交；不会自动撤掉账号下的全部订单。</p>
+                    <pre class="guide-code" data-language="python">from cfquant.xttrader import XtQuantTrader
+from cfquant.xttype import StockAccount
+
+ENABLE_CANCEL = False
+TARGET_ORDER_ID = ""  # 填写查询或回调中得到的 order_id
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+trader = XtQuantTrader("", 0)
+try:
+    trader.start()
+    if trader.connect() != 0 or trader.subscribe(account) != 0:
+        raise RuntimeError("Connection or subscription failed")
+    orders = trader.query_stock_orders(account, cancelable_only=True)
+    for order in orders:
+        print(order.order_id, order.stock_code, order.order_remark)
+    if ENABLE_CANCEL:
+        target = next(
+            (order for order in orders
+             if str(order.order_id) == TARGET_ORDER_ID), None
+        )
+        if target is None:
+            raise RuntimeError("Target order is not in the cancelable list")
+        result = trader.cancel_order_stock(account, target.order_id)
+        print("cancel_result:", result)
+    else:
+        print("Query only; no cancellation submitted")
+finally:
+    trader.stop()</pre>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">接口 / 结果</th><th scope="col">如何确认</th></tr></thead>
+                        <tbody>
+                          <tr><td><code>order_stock()</code></td><td>返回委托编号；失败可能返回 <code>-1</code> 或抛出异常。拿到编号不代表已成交，应查委托状态或看成交回调；刚提交时单笔查询也可能暂时为空。</td></tr>
+                          <tr><td><code>order_stock_async()</code></td><td>与同步下单的参数相同，但返回的是请求序号 <code>seq</code>，不是委托编号。通过本交易实例的 <code>on_order_stock_async_response</code> 关联 <code>response.seq</code> 和 <code>response.order_id</code>，不能用 seq 撤单。</td></tr>
+                          <tr><td><code>cancel_order_stock()</code></td><td><code>0</code> 表示撤单请求调用成功，<code>-1</code> 表示失败；最终是否撤成，以后续委托状态或撤单错误回调为准。查询之后订单也可能已经成交。</td></tr>
+                          <tr><td>超时 / 连接异常</td><td>结果可能尚未确认。先按账号、代码、备注核对委托和回调，再决定是否重试，避免重复提交。</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <p>使用异步下单时，把调用放在第 6 节注册回调和订阅账号之后、<code>run_forever()</code> 之前，并保留进程等待回报。当前只读 <code>query_*_async()</code> 使用后台查询并立即返回请求序号，查询结果由独立回调线程派发；查询或回调异常会记录到 <code>cfquant.xttrader</code> 日志。这个序号不是委托编号，也不代表原版专用响应线程开关已实现。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-accounts">
+                    <h3>8. 多账号与账户类型</h3>
+                    <p>每个请求携带明确的账号对象，Web 根据绑定路由到相应 QMT。普通账户用 <code>STOCK</code>，信用账户用 <code>CREDIT</code>；同一个账号数字配上不同账户类型，含义也不同。</p>
+                    <pre class="guide-code" data-language="python">from cfquant.xttrader import XtQuantTrader
+from cfquant.xttype import StockAccount
+
+accounts = [
+    StockAccount("YOUR_STOCK_ACCOUNT_ID", "STOCK"),
+    StockAccount("YOUR_CREDIT_ACCOUNT_ID", "CREDIT"),
+]
+trader = XtQuantTrader("", 0)
+try:
+    trader.start()
+    if trader.connect() != 0:
+        raise RuntimeError("Connection failed")
+    for account in accounts:
+        if trader.subscribe(account) != 0:
+            raise RuntimeError("Subscription failed: " + account.account_id)
+        asset = trader.query_stock_asset(account)
+        print(account.account_id, asset)
+finally:
+    trader.stop()</pre>
+                    <p>其他账户类型还有 <code>FUTURE</code>、<code>FUTURE_OPTION</code>、<code>STOCK_OPTION</code>。对应业务要使用匹配的买卖 / 开平仓常量和合约代码，不能只换账户类型就照搬股票下单参数。<code>xtdata</code> 的行情调用不接收这个交易账号参数，多账号共享行情源需在 Web“绑定”页配置。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-routing">
+                    <h3>9. 旧版手动通道与当前 auto 路由</h3>
+                    <p>如果原来用的已经是 cfquant，并手工指定 Pipe 或 LTtx 通道，当前常规部署可改用默认 <code>auto</code>。Web 在线且自动发现成功时，请求进入 Web 统一路由，再按账号绑定选择通用、极致或高级模式；发现不到 Web 注册信息时，会回退到通用 PipeHub。</p>
+                    <h4>原来：显式指定连接链路</h4>
+                    <pre class="guide-code" data-language="python">from cfquant import configure
+
+configure(transport="ctypes", pipe_name=r"\\.\pipe\cfquant_pipe_hub")
+# 然后再创建 trader 或调用 xtdata</pre>
+                    <h4>现在：使用自动发现和账号路由</h4>
+                    <pre class="guide-code" data-language="python">from cfquant import configure, xtdata
+
+# 无旧配置时可省略；迁移旧脚本时可显式选择 auto
+configure(transport="auto")
+print(xtdata.get_full_tick(["000001.SZ"]))</pre>
+                    <p>检查旧脚本及启动环境中的 <code>CFQUANT_TRANSPORT</code>，避免仍被固定为 <code>ctypes</code> 或 <code>lttx</code>。自定义 LTtx 地址、端口、认证或 Pipe 名称仍需保持一致；auto 不会自动修复这些连接参数。</p>
+                    <h4>排查时：显式指定 Web 路由</h4>
+                    <pre class="guide-code" data-language="python">from cfquant import configure
+
+configure(
+    transport="web_lttx",
+    host="127.0.0.1",
+    port=2049,
+    token="LTtx",
+    web_request_channel="cfquant.web.request",
+    timeout=15,
+)
+# 然后再创建 trader 或调用 xtdata</pre>
+                    <p>这里的 <code>2049</code> 是默认 LTtx 端口，<code>LTtx</code> 是默认通信 token；都要与实际服务配置一致。它们不同于网页 HTTP 地址（默认 <code>8765</code>）及 HTTP API Key。<code>configure()</code> 应在创建交易实例、查询和订阅之前调用；切换通道后重启外部策略进程更便于确认配置生效。</p>
+                  </div>
+
+                  <div class="guide-section" id="python-troubleshooting">
+                    <h3>10. 常见迁移问题</h3>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">现象</th><th scope="col">检查与处理</th></tr></thead>
+                        <tbody>
+                          <tr><td><code>ModuleNotFoundError: cfquant</code></td><td>在策略使用的解释器执行 <code>python -m pip install cfquant</code>。核对 IDE 解释器和 <code>cfquant.__file__</code>，确认没有装到另一个环境或导入旧副本。</td></tr>
+                          <tr><td>连接返回 -1，或出现 <code>CfquantTimeout</code></td><td>检查 Web、LTtx / PipeHub 和对应 QMT 入口是否在线，再核对旧环境变量和自定义端口。交易请求超时后先查委托，不要立即重复下单。</td></tr>
+                          <tr><td>连接成功，但账号查询为空或报错</td><td>核对资金账号字符串、STOCK / CREDIT 等账户类型、绑定目录和 QMT 登录账号；先在网页执行同一查询，区分绑定问题与脚本问题。</td></tr>
+                          <tr><td>快照 / 历史数据为空</td><td>核对证券代码后缀、日期范围、周期、行情源、下载完成情况及券商权限。先查单只证券的小区间，再扩大批量。</td></tr>
+                          <tr><td>没有回调</td><td>检查回调注册、对应的行情或账号订阅、进程是否仍在运行，以及 QMT 是否实际产生了该事件；<code>stop()</code> 后本进程不再监听。</td></tr>
+                          <tr><td>同名接口不可用 / 字段不一致</td><td>对照项目文档 <code>docs/xtquant原版接口适配清单.md</code>、<code>docs/xtdata平替追踪.md</code> 和 <code>docs/xttrader平替追踪.md</code>。条件适配接口仍依赖券商大 QMT 暴露对应 callable；客户端连接管理、本地目录语义及部分异步接口不能只替换导入就假定完全兼容。</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <p>建议迁移顺序：确认导入版本 → 只读行情 → 资金和持仓 → 回调监听 → 单笔委托和撤单 → 多账号与策略自动运行。每一步都核对实际返回值，再接入下一段策略逻辑。</p>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="cftrader">
+                  <div class="guide-section" id="cftrader-overview">
+                    <h3>cftrader 批量交易与撤单</h3>
+                    <p><code>cfquant.cftrader</code> 是项目扩展的交易模块。通过 <code>CfQuantTrader(trader)</code> 复用已有 <code>XtQuantTrader</code> 实例；连接、订阅、查询、单笔撤单和回调继续交给原实例。</p>
+                    <p><strong>整批请求通过一次 RPC 发送到大 QMT，再由 QMT 内部连续调用 passorder 或 cancel。</strong> 100 笔操作对应一次批量通信、100 次本地调用，减少逐笔通信往返。批量接口适合组合调仓、批量止盈止损，以及撤掉一组未成委托；最终成交或撤成仍以委托查询和回调为准。</p>
+                    <p>需要更新并重启 Web 服务和 QMT 核心；极致模式需重新导入更新后的内置脚本。启用同账号 SH/SZ 独立市场路由时，批量撤单建议每笔带 <code>stock_code</code> 或 <code>market</code>，便于路由到正确交易端。</p>
+                    <p>本机假 QMT 桥基准（2026-09-11，100 单，5 次预热、30 次采样）显示：批量同步中位 4.802 ms，100 次单笔同步中位 9.169 ms；批量异步中位 7.093 ms，100 次单笔异步中位 9.053 ms。该结果只衡量 SDK 到桥接分发开销，不代表真实券商柜台耗时。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">100 单路径</th><th scope="col">RPC 次数</th><th scope="col">中位耗时</th><th scope="col">平均耗时</th></tr></thead>
+                        <tbody>
+                          <tr><td>批量同步 <code>order_stock_batch</code></td><td>1</td><td>4.802 ms</td><td>4.901 ms</td></tr>
+                          <tr><td>单笔同步循环 <code>order_stock</code></td><td>100</td><td>9.169 ms</td><td>8.930 ms</td></tr>
+                          <tr><td>批量异步 <code>order_stock_batch_async</code></td><td>1</td><td>7.093 ms</td><td>7.122 ms</td></tr>
+                          <tr><td>单笔异步循环 <code>order_stock_async</code></td><td>100</td><td>9.053 ms</td><td>9.186 ms</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <p>模拟账号实测（2026-09-11 02:45）：信用账号 <code>900010001595</code> 通过 Web LTtx 统一路由连接 <code>acct_4b2b38c167</code>，对 <code>600000.SH</code> 以 8.88 元、每笔 100 股测试；四条路径各 100 单均返回 <code>submitted=100</code>，复核 400 单均已撤。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">模拟账号 100 单路径</th><th scope="col">RPC 次数</th><th scope="col">提交耗时</th><th scope="col">单笔均摊</th></tr></thead>
+                        <tbody>
+                          <tr><td>批量同步 <code>order_stock_batch</code></td><td>1</td><td>963.252 ms</td><td>9.6325 ms</td></tr>
+                          <tr><td>单笔同步循环 <code>order_stock</code></td><td>100</td><td>23250.174 ms</td><td>232.5017 ms</td></tr>
+                          <tr><td>批量异步 <code>order_stock_batch_async</code></td><td>1</td><td>52.578 ms</td><td>0.5258 ms</td></tr>
+                          <tr><td>单笔异步循环 <code>order_stock_async</code></td><td>100</td><td>2952.912 ms</td><td>29.5291 ms</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <nav class="python-guide-toc" aria-label="cftrader 章节">
+                      <a href="#cftrader-sync">批量同步下单</a>
+                      <a href="#cftrader-async">批量异步与回调</a>
+                      <a href="#cftrader-cancel-sync">批量同步撤单</a>
+                      <a href="#cftrader-cancel-async">批量异步撤单</a>
+                      <a href="#cftrader-results">返回值与失败处理</a>
+                    </nav>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">接口</th><th scope="col">参数与结果</th></tr></thead>
+                        <tbody>
+                          <tr><td><a href="#python-api=cftrader.order_stock"><code>order_stock</code></a></td><td>保留原单笔参数顺序，返回订单号。</td></tr>
+                          <tr><td><a href="#python-api=cftrader.order_stock_async"><code>order_stock_async</code></a></td><td>保留原单笔参数顺序，返回请求序号 <code>seq</code>。</td></tr>
+                          <tr><td><a href="#python-api=cftrader.order_stock_batch"><code>order_stock_batch</code></a></td><td><code>account, orders, strategy_name="", order_remark="", stop_on_error=False</code>；返回逐笔订单号和批量统计。</td></tr>
+                          <tr><td><a href="#python-api=cftrader.order_stock_batch_async"><code>order_stock_batch_async</code></a></td><td>与同步批量参数相同；返回逐笔请求序号和批量统计。</td></tr>
+                          <tr><td><a href="#python-api=cftrader.cancel_order_stock_batch"><code>cancel_order_stock_batch</code></a></td><td><code>account, order_ids, stop_on_error=False</code>；返回逐笔撤单调用结果。</td></tr>
+                          <tr><td><a href="#python-api=cftrader.cancel_order_stock_batch_async"><code>cancel_order_stock_batch_async</code></a></td><td>与同步批量撤单参数相同；返回逐笔请求序号和撤单调用结果。</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <p><code>orders</code> 是订单字典列表。每笔必填 <code>stock_code</code>、<code>order_type</code>、<code>order_volume</code>、<code>price_type</code>、<code>price</code>，沿用原常量和字段名。可单独指定 <code>strategy_name</code> 和 <code>order_remark</code>；未填备注时自动生成逐笔备注。</p>
+                    <p>每批对应一个账号，参数会在发送前整批校验。下单数量必须为正整数，价格必须为有限数值，字段拼写错误会直接报错；撤单列表每项至少包含 <code>order_id</code>。完整文档位于 <code>docs/cftrader批量交易.md</code>。</p>
+                  </div>
+                  <div class="guide-section" id="cftrader-sync">
+                    <h3>批量同步下单</h3>
+                    <p>QMT 先连续提交整批，再集中解析订单号，共用一个等待窗口，不在每笔下单之间等待编号。示例默认预览参数；替换账号、代码和价格，开启 <code>ENABLE_TRADING</code> 后提交。</p>
+                    <pre class="guide-code" data-language="python">from cfquant import cftrader, xtconstant
+from cfquant.xttrader import XtQuantTrader
+from cfquant.xttype import StockAccount
+
+ENABLE_TRADING = False
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+orders = [
+    dict(stock_code="600000.SH", order_type=xtconstant.STOCK_BUY,
+         order_volume=100, price_type=xtconstant.FIX_PRICE, price=10.0),
+    dict(stock_code="000001.SZ", order_type=xtconstant.STOCK_BUY,
+         order_volume=100, price_type=xtconstant.FIX_PRICE, price=9.0),
+]
+trader = XtQuantTrader("", 0)
+orders_api = cftrader.CfQuantTrader(trader)
+if ENABLE_TRADING:
+    try:
+        trader.start()
+        if trader.connect() != 0 or trader.subscribe(account) != 0:
+            raise RuntimeError("Connection or subscription failed")
+        result = orders_api.order_stock_batch(
+            account, orders, strategy_name="rebalance", stop_on_error=True,
+        )
+        for row in result["results"]:
+            print(row["index"], row["status"], row["order_id"], row["error"])
+    finally:
+        trader.stop()
+else:
+    print("Preview only:", orders)</pre>
+                    <p><code>results</code> 与输入等长且顺序一致，<code>index</code> 从 0 开始。获得订单号不代表成交；QMT 明确拒绝记录为 <code>failed</code>，已提交但编号未确认记录为 <code>unknown</code>，此时后续订单可能已经提交。</p>
+                  </div>
+                  <div class="guide-section" id="cftrader-async">
+                    <h3>批量异步下单与原回调</h3>
+                    <p>SDK 预分配逐笔请求序号，将整批一次发送到 QMT；QMT 连续下单后返回逐笔受理状态，不等待订单号或成交。回报仍进入原来的 <code>XtQuantTraderCallback</code>，通过 <code>response.seq</code> 关联请求序号与订单号。</p>
+                    <pre class="guide-code" data-language="python">from cfquant import cftrader, xtconstant
+from cfquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+from cfquant.xttype import StockAccount
+
+class Callback(XtQuantTraderCallback):
+    def on_order_stock_async_response(self, response):
+        print("response:", response.seq, response.order_id, response.order_remark)
+
+    def on_stock_order(self, order):
+        print("order:", order.order_id, order.order_status)
+
+    def on_stock_trade(self, trade):
+        print("trade:", trade.order_id, trade.traded_volume)
+
+    def on_order_error(self, error):
+        print("error:", error)
+
+ENABLE_TRADING = False
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+orders = [
+    dict(stock_code="600000.SH", order_type=xtconstant.STOCK_BUY,
+         order_volume=100, price_type=xtconstant.FIX_PRICE, price=10.0),
+    dict(stock_code="000001.SZ", order_type=xtconstant.STOCK_BUY,
+         order_volume=100, price_type=xtconstant.FIX_PRICE, price=9.0),
+]
+trader = XtQuantTrader("", 0)
+orders_api = cftrader.CfQuantTrader(trader)
+if ENABLE_TRADING:
+    try:
+        trader.register_callback(Callback())
+        trader.start()
+        if trader.connect() != 0 or trader.subscribe(account) != 0:
+            raise RuntimeError("Connection or subscription failed")
+        result = orders_api.order_stock_batch_async(
+            account, orders, strategy_name="rebalance", stop_on_error=False,
+        )
+        for row in result["results"]:
+            print(row["index"], row["status"], row["seq"], row["order_remark"])
+        trader.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        trader.stop()
+else:
+    print("Preview only:", orders)</pre>
+                    <p>回调可能早于批量方法返回；可先用每笔 <code>order_remark</code> 关联。批量返回后需保持进程运行，<code>seq</code> 不能用于撤单。原单笔异步与批量异步共用请求序号和回调去重。</p>
+                    <h4>信用与其他账号类型</h4>
+                    <p>信用账户使用 <code>StockAccount("YOUR_CREDIT_ACCOUNT_ID", "CREDIT")</code>。融资买入使用 <code>xtconstant.CREDIT_FIN_BUY</code>，担保品卖出使用 <code>xtconstant.CREDIT_SELL</code>，同步和异步批量字段一致。期货、期货期权和股票期权沿用原账号类型、合约代码和对应常量。</p>
+                  </div>
+                  <div class="guide-section" id="cftrader-cancel-sync">
+                    <h3>批量同步撤单</h3>
+                    <p>批量撤单只提交撤单请求，不判断原委托最终是否已经撤成。返回 <code>submitted</code> 表示 QMT 的 <code>cancel</code> 调用已被接受；最终状态仍要查询委托表或等待撤单错误回调。</p>
+                    <pre class="guide-code" data-language="python">from cfquant import cftrader
+from cfquant.xttrader import XtQuantTrader
+from cfquant.xttype import StockAccount
+
+ENABLE_TRADING = False
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+order_ids = [
+    dict(order_id="1001", stock_code="600000.SH"),
+    dict(order_id="1002", market="SZ"),
+]
+trader = XtQuantTrader("", 0)
+orders_api = cftrader.CfQuantTrader(trader)
+if ENABLE_TRADING:
+    try:
+        trader.start()
+        if trader.connect() != 0 or trader.subscribe(account) != 0:
+            raise RuntimeError("Connection or subscription failed")
+        result = orders_api.cancel_order_stock_batch(
+            account, order_ids, stop_on_error=False,
+        )
+        for row in result["results"]:
+            print(row["index"], row["status"], row["order_id"], row["cancel_result"], row["error"])
+    finally:
+        trader.stop()
+else:
+    print("Preview only:", order_ids)</pre>
+                  </div>
+                  <div class="guide-section" id="cftrader-cancel-async">
+                    <h3>批量异步撤单与原回调</h3>
+                    <p>异步批量撤单使用 <code>cancel_order_stock_batch_async</code>。SDK 为每笔撤单分配 <code>seq</code>，QMT 本地连续调用 <code>cancel</code> 后返回逐笔受理状态，并继续触发原 <code>on_cancel_order_stock_async_response</code> 和 <code>on_cancel_error</code> 回调。</p>
+                    <pre class="guide-code" data-language="python">from cfquant import cftrader
+from cfquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+from cfquant.xttype import StockAccount
+
+class Callback(XtQuantTraderCallback):
+    def on_cancel_order_stock_async_response(self, response):
+        print("cancel response:", response.seq, response.order_id, response.cancel_result)
+
+    def on_cancel_error(self, error):
+        print("cancel error:", error)
+
+ENABLE_TRADING = False
+account = StockAccount("YOUR_ACCOUNT_ID", "STOCK")
+order_ids = [
+    dict(order_id="1001", stock_code="600000.SH"),
+    dict(order_id="1002", market="SZ"),
+]
+trader = XtQuantTrader("", 0)
+orders_api = cftrader.CfQuantTrader(trader)
+if ENABLE_TRADING:
+    try:
+        trader.register_callback(Callback())
+        trader.start()
+        if trader.connect() != 0 or trader.subscribe(account) != 0:
+            raise RuntimeError("Connection or subscription failed")
+        result = orders_api.cancel_order_stock_batch_async(
+            account, order_ids, stop_on_error=False,
+        )
+        for row in result["results"]:
+            print(row["index"], row["status"], row["seq"], row["cancel_result"], row["error"])
+        trader.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        trader.stop()
+else:
+    print("Preview only:", order_ids)</pre>
+                  </div>
+                  <div class="guide-section" id="cftrader-results">
+                    <h3>返回值与失败处理</h3>
+                    <p>顶层返回 <code>batch_id</code>、<code>account</code>、<code>asynchronous</code>、<code>ok</code>、<code>total</code>、<code>attempted</code>、<code>submitted</code>、<code>failed</code>、<code>unknown</code>、<code>skipped</code> 和 <code>results</code>。每行包含状态、原始索引、代码、策略名、备注、订单号或请求序号及错误信息。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead><tr><th scope="col">状态</th><th scope="col">含义</th><th scope="col">后续订单</th></tr></thead>
+                        <tbody>
+                          <tr><td><code>submitted</code></td><td>已获得订单号或请求序号，行内 <code>ok=True</code>；最终成交以原回报为准。</td><td>继续提交。</td></tr>
+                          <tr><td><code>failed</code></td><td>QMT 下单明确拒绝，同步、异步均适用，行内 <code>ok=False</code>。</td><td><code>stop_on_error=True</code> 时停止。</td></tr>
+                          <tr><td><code>unknown</code></td><td>同步编号未确认、整批回包异常或本地下单异常，行内 <code>ok=None</code>。</td><td>先查委托与回调；整批通信超时不代表 QMT 停止执行。</td></tr>
+                          <tr><td><code>skipped</code></td><td>本次未调用该行下单，行内 <code>ok=None</code>。</td><td>不会自动补发。</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <p><code>execution="qmt"</code> 标明采用 QMT 内批量执行协议，<code>qmt_submit_ms</code> 是 QMT 提交循环耗时，不包含通信与编号解析。异步所有行保留预分配 <code>seq</code>，只有 <code>submitted</code> 代表确认受理。</p>
+                    <p>批量撤单结果额外有 <code>operation="cancel"</code>；每行包含 <code>order_id</code>、可选 <code>stock_code</code>/<code>market</code>、<code>seq</code>、<code>cancel_result</code> 和 <code>error</code>。<code>cancel_result=0</code> 表示 QMT 撤单调用成功，不代表原委托已经处于已撤状态。</p>
+                    <p>QMT 本地下单异常会停止尚未执行的行。<code>trader.set_timeout()</code> 对整批 RPC 生效，整批超时或回包丢失时所有未确认行标为 <code>unknown</code>，保留原异步关联；SDK 和 Web 均不自动重试或切换通道重发。已提交订单不回滚，不保证原子提交或同时成交。</p>
+                    <p>启用 SH/SZ 独立市场路由时，连续同目标市场的订单组成一段，每段一个批量请求，由对应 QMT 本地执行；返回结果仍保持输入顺序。</p>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic active" data-guide-panel="deploy">
+                  <div class="guide-section">
+                    <h3>【cfquant】QMT 部署教程</h3>
+                    <p>本教程介绍如何在大 QMT 中部署 cfquant，并通过本地 Web 控制台或外部 Python 调用行情、查询、交易和回调能力。</p>
+                    <div class="guide-recommend">
+                      <strong>建议先部署通用模式</strong>
+                      <span>通用模式只需要一个 QMT 和一个入口脚本，最适合首次验证。国泰君安和国泰海通的 QMT 建议直接使用极致模式；国泰海通无法部署高级模式。</span>
+                    </div>
+                    <div class="deploy-primer-grid">
+                      <div>
+                        <strong>1. 先启动本地服务</strong>
+                        <span>通过 <code>start_cfquant.bat</code> 或 <code>cfquant --open-browser</code> 打开 Web 控制台，默认地址是 <code>http://127.0.0.1:8765/</code>。</span>
+                      </div>
+                      <div>
+                        <strong>2. 再准备 QMT 环境</strong>
+                        <span>登录 QMT，并确认“模型研究”或“模型交易”里的 Python 环境已经安装可用。</span>
+                      </div>
+                      <div>
+                        <strong>3. 最后绑定账号验证</strong>
+                        <span>在网页“绑定”页填写资金账号、QMT 安装目录或 <code>bin.x64</code> 和运行模式，能查到资产、持仓或行情即部署成功。</span>
+                      </div>
+                    </div>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>模式</th>
+                            <th>入口脚本</th>
+                            <th>QMT 数量</th>
+                            <th>说明</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>通用模式</td>
+                            <td><code>CFQUANT_CTYPE_ALL_LOWLAT.py</code></td>
+                            <td>1 个</td>
+                            <td>默认推荐，适合大多数行情、查询、下单、撤单和回调场景。</td>
+                          </tr>
+                          <tr>
+                            <td>极致模式</td>
+                            <td><code>CFQUANT_LITE.py</code></td>
+                            <td>1 个</td>
+                            <td>适合 QMT 对 Python 包导入有限制，或国泰君安、国泰海通等环境。</td>
+                          </tr>
+                          <tr>
+                            <td>高级模式</td>
+                            <td><code>CFQUANT.py</code> + <code>CFQUANT_TRADE_LOWLAT.py</code></td>
+                            <td>2 个</td>
+                            <td>部署复杂，但外部程序到 QMT 内部的下单链路延迟更低。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="deploy-mode-tabs" role="tablist" aria-label="QMT 部署模式">
+                    <button id="deployModeCtypes" class="active" type="button" role="tab" aria-selected="true" aria-controls="deployModePanelCtypes" data-deploy-mode="ctypes">
+                      <strong>通用模式</strong>
+                      <span>一个 QMT，默认推荐</span>
+                    </button>
+                    <button id="deployModeLite" type="button" role="tab" aria-selected="false" aria-controls="deployModePanelLite" data-deploy-mode="lite">
+                      <strong>极致模式</strong>
+                      <span>国泰君安、国泰海通等场景</span>
+                    </button>
+                    <button id="deployModeAdvanced" type="button" role="tab" aria-selected="false" aria-controls="deployModePanelAdvanced" data-deploy-mode="advanced">
+                      <strong>高级模式</strong>
+                      <span>两个 QMT，低延迟链路</span>
+                    </button>
+                  </div>
+
+                  <div class="deploy-mode-panels">
+                    <section id="deployModePanelCtypes" class="deploy-mode-panel active" role="tabpanel" aria-labelledby="deployModeCtypes" data-deploy-mode-panel="ctypes">
+                      <div class="guide-section">
+                        <h3>通用模式自动部署</h3>
+                        <ol class="guide-list detailed">
+                          <li><strong>配置账号。</strong>选择通用模式，填写对应 QMT 安装目录或 bin.x64。国泰君安和国泰海通 QMT 请使用极致模式。</li>
+                          <li><strong>保存绑定。</strong>勾选“自动导入并管理 QMT 策略”，确认账号、模拟／实盘和策略自动运行设置后保存。初始化与后续绑定均由系统自动导入策略。</li>
+                          <li><strong>启动并登录 QMT。</strong>按保存后的提示重启 QMT；勾选“自动启动 QMT”后，在启动的 QMT 中登录即可。QMT 已设置自动登录时，请等待自动登录完成。</li>
+                          <li><strong>检查连接。</strong>登录后查看绑定列表中的通道状态，或点击“检测连接”。未勾选“QMT 启动后自动运行”时，在“模型交易”运行已导入的托管策略。</li>
+                        </ol>
+                        <div class="guide-callout warning">
+                          <strong>QMT 登录前提</strong>
+                          <span>国金 QMT：请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。非国金 QMT：请在登录界面勾选自动登录和记住密码。所有 QMT 都要先完成 Python 库下载。</span>
+                        </div>
+                        <div class="guide-callout">
+                          <strong>等待退出或部署失败</strong>
+                          <span>提示等待退出时，请正常退出 QMT，保持 cfquant 运行，等待模型配置完成后再启动。部署失败时，按错误提示修正目录、权限或模型账号 Key 后重新保存。</span>
+                        </div>
+                        <figure class="guide-image-card">
+                          <img src="/image/qmt_deploy/image-10.png" alt="通用模式账号绑定示意">
+                          <figcaption>通用模式账号与 QMT 目录配置示意，以当前绑定表单为准。</figcaption>
+                        </figure>
+                      </div>
+                    </section>
+
+                    <section id="deployModePanelLite" class="deploy-mode-panel" role="tabpanel" aria-labelledby="deployModeLite" data-deploy-mode-panel="lite">
+                      <div class="guide-section">
+                        <h3>极致模式自动部署</h3>
+                        <ol class="guide-list detailed">
+                          <li><strong>配置账号。</strong>选择极致模式，填写对应 QMT 安装目录或 bin.x64。系统会自动部署自包含策略。</li>
+                          <li><strong>保存绑定。</strong>勾选“自动导入并管理 QMT 策略”，确认账号、模拟／实盘和策略自动运行设置后保存。初始化与后续绑定均由系统自动导入策略。</li>
+                          <li><strong>启动并登录 QMT。</strong>按保存后的提示重启 QMT；勾选“自动启动 QMT”后，在启动的 QMT 中登录即可。QMT 已设置自动登录时，请等待自动登录完成。</li>
+                          <li><strong>检查连接。</strong>登录后查看绑定列表中的通道状态，或点击“检测连接”。未勾选“QMT 启动后自动运行”时，在“模型交易”运行已导入的托管策略。</li>
+                        </ol>
+                        <div class="guide-callout warning">
+                          <strong>QMT 登录前提</strong>
+                          <span>国金 QMT：请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。非国金 QMT：请在登录界面勾选自动登录和记住密码。所有 QMT 都要先完成 Python 库下载。</span>
+                        </div>
+                        <div class="guide-callout">
+                          <strong>等待退出或部署失败</strong>
+                          <span>提示等待退出时，请正常退出 QMT，保持 cfquant 运行，等待模型配置完成后再启动。部署失败时，按错误提示修正目录、权限或模型账号 Key 后重新保存。</span>
+                        </div>
+                        <figure class="guide-image-card">
+                          <img src="/image/qmt_deploy/image-13.png" alt="极致模式账号绑定示意">
+                          <figcaption>极致模式账号与 QMT 目录配置示意，以当前绑定表单为准。</figcaption>
+                        </figure>
+                      </div>
+                    </section>
+
+                    <section id="deployModePanelAdvanced" class="deploy-mode-panel" role="tabpanel" aria-labelledby="deployModeAdvanced" data-deploy-mode-panel="advanced">
+                      <div class="guide-section">
+                        <h3>高级模式自动部署</h3>
+                        <ol class="guide-list detailed">
+                          <li><strong>配置账号。</strong>选择高级模式，分别填写普通端和极速交易端两个不同的 QMT 目录，系统分别部署对应策略。</li>
+                          <li><strong>保存绑定。</strong>勾选“自动导入并管理 QMT 策略”，确认账号、模拟／实盘和策略自动运行设置后保存。初始化与后续绑定均由系统自动导入策略。</li>
+                          <li><strong>启动并登录 QMT。</strong>按保存后的提示重启 QMT；勾选“自动启动 QMT”后，在启动的 QMT 中登录即可。QMT 已设置自动登录时，请等待自动登录完成。</li>
+                          <li><strong>检查连接。</strong>登录后查看绑定列表中的通道状态，或点击“检测连接”。未勾选“QMT 启动后自动运行”时，在“模型交易”运行已导入的托管策略。</li>
+                        </ol>
+                        <div class="guide-callout warning">
+                          <strong>QMT 登录前提</strong>
+                          <span>国金 QMT：请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。非国金 QMT：请在登录界面勾选自动登录和记住密码。所有 QMT 都要先完成 Python 库下载。</span>
+                        </div>
+                        <div class="guide-callout">
+                          <strong>等待退出或部署失败</strong>
+                          <span>提示等待退出时，请正常退出 QMT，保持 cfquant 运行，等待模型配置完成后再启动。部署失败时，按错误提示修正目录、权限或模型账号 Key 后重新保存。</span>
+                        </div>
+                        <p>两个 QMT 都需要完成登录。自动启动选项仅启动绑定的主 QMT 目录，极速交易端需单独启动并登录。</p>
+                        <figure class="guide-image-card">
+                          <img src="/image/qmt_deploy/image-19.png" alt="高级模式账号绑定示意">
+                          <figcaption>高级模式账号与 QMT 目录配置示意，以当前绑定表单为准。</figcaption>
+                        </figure>
+                      </div>
+                    </section>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>四、写在最后</h3>
+                    <ul class="guide-list detailed">
+                      <li>部署相对复杂一些，但延迟确实是做得比较低。</li>
+                      <li>有不清楚的可以通过首页加入项目交流群。</li>
+                      <li>如有远程帮忙部署指导需求，可以添加微信 <code>13696119612</code>，服务费 100 元/次。</li>
+                      <li>如有其他二次开发需求、整体系统架构方案、多账号交易矩阵、低延迟链路需求，敬请联系。</li>
+                    </ul>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="same_account_market">
+                  <div class="guide-section">
+                    <h3>同账号独立市场</h3>
+                    <p>适合同一资金账号拆成上海、深圳两个 QMT 交易端的场景。网页保存一个主账号，交易请求按证券后缀自动分流。</p>
+                    <div class="guide-kv wide">
+                      <span><code>*.SH</code></span>
+                      <strong>走上海 QMT 子桥。</strong>
+                      <span><code>*.SZ</code></span>
+                      <strong>走深圳 QMT 子桥。</strong>
+                      <span>批量下单</span>
+                      <strong>自动拆成 SH、SZ 两组请求，再合并返回。</strong>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>配置步骤</h3>
+                    <ol class="guide-list detailed">
+                      <li>在“绑定”页编辑账号，打开“同账号独立市场路由”。</li>
+                      <li>分别填写上海、深圳 QMT 的 <code>bin.x64</code> 目录。</li>
+                      <li>保存后确认两个目录生成市场身份文件。</li>
+                      <li>上海 QMT 加载 <code>_SH.py</code>，深圳 QMT 加载 <code>_SZ.py</code>。</li>
+                      <li>深圳入口需挂在深市标的运行，例如 <code>SZ399001</code> 或 <code>000001.SZ</code>；不要把 <code>_SZ.py</code> 挂在 <code>SH000300</code> 上。</li>
+                    </ol>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>入口文件</h3>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>模式</th>
+                            <th>上海</th>
+                            <th>深圳</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>通用</td>
+                            <td><code>CFQUANT_CTYPE_ALL_LOWLAT_SH.py</code></td>
+                            <td><code>CFQUANT_CTYPE_ALL_LOWLAT_SZ.py</code></td>
+                          </tr>
+                          <tr>
+                            <td>极致</td>
+                            <td><code>CFQUANT_LITE_SH.py</code></td>
+                            <td><code>CFQUANT_LITE_SZ.py</code></td>
+                          </tr>
+                          <tr>
+                            <td>高级交易端</td>
+                            <td><code>CFQUANT_TRADE_LOWLAT_SH.py</code></td>
+                            <td><code>CFQUANT_TRADE_LOWLAT_SZ.py</code></td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="bridge">
+                  <div class="guide-section">
+                    <h3>多账号通道</h3>
+                    <p><code>bridge_id</code> 是内部路由标识。普通用户只需要填写账号和 QMT 目录，Web 会按目录复用或分配通道。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>场景</th>
+                            <th>建议</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>单 QMT 单账号</td>
+                            <td>使用默认通道 <code>default</code>。</td>
+                          </tr>
+                          <tr>
+                            <td>单 QMT 多账号</td>
+                            <td>多个账号可共用同一个 QMT 目录。</td>
+                          </tr>
+                          <tr>
+                            <td>多 QMT 多账号</td>
+                            <td>每个账号填写实际登录它的 QMT <code>bin.x64</code> 目录。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>排查要点</h3>
+                    <ul class="guide-list detailed">
+                      <li>QMT 日志里的 <code>bridge_id</code> 要和网页绑定状态一致。</li>
+                      <li>目录填错时，Web 可能把身份文件写到另一个 QMT。</li>
+                      <li>外部程序优先传 <code>account_id</code>，不要手动写死 <code>bridge_id</code>。</li>
+                    </ul>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="account">
+                  <div class="guide-section">
+                    <h3>账号绑定</h3>
+                    <p>账号绑定是运行配置的核心。每个账号保存自己的账户类型、QMT 目录、首选模式、启用状态和共享行情源标记。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>字段</th>
+                            <th>说明</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>资金账号</td>
+                            <td>外部请求按它路由，普通和信用账户要区分账户类型。</td>
+                          </tr>
+                          <tr>
+                            <td>QMT 目录</td>
+                            <td>填写对应 QMT 的安装目录或 <code>bin.x64</code>，用于自动同步项目代码、内部策略代码、身份文件和后续更新。</td>
+                          </tr>
+                          <tr>
+                            <td>运行模式</td>
+                            <td><code>ctypes</code>、<code>lite</code>、<code>lttx</code> 三选一。</td>
+                          </tr>
+                          <tr>
+                            <td>高级模式第二目录</td>
+                            <td>选择高级模式时必须填写另一个 QMT 的安装目录或 <code>bin.x64</code>。</td>
+                          </tr>
+                          <tr>
+                            <td>共享行情源</td>
+                            <td>多账号时只选一个稳定账号，避免重复订阅全推行情。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>保存后怎么验证</h3>
+                    <ol class="guide-list detailed">
+                      <li>刷新“绑定状态”，看首选模式和实际模式。</li>
+                      <li>点击“验证”，确认资金和持仓来自正确账号。</li>
+                      <li>高级模式离线时会自动回退通用模式，状态里会显示回退原因。</li>
+                    </ol>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="trade">
+                  <div class="guide-section">
+                    <h3>交易与回调</h3>
+                    <p>交易页适合做实盘前验证：先查资金和持仓，再用小数量测试下单、撤单和回调。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>能力</th>
+                            <th>说明</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>单笔下单</td>
+                            <td><code>POST /api/order</code>，对应 <code>order_stock</code>。</td>
+                          </tr>
+                          <tr>
+                            <td>批量下单</td>
+                            <td><code>POST /api/orders/batch</code>，逐笔提交并合并结果。</td>
+                          </tr>
+                          <tr>
+                            <td>撤单</td>
+                            <td><code>POST /api/cancel</code>，委托状态仍以 QMT 和回调为准。</td>
+                          </tr>
+                          <tr>
+                            <td>信用查询</td>
+                            <td>支持信用资产、标的、担保品、合约等只读探测。</td>
+                          </tr>
+                          <tr>
+                            <td>回调</td>
+                            <td><code>GET /api/callbacks</code> 或 <code>WS /ws/callbacks</code> 接收委托、成交和错误事件。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>实盘前检查</h3>
+                    <ul class="guide-list detailed">
+                      <li>确认页面当前账号就是要交易的资金账号。</li>
+                      <li>确认下单确认文本、价格、数量和买卖方向。</li>
+                      <li>确认回调页能收到委托或错误事件。</li>
+                      <li>自动化程序不要只看请求返回，还要结合回调或后续查询确认最终状态。</li>
+                    </ul>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="latency">
+                  <div class="guide-section">
+                    <h3>延迟参考</h3>
+                    <p>延迟只表示本机程序到 QMT 脚本的链路量级，不代表券商柜台或交易所确认速度。实际结果会受 QMT 版本、券商环境、机器负载和交易时段影响。</p>
+                    <div class="guide-callout">
+                      <strong>推荐读法</strong>
+                      <span>普通用户优先看稳定性；低延迟交易再比较极速交易端和 ctypes 交易通道。</span>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>当前测试量级</h3>
+                    <div class="guide-table-wrap latency-table wide">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>链路</th>
+                            <th>查询量级</th>
+                            <th>下单请求样本</th>
+                            <th>适合场景</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>通用 ctypes</td>
+                            <td>约 180-260 ms</td>
+                            <td>约 20 ms</td>
+                            <td>部署简单、功能验证、多账号日常使用。</td>
+                          </tr>
+                          <tr>
+                            <td>高级普通端</td>
+                            <td>约 250 ms</td>
+                            <td>约 176 ms</td>
+                            <td>查询、行情、账号级回调。</td>
+                          </tr>
+                          <tr>
+                            <td>高级极速交易端</td>
+                            <td>约 1-4 ms</td>
+                            <td>约 1 ms</td>
+                            <td>追求更低本机到 QMT 下单链路。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>注意事项</h3>
+                    <ul class="guide-list detailed">
+                      <li>撤单请求返回和委托状态变成“已撤”不是同一个时点。</li>
+                      <li>午间、收盘后和首次请求通常比交易时段更不稳定。</li>
+                      <li>需要严肃评估时，用自己的券商、账号、机器和目标时间段重新测。</li>
+                    </ul>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="api">
+                  <div class="guide-section">
+                    <h3>外部接口</h3>
+                    <p>“接口”页就是在线调试台。外部程序接入前，先在这里跑通同一个账号和参数。</p>
+                    <pre class="guide-code">curl -H "X-API-Key: your-api-key" ^
+  "http://127.0.0.1:8765/api/account?account_id=YOUR_ACCOUNT_ID&sections=asset,positions&force=1"</pre>
+                    <p>启用 API Key 后，HTTP 使用 <code>X-API-Key</code> 请求头；WebSocket 使用 <code>apikey</code> 查询参数。</p>
+                  </div>
+
+                  <div class="guide-section">
+                    <h3>常用接口</h3>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>接口</th>
+                            <th>用途</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr><td><code>GET /api/account</code></td><td>资金、持仓、委托、成交。</td></tr>
+                          <tr><td><code>POST /api/order</code></td><td>单笔下单。</td></tr>
+                          <tr><td><code>POST /api/orders/batch</code></td><td>批量下单。</td></tr>
+                          <tr><td><code>POST /api/cancel</code></td><td>撤单。</td></tr>
+                          <tr><td><code>POST /api/data/full-tick</code></td><td>实时 Tick。</td></tr>
+                          <tr><td><code>POST /api/data/market</code></td><td>K 线和行情数据。</td></tr>
+                          <tr><td><code>POST /api/data/history/download</code></td><td>历史行情下载。</td></tr>
+                          <tr><td><code>POST /api/data/financial</code></td><td>财务数据读取。</td></tr>
+                          <tr><td><code>GET /api/callbacks</code></td><td>读取交易回调。</td></tr>
+                          <tr><td><code>WS /ws/callbacks</code></td><td>实时交易回调。</td></tr>
+                          <tr><td><code>WS /ws/quotes</code></td><td>实时行情事件。</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="tutorial-topic" data-guide-panel="troubleshooting">
+                  <div class="guide-section">
+                    <h3>排查问题</h3>
+                    <p>按层排查最快：先确认 Web 能访问，再看本地服务，再看 QMT 脚本，最后看账号和权限。</p>
+                    <div class="guide-table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>现象</th>
+                            <th>优先检查</th>
+                            <th>处理</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr>
+                            <td>网页打不开</td>
+                            <td>Web 端口、启动日志</td>
+                            <td>重启服务，查看 <code>log/cfquant_web_server.stderr.log</code>。</td>
+                          </tr>
+                          <tr>
+                            <td>QMT 离线</td>
+                            <td>入口脚本、QMT 登录、<code>bridge_id</code></td>
+                            <td>重启 QMT 入口，确认加载了当前模式对应脚本。</td>
+                          </tr>
+                          <tr>
+                            <td>高级模式缺交易端</td>
+                            <td>第二个 QMT 目录、<code>CFQUANT_TRADE_LOWLAT.py</code></td>
+                            <td>在绑定页补充极速交易端目录并重新保存。</td>
+                          </tr>
+                          <tr>
+                            <td>查不到账号数据</td>
+                            <td>账号类型、QMT 登录账号、绑定目录</td>
+                            <td>在绑定页点击验证，确认资金和持仓来自预期账号。</td>
+                          </tr>
+                          <tr>
+                            <td>下单失败</td>
+                            <td>确认文本、价格数量、权限、回调错误</td>
+                            <td>先小数量测试，再查看回调页和 QMT 日志。</td>
+                          </tr>
+                          <tr>
+                            <td>版本或缓存异常</td>
+                            <td>前端版本、浏览器缓存</td>
+                            <td>重启 Web 后用 <code>Ctrl + F5</code> 强制刷新。</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </article>
+              </section>
+            </div>
+          </div>
+
+          <div class="panel span-12 view-panel view-docs docs-panel hidden">
+            <div id="cfquantDocs" class="cfquant-docs"></div>
+          </div>
+
+          <div class="panel span-12 view-panel view-overview view-trade view-orders view-status view-callbacks">
+            <div class="panel-head">
+              <h2>日志</h2>
+              <button id="clearLogBtn">清空</button>
+            </div>
+            <div id="logBox" class="log-box"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="bindingDialogOverlay" class="binding-dialog-overlay hidden" aria-hidden="true">
+    <div class="binding-dialog" role="dialog" aria-modal="true" aria-labelledby="bindingDialogTitle">
+      <div class="binding-dialog-head">
+        <div>
+          <strong id="bindingDialogTitle">添加账号绑定</strong>
+          <span id="bindingDialogSubtitle">保存后系统会按账号自动路由到对应 QMT 通道。</span>
+        </div>
+        <div class="onboarding-head-actions">
+          <button type="button" class="help-tooltip-trigger" aria-label="绑定流程说明" aria-expanded="false" data-help-text="保存绑定后系统自动同步项目代码、QMT 内部策略代码和身份配置；填写 QMT 目录即可，无需手工复制。">?</button>
+          <button id="closeBindingDialogBtn" type="button" aria-label="关闭绑定编辑">关闭</button>
+        </div>
+      </div>
+      <form id="bindingForm" class="form-grid binding-dialog-form">
+        <label class="field">
+          <span>账号名称（可选）</span>
+          <input id="bindingDisplayName" name="display_name" placeholder="主账户 / 信用账户 / 家人账户" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>账号</span>
+          <input id="bindingAccountId" name="account_id" placeholder="请输入资金账号" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>账户类型</span>
+          <select id="bindingAccountType" name="account_type">
+            <option value="STOCK">普通证券账户</option>
+            <option value="CREDIT">信用账户</option>
+            <option value="FUTURE">期货账户</option>
+            <option value="FUTURE_OPTION">期货期权账户</option>
+            <option value="STOCK_OPTION">股票期权账户</option>
+                <option value="HUGANGTONG">沪港通账户</option>
+                <option value="SHENGANGTONG">深港通账户</option>
+          </select>
+        </label>
+        <label class="toggle binding-dialog-wide-row">
+          <input id="bindingEnabled" name="enabled" type="checkbox" checked>
+          <span>启用此绑定账号</span>
+        </label>
+        <label class="field wide">
+          <span>QMT 安装目录或核心目录（可选）</span>
+          <input id="bindingQmtDir" name="qmt_dir" placeholder="D:\国金证券QMT交易端 或 D:\国金证券QMT交易端\bin.x64" autocomplete="off">
+          <div id="bindingQmtProcessStatus" class="metric-note" role="status" aria-live="polite">输入目录后将检测对应 QMT 进程和 PID。</div>
+          <small>保存后自动同步项目代码、QMT 内部策略代码和身份配置到对应目录；无需手工复制。留空时该账号仍可运行，但自动同步、自动更新、脚本定位和多 QMT 部署辅助会失效。</small>
+        </label>
+        <label class="toggle binding-dialog-wide-row">
+          <input id="bindingQmtAutoLogin" name="qmt_auto_login" type="checkbox" checked>
+          <span>自动启动 QMT</span>
+        </label>
+        <div id="bindingQmtAutoLoginSettings" class="binding-qmt-autostart-settings binding-dialog-wide-row hidden">
+          <div class="binding-qmt-autostart-head">
+            <div class="qmt-section-heading">
+              <strong>每日重启时间</strong>
+              <button type="button" class="help-tooltip-trigger" aria-label="QMT 自动启动设置说明" aria-expanded="false" data-help-text="勾选后系统会启动绑定目录的 QMT，并按设置的时间重启；QMT 登录前提仍需在客户端内完成。">?</button>
+            </div>
+            <span>系统会启动绑定目录的 QMT，并按下列时间重启。</span>
+          </div>
+          <div id="bindingQmtRestartTimes" class="binding-qmt-restart-times"></div>
+          <button id="addBindingQmtRestartTimeBtn" type="button">添加重启时间</button>
+        </div>
+        <div class="qmt-login-prerequisite wide" role="note">
+          <div class="qmt-login-prerequisite-head">
+            <strong>自动启动前提</strong>
+            <button type="button" class="help-tooltip-trigger" aria-label="QMT 自动启动前提说明" aria-expanded="false" data-help-text="系统可以启动 QMT 进程，但登录和 QMT 内部初始化仍取决于券商客户端设置。">?</button>
+          </div>
+          <div class="qmt-login-prerequisite-grid">
+            <div>
+              <strong>国金 QMT</strong>
+              <span>请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。</span>
+            </div>
+            <div>
+              <strong>非国金 QMT</strong>
+              <span>请在登录界面勾选自动登录和记住密码，之后等待自动登录完成。</span>
+            </div>
+          </div>
+          <small>所有 QMT 都要先完成 Python 库下载，否则自动启动后策略可能无法加载。</small>
+        </div>
+        <label class="field wide">
+          <span>账号模式</span>
+          <select id="bindingMode" name="mode">
+            <option value="ctypes">通用模式（ctypes）</option>
+            <option value="lite">极致模式（纯 ctypes 自包含）</option>
+            <option value="lttx">高级模式（两个 QMT）</option>
+          </select>
+        </label>
+        <label id="bindingQmtTradeDirField" class="field wide hidden">
+          <span>高级模式极速交易端 QMT 安装目录或核心目录</span>
+          <input id="bindingQmtTradeDir" name="qmt_trade_dir" placeholder="D:\国金证券QMT交易端-交易端 或 D:\国金证券QMT交易端-交易端\bin.x64" autocomplete="off">
+          <div id="bindingQmtTradeProcessStatus" class="metric-note" role="status" aria-live="polite"></div>
+          <small>高级模式必须填写与普通端不同的第二个 QMT，保存后系统会自动同步对应代码并写入身份配置。</small>
+        </label>
+        <details class="market-routing-panel binding-dialog-bleed wide" open>
+          <summary class="market-routing-head">
+            <div>
+              <strong>同账号独立市场路由</strong>
+              <small>同一资金账号拆成上海、深圳两个 QMT 交易端时使用；持仓查询子账号 Key 只用于独立市场脚本。</small>
+            </div>
+          </summary>
+          <div class="market-routing-body">
+            <label class="toggle binding-dialog-toggle binding-dialog-wide-row">
+              <input id="bindingMarketRoutingEnabled" name="market_routing_enabled" type="checkbox">
+              <span>开启同账号独立市场路由</span>
+            </label>
+            <div class="market-route-groups">
+              <section class="market-route-group">
+                <div class="market-route-title">
+                  <strong>SH 上海</strong>
+                  <span>上海交易端</span>
+                </div>
+                <div class="market-route-fields">
+                  <label class="field wide">
+                    <span>交易端目录</span>
+                    <input id="bindingMarketShQmtDir" name="market_sh_qmt_dir" placeholder="D:\上海QMT交易端 或 D:\上海QMT交易端\bin.x64" autocomplete="off">
+                  </label>
+                  <label class="field">
+                    <span>bridge_id（可选）</span>
+                    <input id="bindingMarketShBridgeId" name="market_sh_bridge_id" placeholder="自动生成" autocomplete="off">
+                  </label>
+                  <label class="field">
+                    <span>持仓查询子账号 Key（可选）</span>
+                    <input id="bindingMarketShPositionAccountId" name="market_sh_position_account_id" placeholder="2____10501____98101____49____资金账号____" autocomplete="off">
+                  </label>
+                </div>
+              </section>
+              <section class="market-route-group">
+                <div class="market-route-title">
+                  <strong>SZ 深圳</strong>
+                  <span>深圳交易端</span>
+                </div>
+                <div class="market-route-fields">
+                  <label class="field wide">
+                    <span>交易端目录</span>
+                    <input id="bindingMarketSzQmtDir" name="market_sz_qmt_dir" placeholder="D:\深圳QMT交易端 或 D:\深圳QMT交易端\bin.x64" autocomplete="off">
+                  </label>
+                  <label class="field">
+                    <span>bridge_id（可选）</span>
+                    <input id="bindingMarketSzBridgeId" name="market_sz_bridge_id" placeholder="自动生成" autocomplete="off">
+                  </label>
+                  <label class="field">
+                    <span>持仓查询子账号 Key（可选）</span>
+                    <input id="bindingMarketSzPositionAccountId" name="market_sz_position_account_id" placeholder="2____10502____98102____49____资金账号____" autocomplete="off">
+                  </label>
+                </div>
+              </section>
+            </div>
+          </div>
+        </details>
+        <div id="bindingStrategySettings" class="qmt-strategy-settings wide"></div>
+        <label class="toggle binding-dialog-wide-row">
+          <input id="bindingDataProvider" name="data_provider" type="checkbox">
+          <span>作为共享行情数据提供商</span>
+        </label>
+        <div class="binding-script-preview wide">
+          <div id="bindingDialogQmtScriptGuide" class="binding-script-guide"></div>
+          <div id="bindingDialogQmtScriptSummary" class="metric-note"></div>
+          <div id="bindingDialogQmtScriptList" class="binding-script-list compact"></div>
+        </div>
+        <div id="bindingSaveStatus" class="binding-save-status hidden" role="status" aria-live="polite"></div>
+        <div class="binding-dialog-actions">
+          <button id="reinitializeSetupBtn" type="button">重新初始化默认配置</button>
+          <span id="bindingDialogHint" class="metric-note"></span>
+          <button id="cancelBindingDialogBtn" type="button">取消</button>
+          <button class="primary" type="submit">保存绑定</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="bindingQmtProcessOverlay" class="binding-dialog-overlay hidden" aria-hidden="true">
+    <div class="binding-dialog" role="dialog" aria-modal="true" aria-labelledby="bindingQmtProcessTitle">
+      <div class="binding-dialog-head">
+        <div>
+          <strong id="bindingQmtProcessTitle">检测到 QMT 正在运行</strong>
+          <span>策略部署需要先关闭对应目录启动的 QMT。</span>
+        </div>
+      </div>
+      <div id="bindingQmtProcessPromptStatus" class="binding-qmt-guide-status" role="status"></div>
+      <div class="binding-dialog-actions">
+        <button id="bindingQmtProcessStopContinueBtn" class="primary" type="button">关闭 QMT 并继续</button>
+        <button id="bindingQmtProcessRecheckBtn" type="button">手动关闭后重新检测</button>
+        <button id="bindingQmtProcessCancelBtn" type="button">取消保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="bindingQmtGuideOverlay" class="binding-dialog-overlay binding-qmt-guide-overlay hidden" aria-hidden="true">
+    <div class="binding-dialog binding-qmt-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="bindingQmtGuideTitle">
+      <div class="binding-dialog-head">
+        <div>
+          <strong id="bindingQmtGuideTitle">绑定已保存，QMT 启动提醒</strong>
+          <span id="bindingQmtGuideSubtitle">请按部署状态提示重启或登录 QMT。</span>
+        </div>
+        <div class="onboarding-head-actions">
+          <button type="button" data-open-tutorial data-tutorial-return="返回部署">阅读教程</button>
+          <button type="button" class="help-tooltip-trigger" aria-label="QMT 启动提醒说明" aria-expanded="false" data-help-text="先确认代码同步和身份配置成功，再按 QMT 类型完成登录；连接检测需要等待策略上线。">?</button>
+          <button id="closeBindingQmtGuideBtn" type="button" aria-label="关闭 QMT 策略指引">关闭</button>
+        </div>
+      </div>
+      <div class="binding-qmt-guide-body">
+        <div id="bindingQmtGuideInstruction" class="binding-qmt-guide-instruction"></div>
+        <p id="bindingQmtLoginReminder" class="qmt-login-reminder">国金 QMT：请手动输入密码登录，登录后在 QMT 内完成相应初始化设置。非国金 QMT：请在登录界面勾选自动登录和记住密码，然后等待自动登录完成。所有 QMT 都要先完成 Python 库下载。</p>
+        <div>
+          <div class="binding-qmt-guide-section-head">
+            <strong>自动部署状态</strong>
+          </div>
+          <div id="bindingQmtStrategyStatus" class="binding-qmt-status-summary" role="status"></div>
+          <div id="bindingQmtGuideStatus" class="binding-qmt-guide-status"></div>
+        </div>
+        <div id="bindingQmtAutoLoginPanel" class="binding-qmt-autologin-panel hidden">
+          <div class="binding-qmt-guide-section-head">
+            <strong>QMT 自动启动状态</strong>
+          </div>
+          <div id="bindingQmtAutoLoginStatus" class="binding-qmt-guide-status"></div>
+        </div>
+        <div>
+          <div class="binding-qmt-guide-section-head">
+            <strong>对应 QMT 目录</strong>
+          </div>
+          <div id="bindingQmtGuideTargets" class="binding-qmt-guide-status"></div>
+        </div>
+        <div id="bindingQmtLoginCheckPanel" class="binding-qmt-login-check-panel hidden">
+          <div class="binding-qmt-guide-section-head">
+            <strong>登录检测</strong>
+          </div>
+          <div id="bindingQmtLoginCheckStatus" class="binding-qmt-guide-status"></div>
+        </div>
+      </div>
+      <div class="binding-qmt-guide-actions">
+        <button id="backBindingQmtGuideBtn" type="button">返回上一步</button>
+        <button id="checkBindingQmtConnectionBtn" type="button">检测 QMT 登录</button>
+        <button id="closeBindingQmtGuideBottomBtn" class="primary" type="button">知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="qmtUpdateProgressOverlay" class="update-progress-overlay hidden" aria-hidden="true">
+    <div class="update-progress-dialog" role="dialog" aria-modal="true" aria-labelledby="qmtUpdateProgressTitle">
+      <div class="update-progress-head">
+        <div>
+          <strong id="qmtUpdateProgressTitle">QMT 核心更新进度</strong>
+          <span id="qmtUpdateProgressDetail"><i class="update-progress-spinner" aria-hidden="true"></i>准备更新 QMT 核心包...</span>
+        </div>
+        <button id="qmtUpdateProgressCloseBtn" type="button" disabled>关闭</button>
+      </div>
+      <div class="update-progress-meter" aria-hidden="true">
+        <span id="qmtUpdateProgressBar"></span>
+      </div>
+      <div class="update-progress-meta">
+        <span>当前进度</span>
+        <strong id="qmtUpdateProgressPercent">0%</strong>
+      </div>
+      <ol id="qmtUpdateProgressSteps" class="update-progress-steps"></ol>
+      <div class="update-progress-actions">
+        <button id="qmtUpdateProgressCloseBottomBtn" type="button" disabled>完成后关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="updateConfirmOverlay" class="binding-dialog-overlay hidden" aria-hidden="true">
+    <div class="binding-dialog" role="dialog" aria-modal="true" aria-labelledby="updateConfirmTitle">
+      <div class="binding-dialog-head"><div><strong id="updateConfirmTitle">确认更新</strong><span id="updateConfirmMessage"></span></div></div>
+      <div class="binding-dialog-actions">
+        <button id="updateConfirmCancelBtn" type="button">取消</button>
+        <button id="updateConfirmAcceptBtn" class="primary" type="button">确认更新</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="updateRestartNoticeOverlay" class="restart-notice-overlay hidden" aria-hidden="true">
+    <div class="restart-notice-dialog" role="dialog" aria-modal="true" aria-labelledby="updateRestartNoticeTitle">
+      <div class="restart-notice-head">
+        <div>
+          <span>更新后操作</span>
+          <strong id="updateRestartNoticeTitle">QMT 侧需要重启</strong>
+          <p id="updateRestartNoticeSummary">核心文件已经写入磁盘，但 QMT 运行中的脚本不会自动加载新代码。</p>
+        </div>
+        <button id="updateRestartNoticeCloseBtn" type="button" aria-label="关闭重启提醒">关闭</button>
+      </div>
+      <div id="updateRestartNoticeBody" class="restart-notice-body"></div>
+      <div id="updateRestartNoticeCountdown" class="metric-note">此提示将在 60 秒后自动关闭</div>
+      <div class="restart-notice-actions">
+        <button id="updateRestartNoticeSettingsBtn" type="button">打开更新设置</button>
+        <button id="updateRestartNoticeCloseBottomBtn" class="primary" type="button">我知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="tutorialReader" class="tutorial-reader" aria-labelledby="tutorialReaderTitle">
+    <header class="tutorial-reader-head">
+      <h2 id="tutorialReaderTitle">教程中心</h2>
+      <button id="closeTutorialReaderBtn" type="button" autofocus>返回初始化</button>
+    </header>
+    <div id="tutorialReaderBody" class="tutorial-reader-body"></div>
+  </dialog>
+
+  <div class="image-lightbox" id="imageLightbox" aria-hidden="true">
+    <button class="image-lightbox-close" id="imageLightboxClose" type="button" aria-label="关闭图片预览">关闭</button>
+    <img id="imageLightboxImg" alt="">
+    <div class="image-lightbox-caption" id="imageLightboxCaption"></div>
+  </div>
+
+  <script src="/vendor/mermaid.min.js?v=10.9.1"></script>
+  <script src="/python-api-data.js?v=20260925_trading_dates_01"></script>
+  <script src="/cftrader-api-data.js?v=20260911_02"></script>
+  <script src="/api-tester.js?v=20260916_apikey_01"></script>
+  <script src="/python-api.js?v=20260925_trading_dates_01"></script>
+  <script src="/docs.js?v=20260925_data_docs_01"></script>
+  <script src="/app.js?v=web_20261014_01"></script>
+</body>
+</html>
