@@ -328,7 +328,7 @@ class TxTradeBridge(object):
             response = pack_response(request_id, ok=False, error=e)
             self._log("tx trade request_error action=%s id=%s error=%s" % (action, request_id, e))
         if client_id:
-            self.tx.push("response", response, client_id)
+            self._push("response", response, client_id)
             self._log(
                 "tx trade response_sent action=%s id=%s client_id=%s total_ms=%.2f"
                 % (action, request_id, client_id, (time.time() - received_at) * 1000)
@@ -4016,7 +4016,17 @@ class TxTradeBridge(object):
         if not client_id or self.tx is None:
             return
         event = pack_event(name, data=data, client_id=client_id, subscription_id=subscription_id, meta=meta)
-        self.tx.push("event", event, client_id)
+        self._push("event", event, client_id)
+
+    def _push(self, key, payload, channel):
+        """推送前先快照 self.tx：close() 会在别的线程把它置为 None，
+        检查与使用之间不加快照的话，回调/响应线程会 AttributeError。"""
+        tx = self.tx
+        if tx is None:
+            return
+        result = tx.push(key, payload, channel)
+        if isinstance(result, dict) and result.get("code", 0) != 0:
+            self._log("cfquant TX推送失败 channel=%s key=%s result=%s" % (channel, key, result))
 
     def _call_variants(self, func, variants):
         """按参数变体调用 QMT 函数。

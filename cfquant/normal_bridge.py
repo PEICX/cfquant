@@ -226,8 +226,11 @@ class NormalQmtBridge(TxTradeBridge):
 
     def _recv_loop(self):
         while self.running:
+            tx = self.tx
+            if tx is None:
+                break
             try:
-                raw = self.tx.Q.get()
+                raw = tx.Q.get()
                 if raw is None:
                     break
                 self._handle_raw_from_thread(raw)
@@ -491,7 +494,7 @@ class NormalQmtBridge(TxTradeBridge):
                     "source": "qmt_runtime_report",
                 },
             )
-            self.tx.push("event", payload, self.callback_event_channel)
+            self._push("event", payload, self.callback_event_channel)
             self._log("normal bridge runtime report sent version=%s reason=%s" % (data.get("core_version") or "-", reason))
         except Exception as e:
             self._log("normal bridge runtime report failed:%s" % e)
@@ -563,7 +566,7 @@ class NormalQmtBridge(TxTradeBridge):
                     if kind == "whole_quote" and self._push_whole_quote_columnar(sub, sub_id, data, client_id):
                         return
                     event = self._pack_quote_event(kind, sub, sub_id, data)
-                    self.tx.push("event", event, client_id)
+                    self._push("event", event, client_id)
 
         func = self._get_callable(method)
         if method in L2_THOUSAND_SUBSCRIPTIONS:
@@ -614,7 +617,7 @@ class NormalQmtBridge(TxTradeBridge):
 
     def _push_whole_quote_columnar(self, sub, sub_id, data, client_id):
         """Try the columnar binary hot path; False means use the JSON event."""
-        push_columnar = getattr(self.tx, "push_columnar", None)
+        push_columnar = getattr(self.tx, "push_columnar", None)  # tx=None 时 getattr 返回 None，走 JSON 回落
         if push_columnar is None or sub.get("wire_format") != "columnar":
             return False
         payload = encode_whole_quote(data)
@@ -942,7 +945,7 @@ class NormalQmtBridge(TxTradeBridge):
         if not client_id:
             return
         response = pack_response(msg.get("id"), ok=True, result=result)
-        self.tx.push("response", response, client_id)
+        self._push("response", response, client_id)
 
     def _send_error(self, msg, error):
         client_id = msg.get("client_id") or msg.get("reply_channel")
@@ -953,7 +956,7 @@ class NormalQmtBridge(TxTradeBridge):
             % (msg.get("action"), msg.get("id"), client_id, error)
         )
         response = pack_response(msg.get("id"), ok=False, error=error)
-        self.tx.push("response", response, client_id)
+        self._push("response", response, client_id)
 
     def publish_callback_event(self, event_name, obj):
         if self.tx is None:
@@ -1020,7 +1023,7 @@ class NormalQmtBridge(TxTradeBridge):
             data,
         )
         if not channel_duplicate:
-            self.tx.push("event", json.dumps(payload, ensure_ascii=False), self.callback_event_channel)
+            self._push("event", json.dumps(payload, ensure_ascii=False), self.callback_event_channel)
         sent_clients = 0
         if account_id:
             trader_event = event_name.replace("trader:", "", 1)
