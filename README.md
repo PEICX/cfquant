@@ -1,72 +1,14 @@
 # cfquant
 
-<p>
-  <a href="https://github.com/95ge/cfquant/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/95ge/cfquant?style=flat&logo=github&label=Stars" height="18" /></a>
-  <a href="https://github.com/95ge/cfquant/network/members"><img alt="GitHub forks" src="https://img.shields.io/github/forks/95ge/cfquant?style=flat&logo=github&label=Forks" /></a>
-  <a href="https://github.com/95ge/cfquant/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/95ge/cfquant?style=flat&logo=github&label=Issues" /></a>
-  <a href="https://github.com/95ge/cfquant/commits/main"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/95ge/cfquant?style=flat&logo=git&label=Last%20commit" /></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat" /></a>
-  <img alt="Python 3.8 to 3.12" src="https://img.shields.io/badge/Python-3.8--3.12-blue?style=flat&logo=python&logoColor=white" />
-</p>
-
 ## 项目简介
 
-> **CFQuant 是 MiniQMT 的开源替代方案：让原有 `xtquant` / 外部 Python 策略低成本接入大 QMT。**
+> **基于 CFQuant 的个人定制版。非通用。原版见 www.cfquant.org**
 
-### 1. 项目定位
-
-`cfquant` 是面向大 QMT 的本地桥接层，专注解决 MiniQMT 迁移、大 QMT 外部 Python 调用、账号路由、交易回调和 Web 可观测这些实际问题。它不会替代 QMT 终端本身，而是把大 QMT 已有的行情、查询、交易和回调能力整理成更接近 `miniQMT` / `xtquant` 的调用方式，让旧策略可以更低成本迁移到大 QMT 环境。
-
-### 2. 核心能力
-
-| 能力 | 解决的问题 |
-|---|---|
-| MiniQMT / `xtquant` 兼容调用 | 原有外部 Python 策略可以沿用接近 `xtdata`、`XtQuantTrader`、`StockAccount` 的写法，降低迁移成本。 |
-| 大 QMT 本地桥接 | 把大 QMT 内部的行情、查询、交易、撤单和回调能力桥接给外部 Python 程序和 Web 控制台。 |
-| Web 控制台 | 在浏览器里完成账号绑定、QMT 入口脚本指引、在线检测、接口调试、版本更新和回滚。 |
-| 多账号 / 多 QMT 路由 | 按 `bridge_id`、`account_type`、`account_id` 路由请求，适配多资金账号、普通账户、信用账户和多 QMT 终端。 |
-| 通用、极致、高级三种模式 | 普通环境快速跑通；受限 QMT 使用自包含入口；低延迟场景可拆分普通桥和交易桥。 |
-| 交易回调与行情推送 | 接收委托、成交、账号状态和行情事件，方便外部策略处理异步结果。 |
-| 部署与排障闭环 | 通过日志、状态检查、教程、反馈和论坛沉淀接入问题，减少部署和维护成本。 |
-
-### 3. 兼容方式
-
-项目尽量保持 `miniQMT` / `xtquant` 常用接口的调用习惯。已有外部 Python 策略通常只需要调整连接方式或少量配置，不需要重写主要的行情和交易逻辑。具体接口能力和兼容边界请以项目文档为准。
-
-### 4. 使用方式
-
-完成部署后，QMT 负责运行桥接策略，`cfquant` 负责提供本地通信和接口转发。外部 Python 程序可以继续使用熟悉的接口访问 QMT 能力，Web 控制台则用于账号绑定、状态检查、接口测试、策略部署和日常运维。
-
-### 5. 部署建议
-
-部署需要同时配置本地 Python 环境、QMT 目录、账号绑定和 QMT 入口策略。建议第一次使用时优先选择**通用模式**，按 [QMT 部署教程](docs/QMT部署教程.md) 和 Web 控制台中的初始化向导逐步完成；高级模式和两地多中心需要额外配置多个 QMT 或多个市场入口。
-
-### 6. 官方资源
+### 官方资源
 
 - 官网与问题反馈：[www.cfquant.org](https://cfquant.org)
 - 版本更新日志：[docs/版本日志.md](docs/版本日志.md)
 - 完整部署、模式选择和接口说明见下方“文档”目录
-
-## 新用户先看这里
-
-如果你第一次使用 cfquant，只需要先完成下面这条路径：
-
-1. 安装 Python 3.8–3.12，生产环境建议 Python 3.10 或 3.12；使用 Anaconda/Miniconda 时，先确定实际运行策略的环境名称。
-2. 按下方“安装方式”选择源码包或 PyPI。第一次部署、需要 Web 更新和 QMT 脚本管理时，优先选择源码包。
-3. 启动 `start_cfquant.bat`，或在已安装包的环境中执行 `cfquant run`。
-4. 打开 <http://127.0.0.1:8765/>，按初始化向导填写 QMT 目录、账号和运行模式。
-5. 在绑定页导入并运行 QMT 入口策略，等待页面显示通道在线。
-6. 先用“接口测试”验证行情、资金和持仓，再接入自己的策略。
-
-### 我应该选择哪种方式？
-
-| 你的情况 | 推荐做法 |
-|---|---|
-| 第一次部署，希望系统自动管理 Web、QMT 脚本和更新 | 源码包 + 通用模式 |
-| 已有 Python 项目，只需要调用 `xtdata` / `xttrader` | PyPI 安装 |
-| 使用 Anaconda/Miniconda | 激活目标环境后执行 `python -m pip` 安装 |
-| QMT 无法导入 `cfquant` 或受 Python 包白名单限制 | 极致模式 |
-| 需要拆分行情与低延迟交易链路 | 高级模式，准备两个 QMT 环境 |
 
 ### 这几个 Python 环境分别做什么？
 
@@ -77,39 +19,7 @@ python -c "import sys; print(sys.executable)"
 python -m pip show cfquant
 ```
 
-### 怎样判断部署完成？
-
-以下条件同时满足，才算完成基础部署：
-
-- 浏览器可以打开 `http://127.0.0.1:8765/`。
-- Web 页面状态中的 Web、LTtx 和需要的 PipeHub 通道在线。
-- QMT 已登录，绑定页显示入口策略运行中。
-- 接口测试可以返回至少一只证券的行情，以及资金或持仓查询结果。
-- 外部 Python 能够导入 `cfquant`，并且使用的解释器路径与安装包的解释器一致。
-
 ## 快速开始
-
-### 环境要求
-
-- Windows
-- 已安装并登录大 QMT
-- Python `3.8` - `3.12`，生产环境优先使用 `3.10` 或 `3.12`
-
-### 模式选择
-
-部署前先根据 QMT 环境选择模式：
-
-| 模式 | QMT 入口 | 适用场景 |
-|---|---|---|
-| 通用模式 | `CFQUANT_CTYPE_ALL_LOWLAT.py` | 默认选择，适合大多数用户、单账号和常规 QMT 环境 |
-| 极致模式 | `CFQUANT_LITE.py` | 适合国泰君安、国泰海通的君弘君智，以及其他存在 Python 包白名单或导入限制的 QMT |
-| 高级模式 | 普通 QMT 加载 `CFQUANT.py`，极速交易端加载 `CFQUANT_TRADE_LOWLAT.py` | 需要进一步降低下单、撤单延迟，并且能够准备两个 QMT 时使用 |
-
-选择建议：
-
-- 不确定时优先使用**通用模式**。
-- 如果 QMT 无法导入 `cfquant`，或受到 Python 包白名单限制，选择**极致模式**。
-- **高级模式**需要两个不同的 QMT，不能在同一个 QMT 中同时加载普通入口和极速交易入口。
 
 ### 安装方式
 
