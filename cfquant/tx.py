@@ -105,6 +105,9 @@ class txl:
         self.txg_running = False
         self.__tx = False
         self.__tx_plus = False
+        #put 连接的发送互斥锁：d_push 直发与 main_tx_que 发送线程共用同一
+        #socket，并发 sendall 遇到部分发送时长度前缀帧会交错损坏
+        self._tx_send_lock = threading.Lock()
         self.push_count = 0
         self.timeout = 2
         self.heartbeat = 1
@@ -1253,25 +1256,27 @@ class txl:
         '''
         frame = _build_v2_push_frame(who, '%s|%s'%(key,data))
         try:
-            self.__tx.sendall(frame)
+            with self._tx_send_lock:
+                self.__tx.sendall(frame)
         except:
             if self.__tx == False:
                 raise OSError('当前start_tx未执行，请先执行start_tx()')
             else:
                 raise OSError('网络不可达，请稍后重试')
-    
+
     def main_tx_que(self):
         while self.run_on:
             try:
                 msg = self.tx_que.get()
-                if isinstance(msg, tuple):
-                    # v2 推送帧：完整帧单次 sendall，无需再拆长度头
-                    self.__tx.sendall(msg[1])
-                else:
-                    data_len = len(msg)
-                    struct_bytes = struct.pack('Q', data_len)
-                    self.__tx.sendall(struct_bytes)
-                    self.__tx.sendall(msg)
+                with self._tx_send_lock:
+                    if isinstance(msg, tuple):
+                        # v2 推送帧：完整帧单次 sendall，无需再拆长度头
+                        self.__tx.sendall(msg[1])
+                    else:
+                        data_len = len(msg)
+                        struct_bytes = struct.pack('Q', data_len)
+                        self.__tx.sendall(struct_bytes)
+                        self.__tx.sendall(msg)
             except Exception as e:
                 if self.run_on:
                     msg = 'start_tx在发送数据时出错了,开始重连>>>>%s'%(e)

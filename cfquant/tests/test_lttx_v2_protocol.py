@@ -191,6 +191,49 @@ def test_push_always_uses_v2_frame():
     assert body[offset + who_len:].decode("utf-8") == 'event|{"a":1}'
 
 
+def test_d_push_and_sender_thread_are_mutually_exclusive():
+    """d_push 直发与 main_tx_que 发送线程共用 put 连接，sendall 必须互斥。
+
+    并发 sendall 遇到部分发送时，长度前缀帧会交错损坏协议。用可检测
+    重叠的假 socket 验证两处发送从不同时在 sendall 里。
+    """
+    class RaceDetectingSocket:
+        def __init__(self):
+            self._guard = threading.Lock()
+            self.inside = 0
+            self.overlap = False
+            self.calls = 0
+
+        def sendall(self, data):
+            with self._guard:
+                self.inside += 1
+                self.calls += 1
+                if self.inside > 1:
+                    self.overlap = True
+            time.sleep(0.002)
+            with self._guard:
+                self.inside -= 1
+
+    sock = RaceDetectingSocket()
+    client = _bare_client(run_on=True, _tx_send_lock=threading.Lock())
+    client._txl__tx = sock
+    sender = threading.Thread(target=client.main_tx_que, daemon=True)
+    sender.start()
+    try:
+        for _ in range(50):
+            client.tx_que.put(("v2", b"\x01queued-frame"))
+            client.d_push("event", "payload", "chan-1")
+    finally:
+        client.run_on = False
+        client.tx_que.put(("v2", b"\x01stop"))
+        sender.join(timeout=5)
+    assert not sender.is_alive()
+    # d_push 的 50 次同步发送必然全部完成；发送线程在退出前也已消费了
+    # 大量队列帧（run_on 翻转后循环顶直接退出，尾部帧允许残留）
+    assert sock.calls >= 50
+    assert sock.overlap is False
+
+
 # ---------------------------------------------------------------------------
 # 2. 端到端：真实服务器 + 真实客户端
 # ---------------------------------------------------------------------------
