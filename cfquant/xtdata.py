@@ -98,10 +98,11 @@ def subscribe_quote(stock_code, period="1d", start_time="", end_time="", count=0
     }, callback)
 
 
-def subscribe_whole_quote(code_list, callback=None):
-    return _subscribe_quote_request("xtdata.subscribe_whole_quote", {
-        "code_list": code_list,
-    }, callback)
+def subscribe_whole_quote(code_list, callback=None, wire_format=None):
+    params = {"code_list": code_list}
+    if wire_format:
+        params["wire_format"] = wire_format
+    return _subscribe_quote_request("xtdata.subscribe_whole_quote", params, callback)
 
 
 def subscribe_quote2(stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):

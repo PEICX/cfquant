@@ -5,6 +5,7 @@ import datetime as dt
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import threading
@@ -17,10 +18,11 @@ import pytest
 
 import cfquant_web_server as web
 from cfquant import level2, xtdata
-from cfquant.normal_bridge import COALESCED_QUERY_ACTIONS, NormalQmtBridge
+from cfquant.normal_bridge import COALESCED_QUERY_ACTIONS, QUOTE_PROFILE_STATS, NormalQmtBridge
 from cfquant.pipe_bridge import PipeNormalQmtBridge
-from cfquant.protocol import decode_value, encode_value, loads_message, pack_event, pack_request, pack_response
+from cfquant.protocol import decode_value, encode_value, loads_message, pack_event, pack_event_raw, pack_request, pack_response
 from cfquant.qmt_bridge import CfquantQmtBridge
+from cfquant.quote_wire import encode_whole_quote
 from cfquant.tx_trade_bridge import TxTradeBridge
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -48,8 +50,10 @@ def lite_namespace(path):
             body.append(node)
     tree.body = body
     ns = dict(BaseTradeBridge=TxTradeBridge, queue=queue, threading=threading, time=time,
-              dt=dt, json=json, math=math, base64=base64, loads_message=loads_message,
-              pack_event=pack_event, pack_response=pack_response,
+              dt=dt, json=json, math=math, base64=base64, os=os, loads_message=loads_message,
+              pack_event=pack_event, pack_event_raw=pack_event_raw,
+              pack_response=pack_response, encode_whole_quote=encode_whole_quote,
+              QUOTE_PROFILE_ENABLED=False, QUOTE_PROFILE_STATS=QUOTE_PROFILE_STATS,
               COALESCED_QUERY_ACTIONS=COALESCED_QUERY_ACTIONS, DEFAULT_PIPE_NAME="offline")
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), ns)
     return ns

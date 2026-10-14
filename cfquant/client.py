@@ -7,6 +7,7 @@ import time
 
 from .config import get_config
 from .callback_dispatcher import CallbackDispatcher, dispatch_callbacks
+from ._fastjson import loads_message_typed
 from .protocol import decode_value, dumps_message, loads_message, new_id, pack_request
 
 
@@ -180,7 +181,9 @@ class LTtxRpcClient(object):
             if not msg.get("ok"):
                 err = msg.get("error") or {}
                 raise CfquantError(err.get("message") or str(err))
-            return decode_value(msg.get("result"))
+            if msg.pop("_cf_typed", True):
+                return decode_value(msg.get("result"))
+            return msg.get("result")
         finally:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
@@ -209,7 +212,7 @@ class LTtxRpcClient(object):
                 raw = tx.Q.get()
                 if raw is None:
                     break
-                msg = loads_message(raw)
+                msg = loads_message_typed(raw)
                 if not msg:
                     continue
                 with self._lock:

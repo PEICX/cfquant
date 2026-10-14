@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import struct
 import threading
 import time
@@ -35,6 +36,158 @@ ERROR_PIPE_CONNECTED = 535
 
 DEFAULT_BUFFER_SIZE = 65536
 DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Binary hot-path frame codec.
+#
+# Text envelopes ("cfpipe:" + JSON) stay the default so old peers keep working.
+# A peer that advertised binary_hotpath in its hello and received a hello_ack
+# may send hot messages (request / publish / delivery) as binary frames:
+#
+#   magic(2B "CF") ver(1B) msg_type(1B) flags(1B) payload_len(4B) tlv_len(2B)
+#   TLVs (tag 1B + len 2B + value)   payload (opaque bytes)
+#
+# The hub routes on the TLV fields alone and forwards the payload untouched.
+# ---------------------------------------------------------------------------
+
+PIPE_FRAME_MAGIC = b"CF"
+PIPE_FRAME_MAGIC_INT = 0x4346
+PIPE_FRAME_VERSION = 1
+
+FRAME_TYPE_REQUEST = 1
+FRAME_TYPE_PUBLISH_RESPONSE = 2
+FRAME_TYPE_PUBLISH_EVENT = 3
+FRAME_TYPE_DELIVERY = 4
+
+FRAME_FLAG_COLUMNAR = 0x01
+
+TLV_REQUEST_ID = 1
+TLV_CLIENT_ID = 2
+TLV_CHANNEL = 3
+TLV_ACTION = 4
+TLV_EVENT_NAME = 5
+TLV_SUBSCRIPTION_ID = 6
+
+_FRAME_HEADER = struct.Struct("!HBBBIH")
+_FRAME_TLV_HEAD = struct.Struct("!BH")
+
+_FRAME_TYPE_NAMES = {
+    FRAME_TYPE_REQUEST: "request",
+    FRAME_TYPE_PUBLISH_RESPONSE: "publish",
+    FRAME_TYPE_PUBLISH_EVENT: "publish",
+    FRAME_TYPE_DELIVERY: "delivery",
+}
+_FRAME_TYPES_BY_NAME = {
+    "request": FRAME_TYPE_REQUEST,
+    "response": FRAME_TYPE_PUBLISH_RESPONSE,
+    "event": FRAME_TYPE_PUBLISH_EVENT,
+}
+
+# Routing scans over the head of our own compact protocol messages. They rely
+# on the fixed key order of pack_response/pack_event and always fall back to a
+# full parse when they do not match.
+_RESPONSE_ID_SCAN = re.compile(r'^cfquant:\{"type":"response","id":"([^"]+)"')
+_EVENT_NAME_SCAN = re.compile(r'^cfquant:\{"type":"event","event":"([^"]+)"')
+
+
+def scan_response_request_id(payload):
+    match = _RESPONSE_ID_SCAN.match(payload) if isinstance(payload, str) else None
+    return match.group(1) if match else None
+
+
+def scan_event_name(payload):
+    match = _EVENT_NAME_SCAN.match(payload) if isinstance(payload, str) else None
+    return match.group(1) if match else None
+
+
+def encode_pipe_frame(msg_type, payload, request_id=None, client_id=None,
+                      channel=None, action=None, event_name=None,
+                      subscription_id=None, flags=0):
+    if isinstance(payload, str):
+        payload_bytes = payload.encode("utf-8")
+    elif payload is None:
+        payload_bytes = b""
+    else:
+        payload_bytes = bytes(payload)
+    tlvs = []
+    for tag, value in (
+        (TLV_REQUEST_ID, request_id),
+        (TLV_CLIENT_ID, client_id),
+        (TLV_CHANNEL, channel),
+        (TLV_ACTION, action),
+        (TLV_EVENT_NAME, event_name),
+        (TLV_SUBSCRIPTION_ID, subscription_id),
+    ):
+        if value is None:
+            continue
+        value_bytes = str(value).encode("utf-8")
+        tlvs.append(_FRAME_TLV_HEAD.pack(tag, len(value_bytes)) + value_bytes)
+    tlv_block = b"".join(tlvs)
+    return _FRAME_HEADER.pack(
+        PIPE_FRAME_MAGIC_INT,
+        PIPE_FRAME_VERSION,
+        int(msg_type),
+        int(flags) & 0xFF,
+        len(payload_bytes),
+        len(tlv_block),
+    ) + tlv_block + payload_bytes
+
+
+def _decode_binary_frame(raw):
+    if len(raw) < _FRAME_HEADER.size:
+        return None
+    magic, version, msg_type, flags, payload_len, tlv_len = _FRAME_HEADER.unpack_from(raw, 0)
+    if magic != PIPE_FRAME_MAGIC_INT or version != PIPE_FRAME_VERSION:
+        return None
+    offset = _FRAME_HEADER.size
+    tlv_end = offset + tlv_len
+    if tlv_end > len(raw):
+        return None
+    fields = {}
+    while offset + _FRAME_TLV_HEAD.size <= tlv_end:
+        tag, value_len = _FRAME_TLV_HEAD.unpack_from(raw, offset)
+        offset += _FRAME_TLV_HEAD.size
+        if offset + value_len > tlv_end:
+            return None
+        value = raw[offset:offset + value_len]
+        offset += value_len
+        fields.setdefault(tag, value.decode("utf-8", "replace"))
+    payload = raw[tlv_end:tlv_end + payload_len]
+    envelope = {
+        "protocol": "cfquant_pipe",
+        "type": _FRAME_TYPE_NAMES.get(msg_type, "unknown"),
+        "key": "response" if msg_type == FRAME_TYPE_PUBLISH_RESPONSE else (
+            "event" if msg_type == FRAME_TYPE_PUBLISH_EVENT else None),
+        "request_id": fields.get(TLV_REQUEST_ID),
+        "client_id": fields.get(TLV_CLIENT_ID),
+        "channel": fields.get(TLV_CHANNEL),
+        "request_channel": fields.get(TLV_CHANNEL),
+        "action": fields.get(TLV_ACTION),
+        "event_name": fields.get(TLV_EVENT_NAME),
+        "subscription_id": fields.get(TLV_SUBSCRIPTION_ID),
+        "flags": flags,
+        "payload": payload,
+        "_binary": True,
+    }
+    return envelope
+
+
+def decode_pipe_frame(raw):
+    """Decode a frame payload (bytes, or legacy text from test doubles).
+
+    Returns the envelope dict for both binary frames and cfpipe text frames,
+    or None when the payload is neither, so callers keep their legacy
+    raw-payload handling.
+    """
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        raw = bytes(raw)
+        if raw[:2] == PIPE_FRAME_MAGIC:
+            return _decode_binary_frame(raw)
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        return None
+    return loads_pipe_message(raw)
 
 
 def is_windows():
@@ -178,11 +331,11 @@ class NamedPipeConnection(object):
         if size > self.max_frame_size:
             raise ValueError("named pipe frame too large: %s > %s" % (size, self.max_frame_size))
         if size == 0:
-            return ""
+            return b""
         data = self._read_exact(size)
         if data is None:
             return None
-        return data.decode("utf-8", errors="replace")
+        return data
 
     def write_frame(self, payload):
         if isinstance(payload, str):
@@ -351,6 +504,10 @@ class PipeTxClient(object):
             self.process_id,
             uuid.uuid4().hex[:12],
         )
+        self.binary_enabled = str(
+            os.environ.get("CFQUANT_PIPE_BINARY") or "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._hub_binary = False
         self.Q = queue.Queue(maxsize=10000)
         self.running = False
         self.rx_conn = None
@@ -386,17 +543,49 @@ class PipeTxClient(object):
     def push(self, key, payload, channel):
         if isinstance(payload, bytes):
             payload = payload.decode("utf-8", errors="replace")
-        envelope = dumps_pipe_message(self._pipe_envelope("publish", "qmt_tx", {
-            "key": key,
-            "channel": channel,
-            "payload": payload,
-        }))
+        request_id = None
+        event_name = None
+        if self._hub_binary:
+            if key == "response":
+                request_id = scan_response_request_id(payload)
+            elif key == "event":
+                event_name = scan_event_name(payload)
+        return self.push_routed(key, payload, channel, request_id=request_id, event_name=event_name)
+
+    def push_routed(self, key, payload, channel, request_id=None, action=None,
+                    event_name=None, subscription_id=None, flags=0):
+        """Send a publish frame; callers that know the routing fields skip the head scan."""
         conn, generation = self._get_tx_state()
         if conn is None:
             rx_conn, rx_generation = self._get_rx_state()
             if rx_conn is not None:
                 self._drop_pair(rx_generation, reason="pipe tx connection missing", conns=(rx_conn,))
             return {"code": -1, "msg": "pipe not connected"}
+        if self._hub_binary:
+            frame = encode_pipe_frame(
+                _FRAME_TYPES_BY_NAME.get(str(key), FRAME_TYPE_PUBLISH_EVENT),
+                payload,
+                request_id=request_id,
+                client_id=channel,
+                channel=channel,
+                action=action,
+                event_name=event_name,
+                subscription_id=subscription_id,
+                flags=flags,
+            )
+            try:
+                conn.write_frame(frame)
+                return {"code": 0, "msg": "ok"}
+            except Exception as e:
+                message = "pipe push failed: %s" % e
+                self._log(message)
+                self._drop_pair(generation, reason=message, conns=(conn,))
+                return {"code": -1, "msg": str(e)}
+        envelope = dumps_pipe_message(self._pipe_envelope("publish", "qmt_tx", {
+            "key": key,
+            "channel": channel,
+            "payload": payload,
+        }))
         try:
             conn.write_frame(envelope)
             return {"code": 0, "msg": "ok"}
@@ -405,6 +594,35 @@ class PipeTxClient(object):
             self._log(message)
             self._drop_pair(generation, reason=message, conns=(conn,))
             return {"code": -1, "msg": str(e)}
+
+    def push_columnar(self, event_name, data_bytes, client_id, subscription_id=None, channel=None):
+        """Push a columnar whole-quote batch as a binary event frame.
+
+        Returns False when the hot path is unavailable so the caller can fall
+        back to the JSON event path.
+        """
+        if not self._hub_binary:
+            return False
+        conn, generation = self._get_tx_state()
+        if conn is None:
+            return False
+        frame = encode_pipe_frame(
+            FRAME_TYPE_PUBLISH_EVENT,
+            data_bytes,
+            client_id=client_id,
+            channel=channel or client_id,
+            event_name=event_name,
+            subscription_id=subscription_id,
+            flags=FRAME_FLAG_COLUMNAR,
+        )
+        try:
+            conn.write_frame(frame)
+            return True
+        except Exception as e:
+            message = "pipe push failed: %s" % e
+            self._log(message)
+            self._drop_pair(generation, reason=message, conns=(conn,))
+            return False
 
     def close(self):
         self.running = False
@@ -420,6 +638,7 @@ class PipeTxClient(object):
             tx_conn = None
             generation = None
             try:
+                self._hub_binary = False
                 rx_conn = connect_pipe(self.pipe_name, timeout_ms=self.connect_timeout_ms)
                 rx_conn.write_frame(dumps_pipe_message(self._pipe_envelope("hello", "qmt_rx")))
                 tx_conn = connect_pipe(self.pipe_name, timeout_ms=self.connect_timeout_ms)
@@ -453,12 +672,23 @@ class PipeTxClient(object):
             raw = conn.read_frame()
             if raw is None:
                 break
-            envelope = loads_pipe_message(raw)
-            if envelope:
-                payload = envelope.get("payload")
-                if payload:
+            frame = decode_pipe_frame(raw)
+            if frame is not None:
+                if frame.get("type") == "hello_ack":
+                    self._hub_binary = self.binary_enabled and bool(frame.get("binary_hotpath"))
+                    continue
+                payload = frame.get("payload")
+                if payload is None:
+                    continue
+                if isinstance(payload, (bytes, bytearray)):
+                    if not (frame.get("flags", 0) & FRAME_FLAG_COLUMNAR):
+                        payload = payload.decode("utf-8", errors="replace")
+                    self.Q.put(payload)
+                elif payload:
                     self.Q.put(payload)
                 continue
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="replace")
             self.Q.put(raw)
 
     def _get_rx_conn(self):
@@ -553,6 +783,7 @@ class PipeTxClient(object):
             "instance_id": self.instance_id,
             "process_id": self.process_id,
             "heartbeat_interval": self.heartbeat_interval,
+            "binary_hotpath": self.binary_enabled,
         }
         if extra:
             data.update(extra)

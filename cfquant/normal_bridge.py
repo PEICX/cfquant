@@ -12,8 +12,66 @@ import time
 from . import order_meta
 from .order_identity import prepare_order_remark, order_remark_key, restore_order_remark, restore_strategy_name
 from .level2 import L2_THOUSAND_SUBSCRIPTIONS, quote_callback_data, quote_plain, require_l2_callable, thousand_price
-from .protocol import loads_message, pack_event, pack_response
+from .protocol import loads_message, pack_event, pack_event_raw, pack_response
+from .quote_wire import encode_whole_quote
 from .tx_trade_bridge import TxTradeBridge, relay_sync_order_callback
+
+
+QUOTE_PROFILE_ENABLED = str(
+    os.environ.get("CFQUANT_QUOTE_PROFILE") or ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+class _QuoteProfileStats(object):
+    """Aggregated whole-quote encode timing, reported every 10s when enabled."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.batches = 0
+        self.fast_batches = 0
+        self.codes = 0
+        self.encoded_ms = 0.0
+        self.max_ms = 0.0
+        self.chars = 0
+        self.last_report = time.monotonic()
+
+    def record(self, fast, code_count, elapsed_ms, payload_chars):
+        with self.lock:
+            self.batches += 1
+            if fast:
+                self.fast_batches += 1
+            self.codes += code_count
+            self.encoded_ms += elapsed_ms
+            self.chars += payload_chars
+            if elapsed_ms > self.max_ms:
+                self.max_ms = elapsed_ms
+            now = time.monotonic()
+            if now - self.last_report >= 10.0:
+                self._report_locked(now)
+
+    def _report_locked(self, now):
+        if self.batches:
+            print(
+                "quote profile batches=%s fast=%s codes_per_batch=%.1f avg_ms=%.3f max_ms=%.3f total_ms=%.1f avg_chars=%.0f"
+                % (
+                    self.batches,
+                    self.fast_batches,
+                    self.codes / float(self.batches),
+                    self.encoded_ms / float(self.batches),
+                    self.max_ms,
+                    self.encoded_ms,
+                    self.chars / float(self.batches),
+                ),
+                flush=True,
+            )
+        self.reset()
+        self.last_report = now
+
+
+QUOTE_PROFILE_STATS = _QuoteProfileStats()
 
 
 COALESCED_QUERY_ACTIONS = set([
@@ -473,6 +531,11 @@ class NormalQmtBridge(TxTradeBridge):
         self.subscription_seq += 1
         sub_id = self.subscription_seq
         params = msg.get("params") or {}
+        wire_format = str(
+            params.get("wire_format")
+            or os.environ.get("CFQUANT_WHOLE_QUOTE_WIRE")
+            or ""
+        ).strip().lower()
         sub = {
             "kind": kind,
             "client_id": msg.get("client_id") or msg.get("reply_channel"),
@@ -481,6 +544,7 @@ class NormalQmtBridge(TxTradeBridge):
             "period": params.get("period", "1d"),
             "callback_event": params.get("callback_event") or "quote:%s" % sub_id,
             "publish_existing": False,
+            "wire_format": wire_format or "json",
         }
         pending = []
         callback_lock = threading.RLock()
@@ -491,13 +555,14 @@ class NormalQmtBridge(TxTradeBridge):
                 self._release_worker("quote")
                 if self.quote_subscriptions.get(sub_id) is not sub or self.tx is None:
                     return
-                payload = quote_plain(data) if kind == "whole_quote" else quote_callback_data(data)
                 if initializing[0]:
-                    pending.append(payload)
+                    pending.append(data)
                     return
                 client_id = sub.get("client_id")
                 if client_id:
-                    event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+                    if kind == "whole_quote" and self._push_whole_quote_columnar(sub, sub_id, data, client_id):
+                        return
+                    event = self._pack_quote_event(kind, sub, sub_id, data)
                     self.tx.push("event", event, client_id)
 
         func = self._get_callable(method)
@@ -546,6 +611,42 @@ class NormalQmtBridge(TxTradeBridge):
             "callback_event": sub["callback_event"],
             "publish_existing": False,
         }
+
+    def _push_whole_quote_columnar(self, sub, sub_id, data, client_id):
+        """Try the columnar binary hot path; False means use the JSON event."""
+        push_columnar = getattr(self.tx, "push_columnar", None)
+        if push_columnar is None or sub.get("wire_format") != "columnar":
+            return False
+        payload = encode_whole_quote(data)
+        if payload is None:
+            return False
+        return bool(push_columnar(sub["callback_event"], payload, client_id, subscription_id=sub_id))
+
+    def _pack_quote_event(self, kind, sub, sub_id, data):
+        client_id = sub.get("client_id")
+        if kind != "whole_quote":
+            payload = quote_callback_data(data)
+            return pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+        started = time.perf_counter()
+        try:
+            # The dumps call doubles as the plain-scalar type check; numpy
+            # values or NaN/inf raise and take the legacy conversion below.
+            data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            event = pack_event_raw(
+                sub["callback_event"], data_json, client_id=client_id, subscription_id=sub_id)
+            fast = True
+        except (TypeError, ValueError):
+            payload = quote_plain(data)
+            event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+            fast = False
+        if QUOTE_PROFILE_ENABLED:
+            QUOTE_PROFILE_STATS.record(
+                fast,
+                len(data) if isinstance(data, dict) else 0,
+                (time.perf_counter() - started) * 1000.0,
+                len(event),
+            )
+        return event
 
     def _handle_quote_unsubscribe(self, msg):
         params = msg.get("params") or {}

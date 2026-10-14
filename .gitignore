@@ -113,3 +113,6 @@ pic/
 公众号/
 
 tem_delete/
+
+# ZCode agent session workspace.
+.zcode/

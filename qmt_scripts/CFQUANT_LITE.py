@@ -698,8 +698,8 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.51"
-LITE_ENTRY_VERSION = "lite_20260828_01"
+CORE_VERSION = "0.2.52"
+LITE_ENTRY_VERSION = "lite_20261014_01"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
 _ORDER_STATUS_FIELD_NAMES = (
@@ -1201,6 +1201,33 @@ def normalize_json_value(value, path="message", _active=None):
         return [normalize_json_value(item, "%s[%s]" % (path, index), active) for index, item in enumerate(value)]
     finally:
         active.remove(identity)
+
+
+def pack_event_raw(event, data_json, client_id=None, subscription_id=None, meta=None):
+    """pack_event with a pre-serialized ``data`` JSON fragment.
+
+    ``data_json`` must be a compact JSON value produced by json.dumps with
+    allow_nan=False (the caller's dumps doubles as the plain-scalar type
+    check). The fragment is spliced in without re-walking the data, which is
+    what makes the whole-quote fastpath single-pass.
+    """
+    payload = {
+        "type": "event",
+        "event": event,
+        "client_id": client_id,
+        "subscription_id": subscription_id,
+        "meta": meta or {},
+    }
+    payload.setdefault("protocol", "cfquant")
+    payload.setdefault("version", PROTOCOL_VERSION)
+    payload.setdefault("ts", now_ms())
+    head = json.dumps(
+        normalize_json_value(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "%s%s,\"data\":%s}" % (MESSAGE_PREFIX, head[:-1], data_json)
 
 
 def dumps_message(payload):
@@ -5497,6 +5524,66 @@ COALESCED_QUERY_ACTIONS = set([
 ])
 
 
+# ---------------------------------------------------------------------------
+# Whole-quote encode profiling (mirrored from cfquant/normal_bridge.py).
+# ---------------------------------------------------------------------------
+
+QUOTE_PROFILE_ENABLED = str(
+    os.environ.get("CFQUANT_QUOTE_PROFILE") or ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+class _QuoteProfileStats(object):
+    """Aggregated whole-quote encode timing, reported every 10s when enabled."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.batches = 0
+        self.fast_batches = 0
+        self.codes = 0
+        self.encoded_ms = 0.0
+        self.max_ms = 0.0
+        self.chars = 0
+        self.last_report = time.monotonic()
+
+    def record(self, fast, code_count, elapsed_ms, payload_chars):
+        with self.lock:
+            self.batches += 1
+            if fast:
+                self.fast_batches += 1
+            self.codes += code_count
+            self.encoded_ms += elapsed_ms
+            self.chars += payload_chars
+            if elapsed_ms > self.max_ms:
+                self.max_ms = elapsed_ms
+            now = time.monotonic()
+            if now - self.last_report >= 10.0:
+                self._report_locked(now)
+
+    def _report_locked(self, now):
+        if self.batches:
+            print(
+                "quote profile batches=%s fast=%s codes_per_batch=%.1f avg_ms=%.3f max_ms=%.3f total_ms=%.1f avg_chars=%.0f"
+                % (
+                    self.batches,
+                    self.fast_batches,
+                    self.codes / float(self.batches),
+                    self.encoded_ms / float(self.batches),
+                    self.max_ms,
+                    self.encoded_ms,
+                    self.chars / float(self.batches),
+                ),
+                flush=True,
+            )
+        self.reset()
+        self.last_report = now
+
+
+QUOTE_PROFILE_STATS = _QuoteProfileStats()
+
 class NormalQmtBridge(TxTradeBridge):
     def __init__(
         self,
@@ -6319,6 +6406,11 @@ class NormalQmtBridge(TxTradeBridge):
         self.subscription_seq += 1
         sub_id = self.subscription_seq
         params = msg.get("params") or {}
+        wire_format = str(
+            params.get("wire_format")
+            or os.environ.get("CFQUANT_WHOLE_QUOTE_WIRE")
+            or ""
+        ).strip().lower()
         sub = {
             "kind": kind,
             "client_id": msg.get("client_id") or msg.get("reply_channel"),
@@ -6327,6 +6419,7 @@ class NormalQmtBridge(TxTradeBridge):
             "period": params.get("period", "1d"),
             "callback_event": params.get("callback_event") or "quote:%s" % sub_id,
             "publish_existing": False,
+            "wire_format": wire_format or "json",
         }
         pending = []
         callback_lock = threading.RLock()
@@ -6337,13 +6430,14 @@ class NormalQmtBridge(TxTradeBridge):
                 self._release_worker("quote")
                 if self.quote_subscriptions.get(sub_id) is not sub or self.tx is None:
                     return
-                payload = quote_plain(data) if kind == "whole_quote" else quote_callback_data(data)
                 if initializing[0]:
-                    pending.append(payload)
+                    pending.append(data)
                     return
                 client_id = sub.get("client_id")
                 if client_id:
-                    event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+                    if kind == "whole_quote" and self._push_whole_quote_columnar(sub, sub_id, data, client_id):
+                        return
+                    event = self._pack_quote_event(kind, sub, sub_id, data)
                     self.tx.push("event", event, client_id)
 
         func = self._get_callable(method)
@@ -6393,6 +6487,42 @@ class NormalQmtBridge(TxTradeBridge):
             "publish_existing": False,
         }
 
+    def _push_whole_quote_columnar(self, sub, sub_id, data, client_id):
+        """Try the columnar binary hot path; False means use the JSON event."""
+        push_columnar = getattr(self.tx, "push_columnar", None)
+        if push_columnar is None or sub.get("wire_format") != "columnar":
+            return False
+        payload = encode_whole_quote(data)
+        if payload is None:
+            return False
+        return bool(push_columnar(sub["callback_event"], payload, client_id, subscription_id=sub_id))
+
+    def _pack_quote_event(self, kind, sub, sub_id, data):
+        client_id = sub.get("client_id")
+        if kind != "whole_quote":
+            payload = quote_callback_data(data)
+            return pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+        started = time.perf_counter()
+        try:
+            # The dumps call doubles as the plain-scalar type check; numpy
+            # values or NaN/inf raise and take the legacy conversion below.
+            data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            event = pack_event_raw(
+                sub["callback_event"], data_json, client_id=client_id, subscription_id=sub_id)
+            fast = True
+        except (TypeError, ValueError):
+            payload = quote_plain(data)
+            event = pack_event(sub["callback_event"], data=payload, client_id=client_id, subscription_id=sub_id)
+            fast = False
+        if QUOTE_PROFILE_ENABLED:
+            QUOTE_PROFILE_STATS.record(
+                fast,
+                len(data) if isinstance(data, dict) else 0,
+                (time.perf_counter() - started) * 1000.0,
+                len(event),
+            )
+        return event
+
 
 def start_normal_bridge(
     context,
@@ -6430,6 +6560,225 @@ def start_normal_bridge(
         pump_max_ms=pump_max_ms,
     ).start()
 
+
+# ---------------------------------------------------------------------------
+# Columnar whole-quote wire format (mirrored from cfquant/quote_wire.py).
+# ---------------------------------------------------------------------------
+
+QUOTE_WIRE_MAGIC = b"CFQ1"
+QUOTE_WIRE_VERSION = 1
+
+QW_COL_NONE = 0
+QW_COL_INT = 1
+QW_COL_FLOAT = 2
+QW_COL_STR = 3
+QW_COL_BOOL = 4
+QW_COL_NUM_LIST = 5
+
+QW_STR_NONE = 0xFFFF
+
+_QW_HEAD = struct.Struct("!4sBBHH")
+_QW_U16 = struct.Struct("!H")
+
+
+def _qw_none_bitmap(values):
+    bits = bytearray((len(values) + 7) // 8)
+    for index, value in enumerate(values):
+        if value is None:
+            bits[index >> 3] |= 1 << (index & 7)
+    return bytes(bits)
+
+
+def _qw_is_none(bitmap, index):
+    return (bitmap[index >> 3] >> (index & 7)) & 1 == 1
+
+
+def _qw_column_type(values):
+    kinds = set()
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            kinds.add("b")
+        elif isinstance(value, int):
+            kinds.add("i")
+        elif isinstance(value, float):
+            kinds.add("f")
+        elif isinstance(value, str):
+            kinds.add("s")
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)
+        ):
+            kinds.add("n")
+        else:
+            return None
+    if not kinds:
+        return QW_COL_NONE
+    if kinds == {"b"}:
+        return QW_COL_BOOL
+    if kinds == {"i"}:
+        return QW_COL_INT
+    if kinds in ({"f"}, {"i", "f"}):
+        return QW_COL_FLOAT
+    if kinds == {"s"}:
+        return QW_COL_STR
+    if kinds == {"n"}:
+        return QW_COL_NUM_LIST
+    return None
+
+
+def _qw_put_text(out, value):
+    raw = value.encode("utf-8")
+    if len(raw) > QW_STR_NONE:
+        return False
+    out.extend(_QW_U16.pack(len(raw)))
+    out.extend(raw)
+    return True
+
+
+def encode_whole_quote(data):
+    if not isinstance(data, dict) or not data:
+        return None
+    codes = []
+    rows = []
+    fields = []
+    seen = set()
+    for code, row in data.items():
+        if not isinstance(code, str) or not isinstance(row, dict):
+            return None
+        codes.append(code)
+        rows.append(row)
+        for name in row:
+            if not isinstance(name, str):
+                return None
+            if name not in seen:
+                seen.add(name)
+                fields.append(name)
+    columns = []
+    for name in fields:
+        values = [row.get(name) for row in rows]
+        col_type = _qw_column_type(values)
+        if col_type is None:
+            return None
+        columns.append((col_type, values))
+
+    out = bytearray(_QW_HEAD.pack(QUOTE_WIRE_MAGIC, QUOTE_WIRE_VERSION, 0, len(fields), len(codes)))
+    for name in fields:
+        if not _qw_put_text(out, name):
+            return None
+    for code in codes:
+        if not _qw_put_text(out, code):
+            return None
+    for col_type, values in columns:
+        out.append(col_type)
+        if col_type == QW_COL_NONE:
+            continue
+        if col_type in (QW_COL_INT, QW_COL_FLOAT, QW_COL_BOOL):
+            out.extend(_qw_none_bitmap(values))
+        if col_type == QW_COL_INT:
+            out.extend(struct.pack(
+                "!%dq" % len(values), *[0 if v is None else int(v) for v in values]))
+        elif col_type == QW_COL_FLOAT:
+            out.extend(struct.pack(
+                "!%dd" % len(values), *[0.0 if v is None else float(v) for v in values]))
+        elif col_type == QW_COL_BOOL:
+            out.extend(bytes(0 if v is None else (1 if v else 0) for v in values))
+        elif col_type == QW_COL_STR:
+            for value in values:
+                if value is None:
+                    out.extend(_QW_U16.pack(QW_STR_NONE))
+                elif not _qw_put_text(out, value):
+                    return None
+        elif col_type == QW_COL_NUM_LIST:
+            for value in values:
+                if value is None:
+                    out.extend(_QW_U16.pack(0))
+                    continue
+                out.extend(_QW_U16.pack(len(value)))
+                out.extend(struct.pack("!%dd" % len(value), *[float(item) for item in value]))
+    return bytes(out)
+
+
+def decode_whole_quote(payload):
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) < _QW_HEAD.size:
+        return None
+    try:
+        return _qw_decode(payload)
+    except (struct.error, IndexError):
+        return None
+
+
+def _qw_decode(payload):
+    magic, version, _reserved, n_fields, n_codes = _QW_HEAD.unpack_from(payload, 0)
+    if magic != QUOTE_WIRE_MAGIC or version != QUOTE_WIRE_VERSION:
+        return None
+    offset = _QW_HEAD.size
+
+    def read_text():
+        nonlocal offset
+        (length,) = _QW_U16.unpack_from(payload, offset)
+        offset += 2
+        if length == QW_STR_NONE:
+            return None
+        value = payload[offset:offset + length].decode("utf-8", "replace")
+        offset += length
+        return value
+
+    fields = [read_text() for _ in range(n_fields)]
+    codes = [read_text() for _ in range(n_codes)]
+    bitmap_size = (n_codes + 7) // 8
+    columns = []
+    for _ in range(n_fields):
+        col_type = payload[offset]
+        offset += 1
+        if col_type == QW_COL_NONE:
+            columns.append(None)
+            continue
+        bitmap = None
+        if col_type in (QW_COL_INT, QW_COL_FLOAT, QW_COL_BOOL):
+            bitmap = payload[offset:offset + bitmap_size]
+            offset += bitmap_size
+        if col_type == QW_COL_INT:
+            raw = struct.unpack_from("!%dq" % n_codes, payload, offset)
+            offset += 8 * n_codes
+            values = [None if _qw_is_none(bitmap, i) else v for i, v in enumerate(raw)]
+        elif col_type == QW_COL_FLOAT:
+            raw = struct.unpack_from("!%dd" % n_codes, payload, offset)
+            offset += 8 * n_codes
+            values = [None if _qw_is_none(bitmap, i) else v for i, v in enumerate(raw)]
+        elif col_type == QW_COL_BOOL:
+            raw = payload[offset:offset + n_codes]
+            offset += n_codes
+            values = [None if _qw_is_none(bitmap, i) else bool(v) for i, v in enumerate(raw)]
+        elif col_type == QW_COL_STR:
+            values = []
+            for _ in range(n_codes):
+                values.append(read_text())
+        elif col_type == QW_COL_NUM_LIST:
+            values = []
+            for _ in range(n_codes):
+                (count,) = _QW_U16.unpack_from(payload, offset)
+                offset += 2
+                if count == 0:
+                    values.append(None)
+                    continue
+                values.append(list(struct.unpack_from("!%dd" % count, payload, offset)))
+                offset += 8 * count
+        else:
+            return None
+        columns.append(values)
+
+    result = {}
+    for row_index, code in enumerate(codes):
+        row = {}
+        for col_index, name in enumerate(fields):
+            column = columns[col_index]
+            row[name] = None if column is None else column[row_index]
+        result[code] = row
+    return result
+
 DEFAULT_PIPE_NAME = os.environ.get("CFQUANT_PIPE_NAME", r"\\.\pipe\cfquant_pipe_hub")
 PIPE_MESSAGE_PREFIX = "cfpipe:"
 
@@ -6453,6 +6802,139 @@ ERROR_PIPE_CONNECTED = 535
 
 DEFAULT_BUFFER_SIZE = 65536
 DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Binary hot-path frame codec (mirrored from cfquant/pipe_transport.py).
+# ---------------------------------------------------------------------------
+
+PIPE_FRAME_MAGIC = b"CF"
+PIPE_FRAME_MAGIC_INT = 0x4346
+PIPE_FRAME_VERSION = 1
+
+FRAME_TYPE_REQUEST = 1
+FRAME_TYPE_PUBLISH_RESPONSE = 2
+FRAME_TYPE_PUBLISH_EVENT = 3
+FRAME_TYPE_DELIVERY = 4
+
+FRAME_FLAG_COLUMNAR = 0x01
+
+TLV_REQUEST_ID = 1
+TLV_CLIENT_ID = 2
+TLV_CHANNEL = 3
+TLV_ACTION = 4
+TLV_EVENT_NAME = 5
+TLV_SUBSCRIPTION_ID = 6
+
+_FRAME_HEADER = struct.Struct("!HBBBIH")
+_FRAME_TLV_HEAD = struct.Struct("!BH")
+
+_FRAME_TYPE_NAMES = {
+    FRAME_TYPE_REQUEST: "request",
+    FRAME_TYPE_PUBLISH_RESPONSE: "publish",
+    FRAME_TYPE_PUBLISH_EVENT: "publish",
+    FRAME_TYPE_DELIVERY: "delivery",
+}
+_FRAME_TYPES_BY_NAME = {
+    "request": FRAME_TYPE_REQUEST,
+    "response": FRAME_TYPE_PUBLISH_RESPONSE,
+    "event": FRAME_TYPE_PUBLISH_EVENT,
+}
+
+_RESPONSE_ID_SCAN = re.compile(r'^cfquant:\{"type":"response","id":"([^"]+)"')
+_EVENT_NAME_SCAN = re.compile(r'^cfquant:\{"type":"event","event":"([^"]+)"')
+
+
+def scan_response_request_id(payload):
+    match = _RESPONSE_ID_SCAN.match(payload) if isinstance(payload, str) else None
+    return match.group(1) if match else None
+
+
+def scan_event_name(payload):
+    match = _EVENT_NAME_SCAN.match(payload) if isinstance(payload, str) else None
+    return match.group(1) if match else None
+
+
+def encode_pipe_frame(msg_type, payload, request_id=None, client_id=None,
+                      channel=None, action=None, event_name=None,
+                      subscription_id=None, flags=0):
+    if isinstance(payload, str):
+        payload_bytes = payload.encode("utf-8")
+    elif payload is None:
+        payload_bytes = b""
+    else:
+        payload_bytes = bytes(payload)
+    tlvs = []
+    for tag, value in (
+        (TLV_REQUEST_ID, request_id),
+        (TLV_CLIENT_ID, client_id),
+        (TLV_CHANNEL, channel),
+        (TLV_ACTION, action),
+        (TLV_EVENT_NAME, event_name),
+        (TLV_SUBSCRIPTION_ID, subscription_id),
+    ):
+        if value is None:
+            continue
+        value_bytes = str(value).encode("utf-8")
+        tlvs.append(_FRAME_TLV_HEAD.pack(tag, len(value_bytes)) + value_bytes)
+    tlv_block = b"".join(tlvs)
+    return _FRAME_HEADER.pack(
+        PIPE_FRAME_MAGIC_INT,
+        PIPE_FRAME_VERSION,
+        int(msg_type),
+        int(flags) & 0xFF,
+        len(payload_bytes),
+        len(tlv_block),
+    ) + tlv_block + payload_bytes
+
+
+def _decode_binary_frame(raw):
+    if len(raw) < _FRAME_HEADER.size:
+        return None
+    magic, version, msg_type, flags, payload_len, tlv_len = _FRAME_HEADER.unpack_from(raw, 0)
+    if magic != PIPE_FRAME_MAGIC_INT or version != PIPE_FRAME_VERSION:
+        return None
+    offset = _FRAME_HEADER.size
+    tlv_end = offset + tlv_len
+    if tlv_end > len(raw):
+        return None
+    fields = {}
+    while offset + _FRAME_TLV_HEAD.size <= tlv_end:
+        tag, value_len = _FRAME_TLV_HEAD.unpack_from(raw, offset)
+        offset += _FRAME_TLV_HEAD.size
+        if offset + value_len > tlv_end:
+            return None
+        value = raw[offset:offset + value_len]
+        offset += value_len
+        fields.setdefault(tag, value.decode("utf-8", "replace"))
+    payload = raw[tlv_end:tlv_end + payload_len]
+    envelope = {
+        "protocol": "cfquant_pipe",
+        "type": _FRAME_TYPE_NAMES.get(msg_type, "unknown"),
+        "key": "response" if msg_type == FRAME_TYPE_PUBLISH_RESPONSE else (
+            "event" if msg_type == FRAME_TYPE_PUBLISH_EVENT else None),
+        "request_id": fields.get(TLV_REQUEST_ID),
+        "client_id": fields.get(TLV_CLIENT_ID),
+        "channel": fields.get(TLV_CHANNEL),
+        "request_channel": fields.get(TLV_CHANNEL),
+        "action": fields.get(TLV_ACTION),
+        "event_name": fields.get(TLV_EVENT_NAME),
+        "subscription_id": fields.get(TLV_SUBSCRIPTION_ID),
+        "flags": flags,
+        "payload": payload,
+        "_binary": True,
+    }
+    return envelope
+
+
+def decode_pipe_frame(raw):
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        raw = bytes(raw)
+        if raw[:2] == PIPE_FRAME_MAGIC:
+            return _decode_binary_frame(raw)
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        return None
+    return loads_pipe_message(raw)
 
 
 def is_windows():
@@ -6596,11 +7078,11 @@ class NamedPipeConnection(object):
         if size > self.max_frame_size:
             raise ValueError("named pipe frame too large: %s > %s" % (size, self.max_frame_size))
         if size == 0:
-            return ""
+            return b""
         data = self._read_exact(size)
         if data is None:
             return None
-        return data.decode("utf-8", errors="replace")
+        return data
 
     def write_frame(self, payload):
         if isinstance(payload, str):
@@ -6769,6 +7251,10 @@ class PipeTxClient(object):
             self.process_id,
             uuid.uuid4().hex[:12],
         )
+        self.binary_enabled = str(
+            os.environ.get("CFQUANT_PIPE_BINARY") or "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._hub_binary = False
         self.Q = queue.Queue(maxsize=10000)
         self.running = False
         self.rx_conn = None
@@ -6804,17 +7290,49 @@ class PipeTxClient(object):
     def push(self, key, payload, channel):
         if isinstance(payload, bytes):
             payload = payload.decode("utf-8", errors="replace")
-        envelope = dumps_pipe_message(self._pipe_envelope("publish", "qmt_tx", {
-            "key": key,
-            "channel": channel,
-            "payload": payload,
-        }))
+        request_id = None
+        event_name = None
+        if self._hub_binary:
+            if key == "response":
+                request_id = scan_response_request_id(payload)
+            elif key == "event":
+                event_name = scan_event_name(payload)
+        return self.push_routed(key, payload, channel, request_id=request_id, event_name=event_name)
+
+    def push_routed(self, key, payload, channel, request_id=None, action=None,
+                    event_name=None, subscription_id=None, flags=0):
+        """Send a publish frame; callers that know the routing fields skip the head scan."""
         conn, generation = self._get_tx_state()
         if conn is None:
             rx_conn, rx_generation = self._get_rx_state()
             if rx_conn is not None:
                 self._drop_pair(rx_generation, reason="pipe tx connection missing", conns=(rx_conn,))
             return {"code": -1, "msg": "pipe not connected"}
+        if self._hub_binary:
+            frame = encode_pipe_frame(
+                _FRAME_TYPES_BY_NAME.get(str(key), FRAME_TYPE_PUBLISH_EVENT),
+                payload,
+                request_id=request_id,
+                client_id=channel,
+                channel=channel,
+                action=action,
+                event_name=event_name,
+                subscription_id=subscription_id,
+                flags=flags,
+            )
+            try:
+                conn.write_frame(frame)
+                return {"code": 0, "msg": "ok"}
+            except Exception as e:
+                message = "pipe push failed: %s" % e
+                self._log(message)
+                self._drop_pair(generation, reason=message, conns=(conn,))
+                return {"code": -1, "msg": str(e)}
+        envelope = dumps_pipe_message(self._pipe_envelope("publish", "qmt_tx", {
+            "key": key,
+            "channel": channel,
+            "payload": payload,
+        }))
         try:
             conn.write_frame(envelope)
             return {"code": 0, "msg": "ok"}
@@ -6823,6 +7341,35 @@ class PipeTxClient(object):
             self._log(message)
             self._drop_pair(generation, reason=message, conns=(conn,))
             return {"code": -1, "msg": str(e)}
+
+    def push_columnar(self, event_name, data_bytes, client_id, subscription_id=None, channel=None):
+        """Push a columnar whole-quote batch as a binary event frame.
+
+        Returns False when the hot path is unavailable so the caller can fall
+        back to the JSON event path.
+        """
+        if not self._hub_binary:
+            return False
+        conn, generation = self._get_tx_state()
+        if conn is None:
+            return False
+        frame = encode_pipe_frame(
+            FRAME_TYPE_PUBLISH_EVENT,
+            data_bytes,
+            client_id=client_id,
+            channel=channel or client_id,
+            event_name=event_name,
+            subscription_id=subscription_id,
+            flags=FRAME_FLAG_COLUMNAR,
+        )
+        try:
+            conn.write_frame(frame)
+            return True
+        except Exception as e:
+            message = "pipe push failed: %s" % e
+            self._log(message)
+            self._drop_pair(generation, reason=message, conns=(conn,))
+            return False
 
     def close(self):
         self.running = False
@@ -6838,6 +7385,7 @@ class PipeTxClient(object):
             tx_conn = None
             generation = None
             try:
+                self._hub_binary = False
                 rx_conn = connect_pipe(self.pipe_name, timeout_ms=self.connect_timeout_ms)
                 rx_conn.write_frame(dumps_pipe_message(self._pipe_envelope("hello", "qmt_rx")))
                 tx_conn = connect_pipe(self.pipe_name, timeout_ms=self.connect_timeout_ms)
@@ -6871,12 +7419,23 @@ class PipeTxClient(object):
             raw = conn.read_frame()
             if raw is None:
                 break
-            envelope = loads_pipe_message(raw)
-            if envelope:
-                payload = envelope.get("payload")
-                if payload:
+            frame = decode_pipe_frame(raw)
+            if frame is not None:
+                if frame.get("type") == "hello_ack":
+                    self._hub_binary = self.binary_enabled and bool(frame.get("binary_hotpath"))
+                    continue
+                payload = frame.get("payload")
+                if payload is None:
+                    continue
+                if isinstance(payload, (bytes, bytearray)):
+                    if not (frame.get("flags", 0) & FRAME_FLAG_COLUMNAR):
+                        payload = payload.decode("utf-8", errors="replace")
+                    self.Q.put(payload)
+                elif payload:
                     self.Q.put(payload)
                 continue
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="replace")
             self.Q.put(raw)
 
     def _get_rx_conn(self):
@@ -6971,6 +7530,7 @@ class PipeTxClient(object):
             "instance_id": self.instance_id,
             "process_id": self.process_id,
             "heartbeat_interval": self.heartbeat_interval,
+            "binary_hotpath": self.binary_enabled,
         }
         if extra:
             data.update(extra)

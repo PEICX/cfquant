@@ -117,6 +117,7 @@ from cfquant.channels import configured_bridges, normalize_bridge_id
 from cfquant.config import get_config as get_cfquant_config
 from cfquant.logging_i18n import normalize_log_enabled, normalize_log_language
 from cfquant.level2 import L2_PERIODS
+from cfquant._fastjson import loads_message_typed
 from cfquant.pipe_transport import DEFAULT_PIPE_NAME, normalize_pipe_name
 from cfquant.protocol import decode_value, loads_message, new_id, pack_event, pack_response
 from cfquant.runtime_report import read_qmt_runtime_markers as read_qmt_runtime_marker_files
@@ -6972,10 +6973,11 @@ class CallbackEventStore(object):
         if not isinstance(raw, str):
             return None
         key, value = raw.split("|", 1) if "|" in raw else ("", raw)
-        msg = loads_message(raw)
+        msg = loads_message_typed(raw)
         if isinstance(msg, dict) and msg.get("type") == "event":
+            typed = bool(msg.pop("_cf_typed", True))
             event = dict(msg)
-            event["data"] = decode_value(event.get("data"))
+            event["data"] = decode_value(event.get("data")) if typed else event.get("data")
             if key:
                 event.setdefault("key", key)
             return event

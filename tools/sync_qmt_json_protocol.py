@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FUNCTIONS = {"normalize_json_value", "dumps_message", "pack_request"}
+FUNCTIONS = {"normalize_json_value", "dumps_message", "pack_request", "pack_event_raw"}
 
 
 def main():

@@ -6,8 +6,12 @@ import time
 
 from .pipe_transport import (
     DEFAULT_PIPE_NAME,
+    FRAME_FLAG_COLUMNAR,
+    FRAME_TYPE_DELIVERY,
     create_pipe_instance,
+    decode_pipe_frame,
     dumps_pipe_message,
+    encode_pipe_frame,
     loads_pipe_message,
     normalize_pipe_name,
     wait_for_pipe_client,
@@ -127,7 +131,7 @@ class CfquantPipeHub(object):
                 raw = conn.read_frame()
                 if raw is None:
                     break
-                envelope = loads_pipe_message(raw)
+                envelope = decode_pipe_frame(raw)
                 if envelope:
                     msg_type = envelope.get("type")
                     if msg_type == "hello":
@@ -147,6 +151,8 @@ class CfquantPipeHub(object):
                     else:
                         self._log("pipe ignored envelope type=%s role=%s" % (msg_type, role))
                 else:
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode("utf-8", errors="replace")
                     self._handle_api_request(conn, {
                         "payload": raw,
                         "request_channel": self.default_request_channel,
@@ -179,6 +185,11 @@ class CfquantPipeHub(object):
 
     def _handle_hello(self, conn, envelope, current_role):
         role = envelope.get("role") or current_role
+        binary_hotpath = bool(envelope.get("binary_hotpath"))
+        try:
+            conn.binary_hotpath = binary_hotpath
+        except Exception:
+            pass
         if role in ("qmt", "qmt_rx", "qmt_tx"):
             channels = self._envelope_channels(envelope)
             old_conns = []
@@ -215,6 +226,17 @@ class CfquantPipeHub(object):
                 self._remember_client(conn, client_id, receive_conn=role in ("api", "api_rx"))
             self._log("api pipe client registered role=%s client_id=%s" % (role, client_id or "-"))
         self._write_status()
+        if binary_hotpath and role in ("qmt_rx", "api_rx"):
+            # Ack on the direction the peer actually reads, so it can switch
+            # its hot messages to binary frames.
+            try:
+                conn.write_frame(dumps_pipe_message({
+                    "type": "hello_ack",
+                    "role": role,
+                    "binary_hotpath": True,
+                }))
+            except Exception as e:
+                self._log("pipe hello ack failed: %s" % e)
         return role
 
     def _envelope_channels(self, envelope):
@@ -241,6 +263,7 @@ class CfquantPipeHub(object):
             "instance_id": str(envelope.get("instance_id") or ""),
             "process_id": str(envelope.get("process_id") or envelope.get("pid") or ""),
             "heartbeat_interval": max(0.0, heartbeat_interval),
+            "binary_hotpath": bool(envelope.get("binary_hotpath")),
             "connected_at": now,
             "last_seen_at": now,
             "_last_seen_mono": time.monotonic(),
@@ -308,12 +331,30 @@ class CfquantPipeHub(object):
     def _handle_api_request(self, conn, envelope):
         api_received_at = time.perf_counter()
         raw = envelope.get("payload")
-        msg = loads_message(raw)
-        if not msg or msg.get("type") != "request":
-            return
-        request_id = msg.get("id")
-        client_id = envelope.get("client_id") or msg.get("client_id") or msg.get("reply_channel")
-        request_channel = envelope.get("request_channel") or self.default_request_channel
+        action = None
+        if envelope.get("_binary"):
+            # Hot path: routing fields travel in the frame header, the payload
+            # is forwarded untouched. Only our own clients send binary request
+            # frames, and only for pack_request outputs.
+            request_id = envelope.get("request_id")
+            client_id = envelope.get("client_id")
+            request_channel = envelope.get("request_channel") or self.default_request_channel
+            action = envelope.get("action")
+            if not request_id:
+                msg = self._parse_payload_message(raw)
+                if not msg or msg.get("type") != "request":
+                    return
+                request_id = msg.get("id")
+                client_id = client_id or msg.get("client_id") or msg.get("reply_channel")
+                action = msg.get("action")
+        else:
+            msg = loads_message(raw)
+            if not msg or msg.get("type") != "request":
+                return
+            request_id = msg.get("id")
+            client_id = envelope.get("client_id") or msg.get("client_id") or msg.get("reply_channel")
+            request_channel = envelope.get("request_channel") or self.default_request_channel
+            action = msg.get("action")
         if client_id:
             self._remember_client(conn, client_id, receive_conn=False)
         response_conn = self._client_rx_conn(client_id) or conn
@@ -322,7 +363,7 @@ class CfquantPipeHub(object):
                 self.pending[request_id] = {
                     "conn": response_conn,
                     "qmt_conn": None,
-                    "action": msg.get("action"),
+                    "action": action,
                     "request_channel": request_channel,
                     "api_received_at": api_received_at,
                     "forward_done_at": None,
@@ -358,7 +399,7 @@ class CfquantPipeHub(object):
         self._log(
             "pipe forwarded request action=%s id=%s channel=%s api_to_forward_ms=%.2f send_ms=%.2f len=%s"
             % (
-                msg.get("action"),
+                action,
                 request_id,
                 request_channel,
                 self._elapsed_ms(api_received_at, forward_done),
@@ -368,11 +409,97 @@ class CfquantPipeHub(object):
         )
         self._write_status()
 
+    @staticmethod
+    def _parse_payload_message(raw):
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        return loads_message(raw)
+
     def _handle_qmt_publish(self, conn, envelope):
         self._touch_qmt_conn(conn, envelope)
         qmt_received_at = time.perf_counter()
         raw = envelope.get("payload")
+        if envelope.get("_binary"):
+            if envelope.get("flags", 0) & FRAME_FLAG_COLUMNAR:
+                # Columnar batches are opaque bytes: route on the TLV fields
+                # alone; only binary-capable clients can receive them.
+                client_id = envelope.get("client_id") or envelope.get("channel")
+                with self.state_lock:
+                    target = self.client_by_id.get(client_id)
+                if target is None:
+                    return
+                if not getattr(target, "binary_hotpath", False):
+                    self._log(
+                        "pipe dropped columnar event for legacy client client_id=%s len=%s"
+                        % (client_id, len(raw))
+                    )
+                    return
+                try:
+                    self._send_delivery(target, raw, flags=envelope.get("flags", 0))
+                except Exception as e:
+                    self._log("pipe response/event delivery failed: %s" % e)
+                    self._drop_conn(target)
+                return
+            if not isinstance(raw, (bytes, bytearray)) or not raw.startswith(b"cfquant:"):
+                # Not one of our protocol messages: reuse the legacy raw
+                # callback handling below with a text envelope.
+                if isinstance(raw, (bytes, bytearray)):
+                    envelope = dict(envelope, payload=raw.decode("utf-8", errors="replace"))
+                envelope = dict(envelope, _binary=False)
+                raw = envelope.get("payload")
+                msg = loads_message(raw)
+                return self._handle_qmt_publish_legacy(conn, envelope, raw, msg, qmt_received_at)
+            if envelope.get("key") == "response":
+                request_id = envelope.get("request_id")
+                if not request_id:
+                    msg = self._parse_payload_message(raw)
+                    if msg and msg.get("type") == "response":
+                        request_id = msg.get("id")
+                with self.state_lock:
+                    pending = self.pending.pop(request_id, None) if request_id else None
+                if pending:
+                    target = pending.get("conn")
+                    api_received_at = pending.get("api_received_at") or qmt_received_at
+                    forward_done_at = pending.get("forward_done_at") or api_received_at
+                    self._log(
+                        "pipe got qmt response action=%s id=%s channel=%s qmt_roundtrip_ms=%.2f total_to_hub_ms=%.2f len=%s"
+                        % (
+                            pending.get("action"),
+                            request_id,
+                            pending.get("request_channel"),
+                            self._elapsed_ms(forward_done_at, qmt_received_at),
+                            self._elapsed_ms(api_received_at, qmt_received_at),
+                            len(raw),
+                        )
+                    )
+                    if target is not None:
+                        try:
+                            self._send_delivery(target, raw)
+                        except Exception as e:
+                            self._log("pipe response/event delivery failed: %s" % e)
+                            self._drop_conn(target)
+                    self._write_status()
+                return
+            client_id = envelope.get("client_id") or envelope.get("channel")
+            with self.state_lock:
+                target = self.client_by_id.get(client_id)
+            if self.verbose_events:
+                self._log(
+                    "pipe got qmt event event=%s client_id=%s target=%s len=%s"
+                    % (envelope.get("event_name"), client_id, bool(target), len(raw))
+                )
+            if target is not None:
+                try:
+                    self._send_delivery(target, raw)
+                except Exception as e:
+                    self._log("pipe response/event delivery failed: %s" % e)
+                    self._drop_conn(target)
+            return
         msg = loads_message(raw)
+        return self._handle_qmt_publish_legacy(conn, envelope, raw, msg, qmt_received_at)
+
+    def _handle_qmt_publish_legacy(self, conn, envelope, raw, msg, qmt_received_at):
+        self._touch_qmt_conn(conn, envelope)
         target = None
         status_changed = False
         if not msg:
@@ -459,7 +586,18 @@ class CfquantPipeHub(object):
             self._log("pipe error delivery failed: %s" % e)
             self._drop_conn(conn)
 
-    def _send_delivery(self, conn, payload, request_channel=None, client_id=None):
+    def _send_delivery(self, conn, payload, request_channel=None, client_id=None, flags=0):
+        if getattr(conn, "binary_hotpath", False):
+            conn.write_frame(encode_pipe_frame(
+                FRAME_TYPE_DELIVERY,
+                payload,
+                client_id=client_id,
+                channel=request_channel,
+                flags=flags,
+            ))
+            return
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", errors="replace")
         conn.write_frame(dumps_pipe_message({
             "type": "delivery",
             "payload": payload,
@@ -776,6 +914,7 @@ class CfquantPipeHub(object):
             "instance_id": meta.get("instance_id") or "",
             "process_id": meta.get("process_id") or "",
             "heartbeat_interval": heartbeat_interval,
+            "binary_hotpath": bool(meta.get("binary_hotpath")),
             "connected_at": connected_at,
             "last_seen_at": last_seen_at,
             "age_seconds": round(max(0.0, now - last_seen_at), 1) if last_seen_at else None,
@@ -834,7 +973,8 @@ class CfquantPipeHub(object):
             "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
             "pipe_name": self.pipe_name,
             "core_version": CORE_VERSION,
-            "hub_status_schema": 3,
+            "hub_status_schema": 4,
+            "hub_binary_hotpath": True,
             "running": self.running,
             "pid": os.getpid(),
             "qmt_channels": qmt_channels,

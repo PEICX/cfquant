@@ -75,7 +75,8 @@ class CallbackDispatcher(object):
 
 def dispatch_callbacks(callbacks, message, is_current):
     event = message.get("event")
-    data = decode_value(message.get("data"))
+    typed = bool(message.pop("_cf_typed", True))
+    data = decode_value(message.get("data")) if typed else message.get("data")
     full_message = dict(message, data=data)
     deliveries = [(list(callbacks.get("__event__", [])), full_message),
                   (list(callbacks.get(event, [])), data)]

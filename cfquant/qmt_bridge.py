@@ -188,7 +188,7 @@ class CfquantQmtBridge(object):
         if not client_id:
             self._log("cfquant请求缺少client_id，无法回包 action=%s id=%s" % (action, request_id))
             return
-        self._push("response", response, client_id)
+        self._push("response", response, client_id, request_id=request_id, action=action)
         self._log(
             "stage=response_sent action=%s id=%s client_id=%s total_ms=%.2f"
             % (action, request_id, client_id, self._elapsed_ms(received_at))
@@ -1585,7 +1585,7 @@ class CfquantQmtBridge(object):
         )
         self._push("event", event, client_id)
 
-    def _push(self, key, payload, channel):
+    def _push(self, key, payload, channel, request_id=None, action=None):
         if not channel:
             self._log("cfquant推送缺少channel key=%s payload=%s" % (key, self._brief(payload)))
             return
@@ -1593,7 +1593,11 @@ class CfquantQmtBridge(object):
         if tx is None:
             self._log("cfquant TX未连接，无法推送 channel=%s key=%s" % (channel, key))
             return
-        result = tx.push(key, payload, channel)
+        push_routed = getattr(tx, "push_routed", None)
+        if push_routed is not None:
+            result = push_routed(key, payload, channel, request_id=request_id, action=action)
+        else:
+            result = tx.push(key, payload, channel)
         if isinstance(result, dict) and result.get("code", 0) != 0:
             self._log("cfquant TX推送失败 channel=%s result=%s" % (channel, result))
 

@@ -93,6 +93,18 @@ def loads_message(raw):
     return data
 
 
+def has_typed_payload(raw):
+    """True when the raw frame mentions a ``__cf_type__`` envelope.
+
+    A cheap text scan over the whole frame (the marker can only occur inside
+    the payload); when it is absent the decoded message is plain scalars and
+    the decode_value deep restore can be skipped.
+    """
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        return b'"__cf_type__"' in raw
+    return isinstance(raw, str) and '"__cf_type__"' in raw
+
+
 def pack_request(action, params=None, reply_channel=None, client_id=None, request_id=None, timeout=None):
     payload = {
         "type": "request",
@@ -127,6 +139,33 @@ def pack_event(event, data=None, client_id=None, subscription_id=None, meta=None
         "data": encode_value(data),
         "meta": meta or {},
     })
+
+
+def pack_event_raw(event, data_json, client_id=None, subscription_id=None, meta=None):
+    """pack_event with a pre-serialized ``data`` JSON fragment.
+
+    ``data_json`` must be a compact JSON value produced by json.dumps with
+    allow_nan=False (the caller's dumps doubles as the plain-scalar type
+    check). The fragment is spliced in without re-walking the data, which is
+    what makes the whole-quote fastpath single-pass.
+    """
+    payload = {
+        "type": "event",
+        "event": event,
+        "client_id": client_id,
+        "subscription_id": subscription_id,
+        "meta": meta or {},
+    }
+    payload.setdefault("protocol", "cfquant")
+    payload.setdefault("version", PROTOCOL_VERSION)
+    payload.setdefault("ts", now_ms())
+    head = json.dumps(
+        normalize_json_value(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "%s%s,\"data\":%s}" % (MESSAGE_PREFIX, head[:-1], data_json)
 
 
 def encode_error(error):

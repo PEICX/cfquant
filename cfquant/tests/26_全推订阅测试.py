@@ -2,6 +2,7 @@
 import ast
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import queue
 import threading
@@ -13,9 +14,11 @@ import pytest
 import cfquant_web_server as web
 from cfquant import xtdata
 from cfquant import level2
-from cfquant.normal_bridge import COALESCED_QUERY_ACTIONS, NormalQmtBridge
+from cfquant import normal_bridge as normal_bridge_module
+from cfquant.normal_bridge import COALESCED_QUERY_ACTIONS, QUOTE_PROFILE_STATS, NormalQmtBridge
 from cfquant.pipe_bridge import PipeNormalQmtBridge
-from cfquant.protocol import loads_message, pack_event, pack_request, pack_response
+from cfquant.protocol import loads_message, pack_event, pack_event_raw, pack_request, pack_response
+from cfquant.quote_wire import decode_whole_quote, encode_whole_quote
 from cfquant.tx_trade_bridge import TxTradeBridge
 
 
@@ -28,8 +31,13 @@ def lite_bridge_class(path):
     tree.body = [node for node in tree.body if isinstance(node, ast.ClassDef)
                  and node.name in ("NormalQmtBridge", "PipeNormalQmtBridge")]
     namespace = dict(TxTradeBridge=TxTradeBridge, queue=queue, threading=threading,
-                     time=time, dt=dt, json=json, loads_message=loads_message,
-                     pack_event=pack_event, pack_response=pack_response,
+                     time=time, dt=dt, json=json, os=os, loads_message=loads_message,
+                     pack_event=pack_event, pack_event_raw=pack_event_raw,
+                     pack_response=pack_response,
+                     encode_whole_quote=encode_whole_quote,
+                     decode_whole_quote=decode_whole_quote,
+                     QUOTE_PROFILE_ENABLED=False,
+                     QUOTE_PROFILE_STATS=QUOTE_PROFILE_STATS,
                      COALESCED_QUERY_ACTIONS=COALESCED_QUERY_ACTIONS,
                      DEFAULT_PIPE_NAME="offline-test")
     namespace.update({key: value for key, value in vars(level2).items() if not key.startswith("__")})
@@ -232,7 +240,7 @@ def test_sdk_passes_list_and_registers_callback(monkeypatch, bridge):
     client = SimpleNamespace(
         request=lambda action, params: rpc(bridge, action, params),
         add_callback=lambda event, callback: callbacks.update({event: callback}),
-        remove_callback=lambda event, callback: callbacks.pop(event),
+        remove_callback=lambda event, callback: callbacks.pop(event, callback),
     )
     monkeypatch.setattr(xtdata, "get_client", lambda: client)
     monkeypatch.setattr(xtdata, "_subscription_callbacks", {})
@@ -244,6 +252,78 @@ def test_sdk_passes_list_and_registers_callback(monkeypatch, bridge):
     assert received == [{"rb2610.SF": {"lastPrice": 3000}}]
     xtdata.unsubscribe_quote(sub_id)
     assert callbacks == {}
+
+
+def _package_bridge():
+    result = NormalQmtBridge(FakeQmt(), show=False, schedule_timer=False)
+    result._log = lambda message: None
+    result.tx = RecordingTx()
+    result.running = True
+    return result
+
+
+def test_whole_quote_plain_scalars_skip_quote_plain(monkeypatch):
+    bridge = _package_bridge()
+
+    def fail(value):
+        raise AssertionError("quote_plain must not run for plain scalar batches")
+
+    monkeypatch.setattr(normal_bridge_module, "quote_plain", fail)
+    result = rpc(bridge, "xtdata.subscribe_whole_quote", {"code_list": ["BJ"]})
+    bridge.context.callbacks[result["internal_subscribe_id"]](
+        {"830799.BJ": {"lastPrice": 12.5, "volume": 100}, "000001.SZ": {"lastPrice": 1}})
+    kind, event, client = bridge.tx.messages[-1]
+    assert event["data"] == {
+        "830799.BJ": {"lastPrice": 12.5, "volume": 100},
+        "000001.SZ": {"lastPrice": 1},
+    }
+
+
+def test_whole_quote_numpy_and_nan_fall_back_to_conversion(bridge):
+    numpy = pytest.importorskip("numpy")
+    result = rpc(bridge, "xtdata.subscribe_whole_quote", {"code_list": ["BJ"]})
+    bridge.context.callbacks[result["internal_subscribe_id"]]({
+        "830799.BJ": {"lastPrice": numpy.float64(12.5)},
+        "000001.SZ": {"lastPrice": float("nan")},
+    })
+    kind, event, client = bridge.tx.messages[-1]
+    assert event["data"] == {
+        "830799.BJ": {"lastPrice": 12.5},
+        "000001.SZ": {"lastPrice": None},
+    }
+
+
+def test_whole_quote_fastpath_event_matches_legacy_shape():
+    bridge = _package_bridge()
+    result = rpc(bridge, "xtdata.subscribe_whole_quote", {"code_list": ["BJ"]})
+    data = {"830799.BJ": {"lastPrice": 12.5, "askPrice": [12.4, 12.5]}}
+    bridge.context.callbacks[result["internal_subscribe_id"]](data)
+    fastpath_event = bridge.tx.messages[-1][1]
+
+    expected = loads_message(pack_event(
+        "quote:%s" % result["subscribe_id"],
+        data=data,
+        client_id="client-a",
+        subscription_id=result["subscribe_id"],
+    ))
+    assert fastpath_event == expected
+
+
+def test_quote_profile_records_fastpath_batches(monkeypatch):
+    bridge = _package_bridge()
+    monkeypatch.setattr(normal_bridge_module, "QUOTE_PROFILE_ENABLED", True)
+    stats = normal_bridge_module.QUOTE_PROFILE_STATS
+    stats.reset()
+    try:
+        result = rpc(bridge, "xtdata.subscribe_whole_quote", {"code_list": ["BJ"]})
+        bridge.context.callbacks[result["internal_subscribe_id"]](
+            {"830799.BJ": {"lastPrice": 12.5}, "000001.SZ": {"lastPrice": 1}})
+        assert stats.batches == 1
+        assert stats.fast_batches == 1
+        assert stats.codes == 2
+        assert stats.encoded_ms > 0.0
+    finally:
+        stats.reset()
 
 
 @pytest.fixture
