@@ -835,11 +835,12 @@ def main_push_queue(que,who):
                 del dict_client_push_group[who]
                 break
             else:
-                for i in group_list:
-                    if i in dict_client_que:    
-                        dict_client_que[i].put(recv_data)
-                    else:
-                        group_list.remove(i)
+                # 不能边遍历边 remove（会跳过相邻元素导致漏投递）：
+                # 先筛出仍在线的订阅连接，原位更新 group 后再逐个投递
+                alive = [i for i in group_list if i in dict_client_que]
+                group_list[:] = alive
+                for i in alive:
+                    dict_client_que[i].put(recv_data)
      
 
 
