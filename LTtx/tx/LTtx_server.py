@@ -643,12 +643,12 @@ def handle_get_dict_value(var,key):
 
 def handle_get_list_value(var,index):
     if var in dict_var:
-        if abs(index) > len(dict_var[var]):
-            return {'value':dict_var[var][index]}
-        else:
-            return {'value':None}
-    else:
-        return {'value':None}        
+        value_list = dict_var[var]
+        # 合法下标 -len..len-1（支持负下标）；非列表变量按不存在处理，
+        # 避免越界/类型错误被外层 except 吞掉后客户端收不到回复而挂起
+        if isinstance(value_list, list) and -len(value_list) <= index < len(value_list):
+            return {'value':value_list[index]}
+    return {'value':None}
 
 def handle_get_dataframe(var):
     '''

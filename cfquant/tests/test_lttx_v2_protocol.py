@@ -225,6 +225,22 @@ def test_v2_connection_keeps_json_rpc(tx_client):
     assert value == 42
 
 
+def test_get_list_value_indices_end_to_end(tx_client):
+    # 回归：服务端旧实现的下标校验条件写反，合法下标恒返回 None
+    tx_client.put("cfquant_test_list", ["a", "b", "c"])
+    deadline = time.time() + 5
+    value = None
+    while time.time() < deadline:
+        value = tx_client.get_list_value("cfquant_test_list", 1)
+        if value is not None:
+            break
+        time.sleep(0.1)
+    assert value == "b"
+    assert tx_client.get_list_value("cfquant_test_list", -1) == "c"
+    assert tx_client.get_list_value("cfquant_test_list", 99) is None
+    assert tx_client.get_list_value("cfquant_test_missing", 0) is None
+
+
 def test_v2_push_with_large_unicode_payload(tx_client):
     channel = "v2_unicode"
     tx_client.start_txg(channel)
