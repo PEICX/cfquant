@@ -272,7 +272,7 @@ class txl:
                         'tocken':'LTtx',
                         }
             client.sendall(json.dumps(tem_dict).encode('utf-8'))
-            server_msg = client.recv(1024).decode()
+            server_msg = json.loads(client.recv(1024).decode())
             if server_msg['LTtx_lastest'] != self.__version__:
                 self.sys_print('从LTtx官网获取最新tx.py')
                 self.__get_lastest_file()
