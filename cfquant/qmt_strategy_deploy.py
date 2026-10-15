@@ -53,6 +53,18 @@ STALE_RUNTIME_MARKERS = (
     "unsupported action:cfquant.strategy.control",
 )
 
+# 托管策略控制循环的周期。每轮都会对每个 role 发一次 cfquant.strategy.control
+# （下发 desired + 收回运行状态），因此这个值直接决定控制流量的频率。
+# 原为 2 秒：每次往返 p50 约 79ms，属于持续背景负载；放宽到 5 秒流量降约 60%，
+# 代价是策略被外部杀掉后页面最多晚 5 秒感知（存活探测本来也不是毫秒级需求）。
+CONTROL_LOOP_INTERVAL_SECONDS = max(
+    0.5, float(os.environ.get("CFQUANT_STRATEGY_CONTROL_INTERVAL", "5"))
+)
+# 报告新鲜度窗口：_observe_runtime 认为 updated_at 超过该时长即已过期。
+# 必须显著大于控制周期，否则正常心跳会被误判为过期。取周期的 4 倍并设下线，
+# 这样上调控制周期时判定不会随之变紧。
+REPORT_FRESHNESS_SECONDS = max(10.0, CONTROL_LOOP_INTERVAL_SECONDS * 4.0)
+
 
 def is_stale_runtime_error(error):
     """判断控制请求是否因 QMT 侧脚本版本过旧而被拒绝。"""
@@ -1037,7 +1049,7 @@ class QmtStrategyManager:
                 report = json.loads(Path(role["runtime_status_path"]).read_text(encoding="utf-8"))
                 report_generation = str(report.get("generation") or "").strip()
                 valid = (report_generation in valid_generations
-                         and 0 <= time.time() - float(report.get("updated_at", 0)) < 10)
+                         and 0 <= time.time() - float(report.get("updated_at", 0)) < REPORT_FRESHNESS_SECONDS)
                 report_state = report.get("state") or ""
                 reports.append((valid, report_generation, report_state))
                 if valid and report_generation == str(job["generation"]) and report_state == "error":
@@ -1072,7 +1084,7 @@ class QmtStrategyManager:
                 # Per-target errors are reported by process_once; a state-file
                 # write failure will be retried without terminating the worker.
                 pass
-            self.event.wait(2.0)
+            self.event.wait(CONTROL_LOOP_INTERVAL_SECONDS)
             self.event.clear()
 
     def close(self):
