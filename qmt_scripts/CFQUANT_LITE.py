@@ -699,7 +699,7 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
 # END GENERATED CFTRADER BATCH
 
 CORE_VERSION = "0.2.53"
-LITE_ENTRY_VERSION = "lite_20261015_05"
+LITE_ENTRY_VERSION = "lite_20261015_06"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
 _ORDER_STATUS_FIELD_NAMES = (
@@ -6104,17 +6104,18 @@ class NormalQmtBridge(TxTradeBridge):
             return
         try:
             first_time = dt.datetime.now() + dt.timedelta(seconds=1)
-            # interval 从 500ms 降到 20ms：空闲时段 QMT 侧 python 线程的 GIL
+            # interval 从 500ms 降到 10ms：空闲时段 QMT 侧 python 线程的 GIL
             # 释放窗口与本定时器节拍强相关（实测响应耗时被量化成 0.5s 整数倍，
             # 且交易回调活跃时延迟显著降低）。缩短定时器节拍即缩短最坏 GIL 等待。
+            # 实测 500ms→20ms 使空闲期 p50 从 220ms 降到 ~60ms；10ms 再压一档。
             self.schedule_key = self.context.schedule_run(
                 self._on_timer,
                 first_time,
                 repeat_times=-1,
-                interval=dt.timedelta(milliseconds=20),
+                interval=dt.timedelta(milliseconds=10),
                 name="cfquant_normal_bridge_pump",
             )
-            self._log("normal bridge timer scheduled key=%s interval_ms=20" % self.schedule_key)
+            self._log("normal bridge timer scheduled key=%s interval_ms=10" % self.schedule_key)
         except Exception as e:
             self._log("normal bridge timer schedule failed: %s" % e)
 
