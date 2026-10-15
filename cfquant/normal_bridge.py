@@ -1005,6 +1005,12 @@ class NormalQmtBridge(TxTradeBridge):
             self._handle_async_order_callback(data)
             self._remember_order_callback_fields(data)
         restore_strategy_name(data)
+        if not data.get("m_strStrategyName"):
+            # ee78c92 起订单/成交格式化输出不再带 m_strStrategyName 别名（载荷瘦身），
+            # 但 ensure_callback_text_fields 会把它补成空串，导致公开回调里
+            # strategy_name 有用户策略而 m_strStrategyName 为空。这里在剥离内部
+            # 标记后同步别名，恢复"两个键承载同一用户策略"的公开契约。
+            data["m_strStrategyName"] = data.get("strategy_name") or ""
         payload = {
             "type": "event",
             "event": event_name,

@@ -698,8 +698,8 @@ def _resolve_batch_order_ids(bridge, account, pending, before_ids):
         time.sleep(min(0.05, remaining))
 # END GENERATED CFTRADER BATCH
 
-CORE_VERSION = "0.2.52"
-LITE_ENTRY_VERSION = "lite_20261014_01"
+CORE_VERSION = "0.2.53"
+LITE_ENTRY_VERSION = "lite_20261015_05"
 
 _CANCELABLE_ORDER_STATUS_VALUES = set([48, 49, 50, 55])
 _ORDER_STATUS_FIELD_NAMES = (
@@ -2377,14 +2377,13 @@ class TxTradeBridge(object):
                     if used_query_account_id != account_id:
                         formatted.setdefault("query_account_id", used_query_account_id)
                     if detail_type.lower() in ("order", "deal"):
-                        # 只对"仍在跟踪的委托"（元数据索引能命中的新单）做富化和
-                        # 回调缓存登记。历史旧单的元数据早已被上限淘汰，对它们
-                        # 富化必然落空、登记也只会立刻被挤出缓存，纯属逐行空耗
-                        # （2000 行委托实测此两项各约 5.7 秒）。索引未命中即跳过。
+                        # 历史旧单跳过富化（元数据早已被上限淘汰，逐行扫描必落空）。
+                        # _remember_order_callback_fields 保持无条件执行：查询结果
+                        # 是回调缓存的主要种子来源（先查后收成交流水是常见时序）。
                         if self._order_metadata_known(formatted):
                             self._enrich_order_request_fields(formatted)
-                            if detail_type.lower() == "order":
-                                self._remember_order_callback_fields(formatted)
+                        if detail_type.lower() == "order":
+                            self._remember_order_callback_fields(formatted)
                 result.append(formatted)
             except Exception as e:
                 self._log(
@@ -5896,17 +5895,42 @@ class NormalQmtBridge(TxTradeBridge):
     def _worker_loop(self, context=None):
         if context is not None:
             self.context = context
+        # 诊断：统计 worker 真实轮询节拍与唤醒等待，周期性打摘要（默认关闭，
+        # 用环境变量 CFQUANT_WORKER_DIAG=1 开启）。
+        _diag_enabled = str(os.environ.get("CFQUANT_WORKER_DIAG") or "").strip().lower() in ("1", "true", "on")
+        _diag_last_report = time.perf_counter()
+        _diag_ticks = 0
+        _diag_wait_total = 0.0
+        _diag_wait_max = 0.0
+        _diag_waits_over_100ms = 0
         while self.running:
             # 等待唤醒，返回后立即清除标志并无条件排空队列。
             #
-            # 周期取 20ms 而非更大值：实测本 QMT 嵌入式 Python 中
-            # threading.Event.set() 无法唤醒阻塞在 wait() 的线程——诊断日志出现
-            # "source=enqueue wait_ms=512"（set 已被调用，wait 仍等满超时），
-            # 说明 set() 快路径在该环境下不生效，实际处理节拍完全由超时决定。
-            # 原周期 0.5s 使响应耗时被量化成 0.5s 整数倍（实测双峰 513/1023ms）；
-            # 降到 20ms 后量化误差降到同量级。空转是纯 sleep 循环，CPU 代价可忽略。
-            # set() 仍保留：在唤醒正常的环境（如桌面 CPython）下可零延迟响应。
+            # 周期取 20ms：实测空闲时段 QMT 侧 python 线程拿 GIL 的窗口被 QMT
+            # 调度节拍（schedule_run 定时器 500ms）调制，wait 超时返回后仍要
+            # 排队拿 GIL，故有效节拍退化为 ~500ms；定时器 interval 已同步降到
+            # 20ms（见 _schedule_timer），此处保持 20ms 兜底轮询。
+            _t0 = time.perf_counter()
             self.worker_event.wait(0.02)
+            _waited_ms = (time.perf_counter() - _t0) * 1000.0
+            if _diag_enabled:
+                _diag_ticks += 1
+                _diag_wait_total += _waited_ms
+                if _waited_ms > _diag_wait_max:
+                    _diag_wait_max = _waited_ms
+                if _waited_ms > 100:
+                    _diag_waits_over_100ms += 1
+                _now = time.perf_counter()
+                if _now - _diag_last_report >= 10.0:
+                    self._log(
+                        "cfq worker diag ticks=%d avg_wait_ms=%.1f max_wait_ms=%.1f waits_over_100ms=%d"
+                        % (_diag_ticks, _diag_wait_total / max(_diag_ticks, 1), _diag_wait_max, _diag_waits_over_100ms)
+                    )
+                    _diag_ticks = 0
+                    _diag_wait_total = 0.0
+                    _diag_wait_max = 0.0
+                    _diag_waits_over_100ms = 0
+                    _diag_last_report = _now
             self.worker_event.clear()
             if not self.running:
                 break
@@ -6080,14 +6104,17 @@ class NormalQmtBridge(TxTradeBridge):
             return
         try:
             first_time = dt.datetime.now() + dt.timedelta(seconds=1)
+            # interval 从 500ms 降到 20ms：空闲时段 QMT 侧 python 线程的 GIL
+            # 释放窗口与本定时器节拍强相关（实测响应耗时被量化成 0.5s 整数倍，
+            # 且交易回调活跃时延迟显著降低）。缩短定时器节拍即缩短最坏 GIL 等待。
             self.schedule_key = self.context.schedule_run(
                 self._on_timer,
                 first_time,
                 repeat_times=-1,
-                interval=dt.timedelta(milliseconds=500),
+                interval=dt.timedelta(milliseconds=20),
                 name="cfquant_normal_bridge_pump",
             )
-            self._log("normal bridge timer scheduled key=%s" % self.schedule_key)
+            self._log("normal bridge timer scheduled key=%s interval_ms=20" % self.schedule_key)
         except Exception as e:
             self._log("normal bridge timer schedule failed: %s" % e)
 
@@ -6131,6 +6158,10 @@ class NormalQmtBridge(TxTradeBridge):
             self._handle_async_order_callback(data)
             self._remember_order_callback_fields(data)
         restore_strategy_name(data)
+        if not data.get("m_strStrategyName"):
+            # 订单/成交格式化输出不带 m_strStrategyName 别名（载荷瘦身），
+            # 这里在剥离内部标记后同步别名，保持两个键承载同一用户策略。
+            data["m_strStrategyName"] = data.get("strategy_name") or ""
         payload = {
             "type": "event",
             "event": event_name,
@@ -8356,7 +8387,7 @@ def _direct_async_order(msg):
 
 _attach_normal_status_extra()
 _runtime_report_retry_until = time.time() + 60.0
-_publish_lite_runtime_report("module_loaded")
+_publish_lite_runtime_report("module_loaded")
 
 _QMT_TRADE_CALLBACK_REGISTERED = False
 
@@ -8452,7 +8483,8 @@ def init(ContextInfo):
     if _trade_bridge:
         _trade_bridge.set_context(ContextInfo)
         _print_log("cfquant lite extreme trade context ready version:%s" % _ENTRY_VERSION)
-    _runtime_report_retry_until = time.time() + 60.0    if not _runtime_report_sent_at:
+    _runtime_report_retry_until = time.time() + 60.0
+    if not _runtime_report_sent_at:
         _publish_lite_runtime_report("context_ready", force=True)
 
 

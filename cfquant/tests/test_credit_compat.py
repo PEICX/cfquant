@@ -369,18 +369,22 @@ SMT_CASES = [
 @pytest.mark.parametrize("method,args", SMT_CASES)
 def test_smt_business_result_is_correlated_once_via_event(method, args):
     calls = []
-    raw = {"success": True, "msg": "accepted", "apply_id": "APPLY-1", "seq": 987}
+    # 模拟服务端回包的 seq 必须远离类级计数器当前区间：XtQuantTrader._seq 是
+    # 全进程共享的 itertools.count，全套件跑到此处时计数可达三位数，固定小值
+    # （原 987）会偶发生成 seq 与模拟值碰撞，断言 seq != 模拟值随机失败。
+    mock_seq = 10 ** 9 + 7
+    raw = {"success": True, "msg": "accepted", "apply_id": "APPLY-1", "seq": mock_seq}
     _, trader = wire({method: lambda *values: calls.append(values) or raw})
     received = []
     trader.callback = SimpleNamespace(on_smt_appointment_async_response=received.append)
     seq = getattr(trader, method + "_async")(ACCOUNT, *args)
-    assert seq > 0 and seq != 987
+    assert seq > 0 and seq != mock_seq
     assert calls == [("C123",) + args]
     assert len(received) == 1
     assert isinstance(received[0], XtSmtAppointmentResponse)
     assert received[0].seq == seq and received[0].apply_id == "APPLY-1"
     assert received[0].success is True
-    assert raw["seq"] == 987
+    assert raw["seq"] == mock_seq
 
 
 @pytest.mark.parametrize("raw", [False, -1])

@@ -346,6 +346,12 @@ def updated_source(source):
     source = _replace_class_method(source, 'NormalQmtBridge', '_callback_account_type',
                                    _class_method(normal, 'NormalQmtBridge', '_callback_account_type'))
     for name in ('_drain_requests', '_drain_single_request'):
+        # LITE 专属：order_priority_queue 让下单/撤单插队（d46c668 低延迟改造），
+        # canonical normal_bridge 没有该队列。目标文件带这个队列时保留其
+        # _drain_requests（含插队取队列逻辑），只同步 _drain_single_request。
+        lite_priority_drain = name == '_drain_requests' and 'order_priority_queue' in source
+        if lite_priority_drain:
+            continue
         source = _replace_class_method(source, 'NormalQmtBridge', name,
                                        _class_method(normal, 'NormalQmtBridge', name))
     for name in ('_defer_sync_order_response', '_poll_sync_order_responses'):

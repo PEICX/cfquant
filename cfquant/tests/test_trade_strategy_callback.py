@@ -51,7 +51,8 @@ def lite_bridge(path):
     methods = {'__init__', '_remember_order_request', '_enrich_order_request_fields',
                '_remember_order_callback_fields', '_format_trade_detail', '_query_trade_detail',
                '_trade_detail_query_account_id', '_filter_trade_detail_market',
-               '_active_market_route', '_market_suffix', '_formatted_trade_detail_market', '_stock_code_market'}
+               '_active_market_route', '_market_suffix', '_formatted_trade_detail_market', '_stock_code_market',
+               '_order_metadata_known'}
     nodes = []
     for cls in (node for node in tree.body if isinstance(node, ast.ClassDef)):
         selected = methods if cls.name == 'TxTradeBridge' else (

@@ -698,8 +698,12 @@ class TxTradeBridge(object):
                             account.get("account_type") or params.get("account_type") or account_type.upper()
                         )
                     if detail_type.lower() in ("order", "deal"):
-                        self._enrich_order_request_fields(formatted)
-                        self._enrich_query_order_meta_fields(formatted, account_id, account_type)
+                        # 历史旧单跳过富化（元数据早已被上限淘汰，逐行扫描必落空）。
+                        # _remember_order_callback_fields 保持无条件执行：查询结果
+                        # 是回调缓存的主要种子来源（先查后收成交流水是常见时序）。
+                        if self._order_metadata_known(formatted):
+                            self._enrich_order_request_fields(formatted)
+                            self._enrich_query_order_meta_fields(formatted, account_id, account_type)
                         if detail_type.lower() == "order":
                             self._remember_order_callback_fields(formatted)
                 result.append(formatted)
@@ -1663,6 +1667,32 @@ class TxTradeBridge(object):
         with self.pending_async_orders_lock:
             self._prune_pending_async_orders_locked()
             self.pending_async_orders.append(record)
+
+    def _order_metadata_known(self, order):
+        # 判断该行是否存在于 order_request_metadata 的委托号索引中。
+        # 与 _enrich_order_request_fields 使用同一判据（account_id + 任一委托号），
+        # 因此"跳过"不会漏掉富化本可命中的行。历史旧单的元数据早已被上限
+        # 淘汰，索引必然未命中——查询侧据此跳过逐行富化与登记的空耗。
+        if not isinstance(order, dict):
+            return False
+        account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
+        if not account_id:
+            return False
+        with self.order_request_metadata_lock:
+            index = getattr(self, "order_request_metadata_by_id", None)
+            if not index:
+                return False
+            for name in (
+                "order_id",
+                "m_nRef",
+                "m_nOrderID",
+                "m_strOrderRef",
+                "m_strOrderID",
+            ):
+                order_id = self._normalize_order_id(self._first_value(order, (name,)))
+                if order_id is not None and (account_id, str(order_id)) in index:
+                    return True
+        return False
 
     def _remember_order_request(self, account_id, stock_code, order_remark, strategy_name, order_id=None):
         key = (
