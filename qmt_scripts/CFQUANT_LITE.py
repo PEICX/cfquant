@@ -2058,47 +2058,6 @@ class TxTradeBridge(object):
                 pass
         self._log("tx trade bridge stopped")
 
-    def run_forever(self, sleep_seconds=0.05):
-        self.start()
-        while self.running:
-            self.poll(max_messages=100, timeout=sleep_seconds)
-
-    def poll(self, max_messages=100, timeout=0):
-        self.start()
-        count = 0
-        while self.running and count < max_messages:
-            try:
-                raw = self.tx.Q.get(timeout=timeout if count == 0 else 0)
-            except Exception:
-                break
-            if raw is None:
-                break
-            self._handle_raw(raw)
-            count += 1
-        return count
-
-    def _handle_raw(self, raw):
-        received_at = time.time()
-        msg = loads_message(raw)
-        if not msg or msg.get("type") != "request":
-            return
-        request_id = msg.get("id")
-        action = msg.get("action")
-        client_id = msg.get("client_id") or msg.get("reply_channel")
-        try:
-            result = self._dispatch(action, msg.get("params") or {}, msg)
-            response = pack_response(request_id, ok=True, result=result)
-            self._log("tx trade response_ready action=%s id=%s" % (action, request_id))
-        except Exception as e:
-            response = pack_response(request_id, ok=False, error=e)
-            self._log("tx trade request_error action=%s id=%s error=%s" % (action, request_id, e))
-        if client_id:
-            self.tx.push("response", response, client_id)
-            self._log(
-                "tx trade response_sent action=%s id=%s client_id=%s total_ms=%.2f"
-                % (action, request_id, client_id, (time.time() - received_at) * 1000)
-            )
-
     def _dispatch(self, action, params, msg):
         if action == "xttrader.get_hkt_exchange_rate":
             return query_connect_exchange_rate(self, params)
@@ -2789,7 +2748,8 @@ class TxTradeBridge(object):
         price_type = params.get("price_type", 11)
         order_remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy_name = params.get("strategy_name", "")
-        previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) if capture_previous_id else None        pending_sync_order = None
+        previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) if capture_previous_id else None
+        pending_sync_order = None
         if resolve_order_id:
             pending_sync_order = self._register_pending_sync_order(
                 account_id,
@@ -7762,22 +7722,6 @@ class PipeTradeBridge(TxTradeBridge):
                 pass
         self._log("pipe trade bridge stopped")
 
-    def poll(self, max_messages=100, timeout=0):
-        self.start()
-        count = 0
-        while self.running and count < max_messages:
-            try:
-                raw = self.tx.Q.get(timeout=timeout if count == 0 else 0)
-            except queue.Empty:
-                break
-            except Exception:
-                break
-            if raw is None:
-                break
-            self._handle_raw(raw)
-            count += 1
-        return count
-
     def _status_extra(self):
         return {
             "transport": "lite",
@@ -7853,18 +7797,6 @@ def start_pipe_trade_bridge(
 
 _normal_bridge = None
 _trade_bridge = None
-_trade_thread = None
-_trade_request_queue = queue.Queue(maxsize=10000)
-_trade_timer_key = None
-_trade_loop_started_at = 0
-_trade_loop_error = ""
-_trade_recv_count = 0
-_trade_dispatch_count = 0
-_trade_direct_dispatch_count = 0
-_trade_reroute_count = 0
-_trade_queue_full_count = 0
-_trade_last_recv_at = 0
-_trade_last_dispatch_at = 0
 _runtime_report_sent_at = 0.0
 _runtime_report_last_attempt_at = 0.0
 _runtime_report_pending_log_at = 0.0
@@ -7882,13 +7814,13 @@ RUNTIME_CONFIG = {}
 RUNTIME_CHANNELS = {}
 QMT_MARKET = os.environ.get("CFQUANT_MARKET", "").strip().upper()
 PIPE_CONNECT_TIMEOUT_MS = int(os.environ.get("CFQUANT_PIPE_CONNECT_TIMEOUT_MS", "3000"))
-TRADE_LOOP_IN_THREAD = os.environ.get("CFQUANT_CTYPE_TRADE_THREAD", "1").strip().lower() in ("1", "true", "yes", "on")
+
 NORMAL_PUMP_MAX_COUNT = int(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_COUNT", "100"))
 NORMAL_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_NORMAL_PUMP_MAX_MS", "0"))
-TRADE_SLEEP_SECONDS = float(os.environ.get("CFQUANT_CTYPE_TRADE_SLEEP_SECONDS", "0.001"))
-TRADE_PUMP_MAX_COUNT = int(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_COUNT", "100"))
-TRADE_PUMP_MAX_MS = float(os.environ.get("CFQUANT_CTYPE_TRADE_PUMP_MAX_MS", "0"))
-TRADE_TIMER_INTERVAL_MS = int(os.environ.get("CFQUANT_CTYPE_TRADE_TIMER_INTERVAL_MS", "20"))
+
+
+
+
 
 
 def _entry_file_path():
@@ -8138,7 +8070,7 @@ class ManagedPipeRuntime(object):
         self.namespace = namespace
         self.original_stop = namespace.get("stop")
         for name, value in list(namespace.items()):
-            if (name in ("init", "after_init", "handlebar", "cfquant_normal_timer", "cfquant_ctype_trade_timer")
+            if (name in ("init", "after_init", "handlebar", "cfquant_normal_timer")
                     or name.endswith("_callback")) and callable(value):
                 namespace[name] = self.wrap(value)
         for name in ("_normal_bridge", "_trade_bridge"):
@@ -8235,7 +8167,7 @@ _print_log("cfquant lite bridge id:%s pipe:%s normal_channel:%s trade_channel:%s
     BRIDGE_CHANNELS["trade"],
     BRIDGE_CHANNELS["callback"],
 ))
-_print_log("cfquant lite trade loop in thread:%s sleep_seconds:%s" % (TRADE_LOOP_IN_THREAD, TRADE_SLEEP_SECONDS))
+print
 
 
 def _record_lite_runtime_report_success(reason):
@@ -8306,32 +8238,13 @@ def _attach_normal_status_extra():
             "qmt_runtime_module_file": _entry_file_path() or "<string>",
             "qmt_runtime_entry_file": _entry_file_path() or "<string>",
             "ctype_trade_bridge_running": bool(_trade_bridge and _trade_bridge.running),
-            "ctype_trade_thread_alive": bool(_trade_thread and _trade_thread.is_alive()),
-            "ctype_trade_queue_size": _trade_request_queue.qsize(),
-            "ctype_trade_timer_key": _trade_timer_key,
-            "ctype_trade_loop_started_at": _trade_loop_started_at,
-            "ctype_trade_loop_error": _trade_loop_error,
-            "ctype_trade_recv_count": _trade_recv_count,
-            "ctype_trade_dispatch_count": _trade_dispatch_count,
-            "ctype_trade_direct_dispatch_count": _trade_direct_dispatch_count,
-            "ctype_trade_reroute_count": _trade_reroute_count,
-            "ctype_trade_queue_full_count": _trade_queue_full_count,
-            "ctype_trade_last_recv_at": _trade_last_recv_at,
-            "ctype_trade_last_dispatch_at": _trade_last_dispatch_at,
+            "ctype_trade_fast_dispatch_count": _trade_fast_dispatch_count,
             "ctype_trade_request_channel": BRIDGE_CHANNELS["trade"],
-            "ctype_trade_loop_in_thread": TRADE_LOOP_IN_THREAD,
-            "ctype_trade_sleep_seconds": TRADE_SLEEP_SECONDS,
-            "ctype_trade_pump_max_count": TRADE_PUMP_MAX_COUNT,
-            "ctype_trade_pump_max_ms": TRADE_PUMP_MAX_MS,
-            "ctype_trade_timer_interval_ms": TRADE_TIMER_INTERVAL_MS,
-            "ctype_trade_dispatch_thread": "qmt_timer_or_handlebar",
-            "ctype_trade_route_mode": "xttrader_to_normal_worker",
+            "ctype_trade_route_mode": "recv_thread_fast_dispatch",
         })
         return data
 
     _normal_bridge._status_extra = status_extra_with_trade
-
-
 
 
 _trade_fast_dispatch_count = 0
@@ -8345,19 +8258,22 @@ _DIRECT_DISPATCH_ACTIONS = frozenset((
 
 
 def _trade_fast_dispatch(payload):
-    # 零跳转：trade 端点收到的 xttrader.* 请求直接转发给 normal bridge（其内部
-    # 线程安全队列会立刻唤醒 worker），不再经过 tx.Q + 接收线程两级排队。
-    # 返回 True 表示已接管该消息；其余消息保持原路径。
+    # trade 端点的唯一分发路径：接收线程收到请求后不再经过任何中间队列，
+    # 直接交给 normal bridge（其线程安全队列会立刻唤醒 worker）。
+    # 返回 True 表示已接管该消息；仅当 normal bridge 极端情况下始终未就绪时
+    # 返回 False（消息留在 tx.Q，无人消费——启动序列保证不会走到这里）。
     global _trade_fast_dispatch_count
     try:
         if _normal_bridge is None:
-            return False
+            # 启动序列里 normal bridge 先于 trade 端点创建，正常不会走到这里；
+            # 有界等待而不是把消息滞留在无人消费的 tx.Q。
+            _deadline = time.perf_counter() + 5.0
+            while _normal_bridge is None and time.perf_counter() < _deadline:
+                time.sleep(0.01)
+            if _normal_bridge is None:
+                return False
         msg = loads_message(payload)
         if not isinstance(msg, dict) or msg.get("type") != "request":
-            return False
-        _action = str(msg.get("action") or "")
-        if not (_action.startswith("xttrader.") or _action in CFTRADER_BATCH_ORDER_ACTIONS
-                or _action in CFTRADER_BATCH_CANCEL_ACTIONS):
             return False
         _trade_fast_dispatch_count += 1
         if str(msg.get("action") or "") in _DIRECT_DISPATCH_ACTIONS:
@@ -8371,13 +8287,12 @@ def _trade_fast_dispatch(payload):
         return False
 
 
-
-
-
 def _direct_async_order(msg):
     # 接收线程直通：异步下单不经任何队列，直接 dispatch 并回包。
     try:
+        _t0 = time.perf_counter()
         result = _normal_bridge._dispatch(msg.get("action"), msg.get("params") or {}, msg)
+        _print_log("cfq direct async done ms=%.2f" % ((time.perf_counter() - _t0) * 1000))
         _normal_bridge._send_response(msg, result)
     except Exception as _direct_err:
         try:
@@ -8386,148 +8301,9 @@ def _direct_async_order(msg):
             pass
 
 
-def _run_trade_loop():
-    global _trade_loop_error, _trade_recv_count, _trade_queue_full_count, _trade_last_recv_at
-
-    while _trade_bridge and _trade_bridge.running:
-        try:
-            tx = _trade_bridge.tx
-            if tx is None:
-                time.sleep(0.05)
-                continue
-            raw = tx.Q.get(timeout=TRADE_SLEEP_SECONDS)
-            if raw is None:
-                continue
-            _fast_path = False
-            try:
-                _msg2 = loads_message(raw)
-                if isinstance(_msg2, dict) and _msg2.get("type") == "request":
-                    _action2 = str(_msg2.get("action") or "")
-                    if _action2.startswith("xttrader.") and _normal_bridge:
-                        _normal_bridge._handle_raw_from_thread(raw)
-                        _fast_path = True
-            except Exception:
-                _fast_path = False
-            if not _fast_path:
-                _trade_request_queue.put_nowait(raw)
-            _trade_recv_count += 1
-            _trade_last_recv_at = time.time()
-        except Exception as e:
-            if isinstance(e, queue.Empty):
-                continue
-            if isinstance(e, queue.Full):
-                _trade_queue_full_count += 1
-                _trade_loop_error = "trade request queue full"
-            else:
-                _trade_loop_error = "%s:%s" % (type(e).__name__, e)
-            _print_log("cfquant lite extreme trade loop error:%s" % _trade_loop_error)
-            try:
-                time.sleep(0.05)
-            except Exception:
-                pass
-
-
-def _drain_trade_requests(source):
-    global _trade_dispatch_count, _trade_last_dispatch_at, _trade_loop_error
-
-    if not _trade_bridge:
-        return 0
-    start = time.perf_counter()
-    count = 0
-    while count < TRADE_PUMP_MAX_COUNT:
-        if TRADE_PUMP_MAX_MS > 0 and (time.perf_counter() - start) * 1000 >= TRADE_PUMP_MAX_MS:
-            break
-        try:
-            raw = _trade_request_queue.get_nowait()
-        except queue.Empty:
-            break
-        try:
-            _handle_trade_raw(raw)
-            _trade_dispatch_count += 1
-            _trade_last_dispatch_at = time.time()
-        except Exception as e:
-            _trade_loop_error = "%s:%s" % (type(e).__name__, e)
-            _print_log("cfquant lite extreme trade dispatch error source=%s error=%s" % (source, _trade_loop_error))
-        count += 1
-    return count
-
-
-def _handle_trade_raw(raw):
-    if _should_reroute_trade_raw(raw) and _normal_bridge:
-        return _reroute_trade_raw_to_normal(raw)
-    _handle_trade_raw_direct(raw)
-
-
-def _should_reroute_trade_raw(raw):
-    msg = loads_message(raw)
-    if not msg or msg.get("type") != "request":
-        return False
-    action = str(msg.get("action") or "")
-    return action.startswith("xttrader.") or action == "cfquant.query_info"
-
-
-def _reroute_trade_raw_to_normal(raw):
-    global _trade_reroute_count
-
-    _normal_bridge._handle_raw_from_thread(raw)
-    _trade_reroute_count += 1
-
-
-def _handle_trade_raw_direct(raw):
-    global _trade_direct_dispatch_count
-
-    _trade_bridge._handle_raw(raw)
-    _trade_direct_dispatch_count += 1
-
-
-def _start_trade_loop():
-    global _trade_thread, _trade_loop_started_at, _trade_loop_error
-
-    if not _trade_bridge:
-        return
-    if _trade_thread is not None and _trade_thread.is_alive():
-        return
-    if TRADE_LOOP_IN_THREAD:
-        _trade_loop_error = ""
-        _trade_loop_started_at = time.time()
-        _trade_thread = threading.Thread(target=_run_trade_loop)
-        _trade_thread.daemon = True
-        _trade_thread.start()
-        _print_log("cfquant lite extreme trade loop started in worker thread")
-        return
-    _print_log("cfquant lite extreme trade loop entering current QMT thread")
-    _run_trade_loop()
-
-
-def cfquant_ctype_trade_timer(*args, **kwargs):
-    _drain_trade_requests("timer")
-
-
-def _schedule_trade_timer(ContextInfo):
-    global _trade_timer_key
-
-    if _trade_timer_key or ContextInfo is None:
-        return
-    try:
-        first_time = dt.datetime.now() + dt.timedelta(seconds=1)
-        _trade_timer_key = ContextInfo.schedule_run(
-            cfquant_ctype_trade_timer,
-            first_time,
-            repeat_times=-1,
-            interval=dt.timedelta(milliseconds=TRADE_TIMER_INTERVAL_MS),
-            name="cfquant_lite_trade_bridge_pump",
-        )
-        _print_log("cfquant lite extreme trade timer scheduled key:%s interval_ms:%s" % (_trade_timer_key, TRADE_TIMER_INTERVAL_MS))
-    except Exception as e:
-        _print_log("cfquant lite extreme trade timer schedule failed:%s" % e)
-
-
 _attach_normal_status_extra()
 _runtime_report_retry_until = time.time() + 60.0
-_publish_lite_runtime_report("module_loaded")
-if TRADE_LOOP_IN_THREAD:
-    _start_trade_loop()
-
+_publish_lite_runtime_report("module_loaded")
 
 _QMT_TRADE_CALLBACK_REGISTERED = False
 
@@ -8623,10 +8399,7 @@ def init(ContextInfo):
     if _trade_bridge:
         _trade_bridge.set_context(ContextInfo)
         _print_log("cfquant lite extreme trade context ready version:%s" % _ENTRY_VERSION)
-    _start_trade_loop()
-    _schedule_trade_timer(ContextInfo)
-    _runtime_report_retry_until = time.time() + 60.0
-    if not _runtime_report_sent_at:
+    _runtime_report_retry_until = time.time() + 60.0    if not _runtime_report_sent_at:
         _publish_lite_runtime_report("context_ready", force=True)
 
 
@@ -8636,9 +8409,6 @@ def after_init(ContextInfo):
 
 
 def handlebar(ContextInfo):
-    if TRADE_LOOP_IN_THREAD:
-        _start_trade_loop()
-    _drain_trade_requests("handlebar")
     if not _runtime_report_sent_at and time.time() <= _runtime_report_retry_until:
         _publish_lite_runtime_report("startup_retry")
     if _normal_bridge:
@@ -8646,14 +8416,7 @@ def handlebar(ContextInfo):
 
 
 def stop(ContextInfo):
-    global _normal_bridge, _trade_bridge, _trade_timer_key
-
-    if ContextInfo is not None and _trade_timer_key:
-        try:
-            ContextInfo.cancel_schedule_run(_trade_timer_key)
-        except Exception as e:
-            _print_log("cfquant lite extreme trade timer cancel failed:%s" % e)
-        _trade_timer_key = None
+    global _normal_bridge, _trade_bridge
 
     if _trade_bridge:
         _trade_bridge.close()
