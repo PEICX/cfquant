@@ -16,9 +16,6 @@ const state = {
   accountCacheRefreshInFlight: false,
   lastOrderConfirm: '',
   callbackSeq: 0,
-  orderSnapshot: new Map(),
-  orderSnapshotReady: false,
-  orderHighlights: new Map(),
   orderHighlightTimer: null,
   orderCallbackSocket: null,
   orderCallbackKey: '',
@@ -30,11 +27,7 @@ const state = {
   orderCallbackRefreshInFlight: false,
   orderCallbackRefreshPending: false,
   orderCallbackRefreshSections: new Set(),
-  orderCallbackMeta: new Map(),
-  latestOrders: [],
-  orderSort: { key: 'time', direction: 'desc' },
-  cfquantOrderIds: new Set(),
-  cfquantOrderRemarks: new Set(),
+
   callbackEvents: [],
   callbackEventFilters: null,
   callbackLastEventAt: '',
@@ -282,9 +275,6 @@ const DEFAULT_OFFICIAL_SITE_URL = 'https://cfquant.org';
 const API_DEBUG_TIMEOUT_MS = 18000;
 const API_DEBUG_QMT_TIMEOUT_SECONDS = 12;
 // 账户 orders/trades 段是全表查询，大委托表下单次可达数十秒。
-// 注意服务端链路上限：PipeHub 的 pending 超时（CFQUANT_PIPE_HUB_PENDING_TIMEOUT，
-// 默认 60s）会先截断，这里给 55s 让请求在到达上限前自然结束，拿到明确错误而非断连。
-const ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS = 55;
 const HELP_TOOLTIP_LAYER_ID = 'helpTooltipLayer';
 let mermaidRendererReady = false;
 let forceCloseVersionPopover = () => {};
@@ -1526,7 +1516,7 @@ const ONBOARDING_BRIDGE_POLL_MS = 3000;
 const CALLBACK_POLL_INTERVAL_MS = 3000;
 // 交易回调事件只做本地行合并，不触发任何全量委托/成交查询（web 页不需要
 // 精确到笔）；需要精确数据时用刷新按钮/切页签手动触发。
-const ORDER_SNAPSHOT_LIMIT = 500;
+
 const ORDER_HIGHLIGHT_MS = 6500;
 const DOWNLOAD_EVENT_PREFIX = 'xtdata:download';
 const DOWNLOAD_EVENT_LIMIT = 80;
@@ -8113,9 +8103,6 @@ function setDataTab(name, shouldRefresh = true) {
   if (shouldRefresh && name === 'trades') {
     refreshAccount('trades').catch((error) => log('成交刷新失败', { error: error.message }));
   }
-  if (shouldRefresh && name === 'orders') {
-    refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log('委托刷新失败', { error: error.message }));
-  }
 }
 
 function normalizeAccountType(value = 'STOCK') {
@@ -9604,7 +9591,6 @@ function selectAccountPair(accountId, bridgeId, accountType = 'STOCK', accountKe
   restartOrderCallbackSocket();
   refreshStatus().catch((error) => log('账号配置状态刷新失败', { error: error.message }));
   refreshAccount('asset,positions').catch((error) => log('账号配置资产刷新失败', { error: error.message }));
-  refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log('账号配置委托刷新失败', { error: error.message }));
   refreshAccount('trades').catch((error) => log('账号配置成交刷新失败', { error: error.message }));
 }
 
@@ -10745,16 +10731,12 @@ async function startAuthenticatedApp() {
 }
 
 async function refreshInitialAccountData() {
+  // orders 段已不再展示（委托页移除），初始化只拉资产/持仓/成交。
   const requests = [
     {
       sections: 'asset,positions',
       options: undefined,
       error: '初始化查询失败',
-    },
-    {
-      sections: 'orders',
-      options: { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS },
-      error: '委托初始化失败',
     },
     {
       sections: 'trades',
@@ -10934,12 +10916,7 @@ function resetSelectionState() {
   state.callbackEvents = [];
   state.callbackLastEventAt = '';
   state.callbackLastEventName = '';
-  state.orderSnapshot.clear();
-  state.orderSnapshotReady = false;
-  state.orderHighlights.clear();
-  state.orderCallbackMeta.clear();
-  state.cfquantOrderIds.clear();
-  state.cfquantOrderRemarks.clear();
+
   state.orderCallbackRefreshSections.clear();
   state.orderCallbackRefreshPending = false;
   if (state.orderHighlightTimer) {
@@ -10957,7 +10934,6 @@ function refreshCurrentSelection(reason) {
   restartOrderCallbackSocket();
   refreshStatus().catch((error) => log(`${reason}状态刷新失败`, { error: error.message }));
   refreshAccount('asset,positions').catch((error) => log(`${reason}资产刷新失败`, { error: error.message }));
-  refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log(`${reason}委托刷新失败`, { error: error.message }));
   refreshAccount('trades').catch((error) => log(`${reason}成交刷新失败`, { error: error.message }));
 }
 
@@ -11086,115 +11062,8 @@ function meaningfulOrderId(...values) {
   return '';
 }
 
-function orderKey(row) {
-  if (!row || typeof row !== 'object') return '';
-  return meaningfulOrderId(
-    row.order_sysid,
-    row.m_strOrderSysID,
-    row.order_id,
-    row.m_strOrderID,
-    row.m_nOrderID,
-    row.entrust_no,
-    row.contract_no,
-    row.m_strContractNo,
-  );
-}
-
-function orderCode(row) {
-  return row.stock_code || `${row.m_strInstrumentID || ''}.${row.m_strExchangeID || ''}`;
-}
-
-function orderName(row) {
-  return row.instrument_name || row.m_strInstrumentName || row.stock_name || row.name || '';
-}
-
-function orderRemark(row) {
-  return firstField(row, [
-    'order_remark',
-    'remark',
-    'strategy_name',
-    'm_strRemark',
-    'm_strOrderRemark',
-    'm_strStrategyName',
-  ]);
-}
-
-function isCfquantOrder(row) {
-  const id = orderKey(row);
-  if (id && state.cfquantOrderIds.has(id)) return true;
-  const explicitSource = String(row.order_source || row.source || '').trim().toLowerCase();
-  if (explicitSource === 'cfquant') return true;
-  const remark = String(orderRemark(row) || '').trim();
-  if (remark && state.cfquantOrderRemarks.has(remark)) return true;
-  return /^cfquant(?:_|$)/i.test(remark) || /(?:^|[_\-\s])cfquant(?:[_\-\s]|$)/i.test(remark);
-}
-
-function orderSource(row) {
-  return isCfquantOrder(row) ? 'cfquant' : '其他';
-}
-
-function orderSourceClass(row) {
-  return isCfquantOrder(row) ? 'source-cfquant' : 'source-other';
-}
-
-function rememberCfquantOrder(value) {
-  if (!value) return;
-  if (Array.isArray(value)) {
-    value.forEach((item) => rememberCfquantOrder(item));
-    return;
-  }
-  if (typeof value !== 'object') return;
-  const id = meaningfulOrderId(
-    value.order_sysid,
-    value.m_strOrderSysID,
-    value.order_id,
-    value.m_strOrderID,
-    value.m_nOrderID,
-    value.entrust_no,
-    value.contract_no,
-  );
-  const remark = String(
-    value.order_remark
-    || value.remark
-    || value.m_strRemark
-    || value.m_strOrderRemark
-    || '',
-  ).trim();
-  if (id) state.cfquantOrderIds.add(id);
-  if (remark) state.cfquantOrderRemarks.add(remark);
-  if (value.result) rememberCfquantOrder(value.result);
-  if (value.results) rememberCfquantOrder(value.results);
-  if (value.request_result && typeof value.request_result === 'object') rememberCfquantOrder(value.request_result);
-}
-
-function orderVolume(row) {
-  return Number(row.order_volume ?? row.m_nVolumeTotalOriginal ?? 0);
-}
-
-function tradedVolume(row) {
-  return Number(row.traded_volume ?? row.m_nVolumeTraded ?? 0);
-}
-
 function rawOrderStatus(row) {
   return row.order_status ?? row.m_nOrderStatus ?? row.m_strOrderStatus ?? row.m_nOrderState ?? row.m_strStatus ?? '';
-}
-
-function isCancelableOrder(row) {
-  const id = orderKey(row);
-  const volume = orderVolume(row);
-  const traded = tradedVolume(row);
-  if (!id || volume <= 0 || traded >= volume) return false;
-
-  const status = mappedStatus(rawOrderStatus(row), ORDER_STATUS_MAP);
-  const nonCancelableStatuses = new Set([
-    '已报待撤',
-    '部成待撤',
-    '部撤',
-    '已撤',
-    '已成',
-    '废单',
-  ]);
-  return !nonCancelableStatuses.has(status);
 }
 
 function orderStatus(row) {
@@ -11205,24 +11074,6 @@ function orderStatus(row) {
   if (hasValue(submitValue)) return mappedStatus(submitValue, SUBMIT_STATUS_MAP);
 
   return row.m_strStatusMsg || '';
-}
-
-function orderStatusReason(row) {
-  return firstField(row, [
-    'status_msg',
-    'm_strStatusMsg',
-    'error_msg',
-    'm_strErrorMsg',
-    'm_strCancelInfo',
-    'cancel_info',
-    'message',
-    'msg',
-  ]);
-}
-
-function isJunkOrder(row) {
-  const value = rawOrderStatus(row);
-  return Number(value) === 57 || String(value || '').trim().toUpperCase() === 'ORDER_JUNK';
 }
 
 const ORDER_TIME_FIELDS = [
@@ -11376,165 +11227,6 @@ function tradeDataTimeSortValue(value, dateValue) {
     return Number(date ? `${date}${clock}` : clock);
   }
   return null;
-}
-
-function orderTimeSortValue(row) {
-  return tradeDataTimeSortValue(firstField(row, ORDER_TIME_FIELDS), firstField(row, ORDER_DATE_FIELDS));
-}
-
-function orderSortValue(row, key) {
-  if (key === 'time') return orderTimeSortValue(row);
-  if (key === 'source') return orderSource(row);
-  if (key === 'code') return orderCode(row);
-  if (key === 'name') return orderName(row);
-  if (key === 'volume') return orderVolume(row);
-  if (key === 'traded') return tradedVolume(row);
-  if (key === 'status') return orderStatus(row);
-  if (key === 'id') return orderKey(row);
-  return '';
-}
-
-function compareOrderSortValues(left, right, column, direction) {
-  const type = column.type;
-  const leftMissing = type === 'number' ? !Number.isFinite(Number(left)) : !hasValue(left);
-  const rightMissing = type === 'number' ? !Number.isFinite(Number(right)) : !hasValue(right);
-  if (leftMissing && rightMissing) return 0;
-  if (leftMissing) return 1;
-  if (rightMissing) return -1;
-
-  let result = 0;
-  if (type === 'number') {
-    result = Number(left) - Number(right);
-  } else {
-    result = String(left).localeCompare(String(right), 'zh-CN', { numeric: true, sensitivity: 'base' });
-  }
-  return direction === 'desc' ? -result : result;
-}
-
-function sortedOrderRows(rows) {
-  const sort = state.orderSort || { key: 'time', direction: 'desc' };
-  const column = ORDER_SORT_COLUMNS[sort.key] || ORDER_SORT_COLUMNS.time;
-  const direction = sort.direction === 'asc' ? 'asc' : 'desc';
-  return rows.map((row, index) => ({ row, index })).sort((left, right) => {
-    const result = compareOrderSortValues(
-      orderSortValue(left.row, sort.key),
-      orderSortValue(right.row, sort.key),
-      column,
-      direction,
-    );
-    if (result !== 0) return result;
-    return direction === 'desc' ? right.index - left.index : left.index - right.index;
-  }).map((item) => item.row);
-}
-
-function renderOrderSortHeaders() {
-  document.querySelectorAll('[data-order-sort]').forEach((button) => {
-    const active = button.dataset.orderSort === state.orderSort.key;
-    const mark = button.querySelector('.sort-mark');
-    button.classList.toggle('active', active);
-    button.dataset.direction = active ? state.orderSort.direction : '';
-    if (mark) mark.textContent = active ? (state.orderSort.direction === 'asc' ? '↑' : '↓') : '';
-  });
-}
-
-function setOrderSort(key) {
-  const column = ORDER_SORT_COLUMNS[key];
-  if (!column) return;
-  const current = state.orderSort || {};
-  const direction = current.key === key
-    ? (current.direction === 'asc' ? 'desc' : 'asc')
-    : column.defaultDirection;
-  state.orderSort = { key, direction };
-  renderOrderSortHeaders();
-  renderOrders({ data: state.latestOrders || [] });
-}
-
-function wireOrderSortHeaders() {
-  document.querySelectorAll('[data-order-sort]').forEach((button) => {
-    button.addEventListener('click', () => setOrderSort(button.dataset.orderSort));
-  });
-  renderOrderSortHeaders();
-}
-
-function pruneOrderHighlights(now = Date.now()) {
-  let changed = false;
-  state.orderHighlights.forEach((highlight, id) => {
-    if (!highlight || highlight.expiresAt <= now) {
-      state.orderHighlights.delete(id);
-      changed = true;
-    }
-  });
-  return changed;
-}
-
-function scheduleOrderHighlightCleanup() {
-  if (state.orderHighlightTimer) {
-    window.clearTimeout(state.orderHighlightTimer);
-    state.orderHighlightTimer = null;
-  }
-  const expires = Array.from(state.orderHighlights.values()).map((item) => item.expiresAt);
-  if (!expires.length) return;
-  const nextExpiresAt = Math.min(...expires);
-  const delay = Math.max(120, nextExpiresAt - Date.now() + 40);
-  state.orderHighlightTimer = window.setTimeout(() => {
-    state.orderHighlightTimer = null;
-    const changed = pruneOrderHighlights();
-    if (changed) renderOrders({ data: state.latestOrders || [] });
-    if (state.orderHighlights.size) scheduleOrderHighlightCleanup();
-  }, delay);
-}
-
-function markOrderHighlight(id, type) {
-  if (!id) return;
-  state.orderHighlights.set(id, {
-    type,
-    expiresAt: Date.now() + ORDER_HIGHLIGHT_MS,
-  });
-  scheduleOrderHighlightCleanup();
-}
-
-function orderHighlightType(row) {
-  const id = orderKey(row);
-  if (!id) return '';
-  const highlight = state.orderHighlights.get(id);
-  if (!highlight) return '';
-  if (highlight.expiresAt <= Date.now()) {
-    state.orderHighlights.delete(id);
-    return '';
-  }
-  return highlight.type || 'updated';
-}
-
-function trackOrderEvents(rows) {
-  const shouldHighlight = state.orderSnapshotReady;
-  rows.forEach((row) => {
-    const id = orderKey(row);
-    if (!id) return;
-    const snapshot = {
-      code: orderCode(row),
-      name: orderName(row),
-      order_id: id,
-      time: orderTime(row),
-      source: orderSource(row),
-      volume: row.order_volume ?? row.m_nVolumeTotalOriginal,
-      traded: row.traded_volume ?? row.m_nVolumeTraded,
-      status: orderStatus(row),
-    };
-    const previous = state.orderSnapshot.get(id);
-    const changed = !previous || JSON.stringify(previous) !== JSON.stringify(snapshot);
-    if (changed) {
-      state.orderSnapshot.set(id, snapshot);
-      if (shouldHighlight) markOrderHighlight(id, previous ? 'updated' : 'new');
-    }
-  });
-  state.orderSnapshotReady = true;
-  while (state.orderSnapshot.size > ORDER_SNAPSHOT_LIMIT) {
-    const oldest = state.orderSnapshot.keys().next().value;
-    if (!oldest) break;
-    state.orderSnapshot.delete(oldest);
-    state.orderHighlights.delete(oldest);
-  }
-  pruneOrderHighlights();
 }
 
 function timestampMs(value) {
@@ -11860,57 +11552,6 @@ function appendServerCallbackEvent(event, options = {}) {
   return row;
 }
 
-function callbackEventIsOrderRow(event) {
-  return callbackEventName(event).includes('on_stock_order');
-}
-
-function orderRowFromCallbackEvent(event) {
-  if (!callbackEventIsOrderRow(event)) return null;
-  const data = callbackEventData(event);
-  if (!data || typeof data !== 'object') return null;
-  const row = { ...data };
-  if (!hasValue(firstField(row, ORDER_TIME_FIELDS)) && hasValue(event.received_at)) {
-    row.order_time = callbackReceivedMs(event);
-  }
-  return orderKey(row) ? row : null;
-}
-
-function rememberOrderCallbackMeta(row) {
-  if (!row || !row.order_id) return;
-  if (state.orderCallbackMeta.has(row.order_id)) state.orderCallbackMeta.delete(row.order_id);
-  state.orderCallbackMeta.set(row.order_id, {
-    label: row.label,
-    type: row.type,
-    className: row.className,
-    time: row.time,
-    seq: row.seq,
-    status: row.status,
-  });
-  while (state.orderCallbackMeta.size > ORDER_SNAPSHOT_LIMIT) {
-    const oldest = state.orderCallbackMeta.keys().next().value;
-    if (!oldest) break;
-    state.orderCallbackMeta.delete(oldest);
-  }
-}
-
-function orderCallbackMetaForRow(row) {
-  const id = orderKey(row);
-  return id ? state.orderCallbackMeta.get(id) : null;
-}
-
-function mergeOrderCallbackRow(row) {
-  if (!row) return false;
-  const id = orderKey(row);
-  if (!id) return false;
-  if (isCfquantOrder(row)) rememberCfquantOrder(row);
-  const rows = (state.latestOrders || []).slice();
-  const index = rows.findIndex((item) => orderKey(item) === id);
-  if (index >= 0) rows[index] = { ...rows[index], ...row };
-  else rows.push(row);
-  markOrderHighlight(id, index >= 0 ? 'updated' : 'new');
-  renderOrders({ data: rows });
-  return true;
-}
 
 function runOrderCallbackRefresh() {
   state.orderCallbackRefreshTimer = null;
@@ -11923,10 +11564,9 @@ function runOrderCallbackRefresh() {
   if (!sections.length) return;
   state.orderCallbackRefreshInFlight = true;
   const snapshots = sections.filter((section) => section === 'asset' || section === 'positions');
-  // 回调事件已经把行数据本地合并进表格（mergeOrderCallbackRow），委托/成交
-  // 不做任何事件驱动的全量查询——web 页不需要精确到笔，避免大委托表时
-  // 单次 30-80 秒的 get_trade_detail_data 霸占 worker。需要精确数据时
-  // 用刷新按钮/切页签手动触发。
+  // 交易事件不做任何委托/成交全量查询：web 已不再展示委托列表，避免
+  // 大委托表时单次数十秒的 get_trade_detail_data 霸占 worker 阻塞其他请求。
+  // 事件只顺带刷新资产/持仓快照（服务端缓存，轻量）。
   Promise.all([
     snapshots.length && accountSnapshotVisible() ? refreshVisibleAccountCache() : Promise.resolve(),
   ])
@@ -11953,11 +11593,7 @@ function handleOrderCallbackEvent(event, options = {}) {
   const row = appendServerCallbackEvent(event, { render: false });
   if (!row) return;
   const data = callbackEventData(event);
-  rememberCfquantOrder(data);
-  rememberOrderCallbackMeta(row);
-  mergeOrderCallbackRow(orderRowFromCallbackEvent(event));
   const name = callbackEventName(event);
-  // 委托/成交行数据已由 mergeOrderCallbackRow 本地合并；
   // 事件只额外刷新资产/持仓快照（服务端缓存，轻量）。
   if (name.includes('stock_trade') || name.includes('stock_asset') || name.includes('stock_position')) {
     scheduleOrderCallbackRefresh('asset,positions');
@@ -12144,62 +11780,6 @@ function renderCallbacks() {
   body.innerHTML = html || `<tr><td colspan="11">${state.callbackEvents.length ? '当前筛选下暂无回调，请勾选其他事件类型。' : '暂无真实回调事件。请确认 QMT 端已启用交易主推并加载 cfquant 回调桥。'}</td></tr>`;
 }
 
-function renderOrders(section) {
-  const rows = (section && Array.isArray(section.data)) ? section.data : [];
-  state.latestOrders = rows.slice();
-  trackOrderEvents(rows);
-  const cancelableCount = rows.filter(isCancelableOrder).length;
-  $('orderCount').textContent = `${rows.length} 条 / ${cancelableCount} 条可撤`;
-  const sortedRows = sortedOrderRows(rows);
-  const html = orderRowsHtml(sortedRows, { includeTime: true });
-  $('ordersBody').innerHTML = html || '<tr><td colspan="11">无委托数据</td></tr>';
-  const tradeBody = $('tradeOrdersBody');
-  if (tradeBody) {
-    tradeBody.innerHTML = html || '<tr><td colspan="11">无委托数据</td></tr>';
-  }
-  $('selectAllOrders').checked = false;
-  const tradeSelectAll = $('selectAllTradeOrders');
-  if (tradeSelectAll) tradeSelectAll.checked = false;
-  renderOrderSortHeaders();
-}
-
-function orderCallbackCellHtml(row) {
-  const meta = orderCallbackMetaForRow(row);
-  if (!meta) return '<span class="order-callback-empty">未收到</span>';
-  return `<span class="order-callback-tag ${esc(meta.className || '')}">${esc(meta.label)}</span><small>${esc(meta.time)}${meta.seq ? ` / seq ${esc(meta.seq)}` : ''}</small>`;
-}
-
-function orderRowsHtml(rows, options = {}) {
-  const includeTime = !!options.includeTime;
-  return rows.map((row, index) => {
-    const code = orderCode(row);
-    const orderId = orderKey(row);
-    const cancelable = isCancelableOrder(row);
-    const highlightType = orderHighlightType(row);
-    const highlightClass = highlightType ? ` order-row-highlight order-row-${highlightType}` : '';
-    const junk = isJunkOrder(row);
-    const statusReason = orderStatusReason(row);
-    const reasonText = junk
-      ? (statusReason || 'QMT未返回废单原因')
-      : '';
-    return `<tr class="clickable${highlightClass}" data-order-id="${esc(orderId)}" data-code="${esc(code)}" data-cancelable="${cancelable ? '1' : '0'}">
-      <td><input class="order-select" type="checkbox" data-order-id="${esc(orderId)}"${cancelable ? '' : ' disabled'}></td>
-      <td class="num">${index + 1}</td>
-      ${includeTime ? `<td>${esc(orderTime(row))}</td>` : ''}
-      <td><span class="source-pill ${orderSourceClass(row)}">${esc(orderSource(row))}</span></td>
-      <td>${esc(code)}</td>
-      <td>${esc(orderName(row))}</td>
-      <td class="num">${esc(orderVolume(row))}</td>
-      <td class="num">${esc(tradedVolume(row))}</td>
-      <td class="order-status-cell"${reasonText ? ` title="${esc(reasonText)}"` : ''}>
-        <strong>${esc(orderStatus(row))}</strong>
-        ${reasonText ? `<small class="order-status-reason">废单原因：${esc(reasonText)}</small>` : ''}
-      </td>
-      <td class="order-callback-cell">${orderCallbackCellHtml(row)}</td>
-      <td>${esc(orderId)}</td>
-    </tr>`;
-  }).join('');
-}
 
 function renderTrades(section) {
   const rows = (section && Array.isArray(section.data)) ? section.data : [];
@@ -12246,10 +11826,6 @@ async function refreshAccount(sections = 'asset,positions', options = {}) {
   if (data.positions) {
     if (data.positions.ok) renderPositions(data.positions);
     else log('持仓查询失败', data.positions);
-  }
-  if (data.orders) {
-    if (data.orders.ok) renderOrders(data.orders);
-    else log('委托查询失败', data.orders);
   }
   if (data.trades) {
     if (data.trades.ok) renderTrades(data.trades);
@@ -12325,10 +11901,8 @@ async function submitOrder(event) {
   if (derivativeAction) body.order_action = derivativeAction;
   try {
     const data = await api('/api/order', { method: 'POST', body: JSON.stringify(body) });
-    rememberCfquantOrder(data);
-    log('委托已提交', data);
+      log('委托已提交', data);
     await refreshAccount('asset,positions', { force: true });
-    await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
   } catch (error) {
     log('委托失败', { error: error.message });
   }
@@ -12403,10 +11977,8 @@ async function submitBatchOrders(event) {
     if (creditAction) body.credit_action = creditAction;
     if (derivativeAction) body.order_action = derivativeAction;
     const data = await api('/api/orders/batch', { method: 'POST', body: JSON.stringify(body) });
-    rememberCfquantOrder(data);
-    log('批量委托已提交', data);
+      log('批量委托已提交', data);
     await refreshAccount('asset,positions', { force: true });
-    await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
   } catch (error) {
     log('批量委托失败', { error: error.message });
   }
@@ -12424,7 +11996,6 @@ async function sendCancel(orderId, channel) {
   };
   const data = await api('/api/cancel', { method: 'POST', body: JSON.stringify(body) });
   log('撤单已提交', data);
-  await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
 }
 
 async function cancelOrder(event) {
@@ -12435,40 +12006,6 @@ async function cancelOrder(event) {
   } catch (error) {
     log('撤单失败', { error: error.message });
   }
-}
-
-async function cancelOrderFromRow(row) {
-  const orderId = row.dataset.orderId;
-  if (!orderId || orderId === '--') return;
-  if (row.dataset.cancelable !== '1') return;
-  const channel = selectedTradeChannel();
-  const confirmed = window.confirm(`确认撤单 ${orderId}？`);
-  if (!confirmed) return;
-  try {
-    await sendCancel(orderId, channel);
-  } catch (error) {
-    log('双击撤单失败', { order_id: orderId, error: error.message });
-  }
-}
-
-async function cancelSelectedOrders() {
-  const checked = Array.from(document.querySelectorAll('.order-select:not(:disabled):checked'));
-  const ids = [...new Set(checked.map((item) => item.dataset.orderId).filter(Boolean))];
-  if (!ids.length) {
-    log('未选择可撤委托');
-    return;
-  }
-  const confirmed = window.confirm(`确认撤销 ${ids.length} 笔委托？`);
-  if (!confirmed) return;
-  const channel = selectedTradeChannel();
-  for (const orderId of ids) {
-    try {
-      await sendCancel(orderId, channel);
-    } catch (error) {
-      log('批量撤单失败', { order_id: orderId, error: error.message });
-    }
-  }
-  await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
 }
 
 function wireForms() {
@@ -12533,22 +12070,6 @@ function wireForms() {
     });
   });
   syncCreditOrderControls();
-  $('ordersBody').addEventListener('dblclick', (event) => {
-    const row = event.target.closest('tr[data-order-id]');
-    if (row) cancelOrderFromRow(row);
-  });
-  $('selectAllOrders').addEventListener('change', (event) => {
-    document.querySelectorAll('.order-select:not(:disabled)').forEach((item) => {
-      item.checked = event.target.checked;
-    });
-  });
-  $('selectAllTradeOrders').addEventListener('change', (event) => {
-    document.querySelectorAll('.order-select:not(:disabled)').forEach((item) => {
-      item.checked = event.target.checked;
-    });
-  });
-  $('cancelSelectedBtn').addEventListener('click', cancelSelectedOrders);
-  wireOrderSortHeaders();
 }
 
 function wireNavigation() {
@@ -14004,7 +13525,6 @@ async function boot() {
   $('refreshBtn').addEventListener('click', async () => {
     try {
       await refreshAccount('asset,positions', { force: true });
-      await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
       await refreshAccount('trades', { force: true });
     } catch (error) {
       log('刷新失败', { error: error.message });
@@ -14356,7 +13876,6 @@ async function boot() {
       if (apiToggle) apiToggle.checked = overviewRemoteToggle.checked;
     });
   }
-  $('ordersBtn').addEventListener('click', () => refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log('委托刷新失败', { error: error.message })));
   const realtimeOrdersToggle = $('autoRefresh');
   if (realtimeOrdersToggle) {
     realtimeOrdersToggle.addEventListener('change', () => {

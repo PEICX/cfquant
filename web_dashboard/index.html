@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>cfquant 控制台</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/styles.css?v=web_20261015_03">
+  <link rel="stylesheet" href="/styles.css?v=web_20261015_04">
 </head>
 <body>
   <div id="webAuthOverlay" class="auth-overlay hidden" aria-live="polite">
@@ -410,7 +410,6 @@
               <button id="lttxStartBtn">启动 LTtx</button>
               <button id="lttxStopBtn" disabled>完整退出停止</button>
               <button id="statusBtn">状态检查</button>
-              <button id="ordersBtn">刷新委托</button>
             </div>
             <div id="lttxRuntime" class="runtime-note"></div>
             <div class="runtime-status-grid" aria-label="LTtx 运行状态">
@@ -479,35 +478,6 @@
             </div>
           </div>
 
-          <div class="panel span-12 view-panel view-overview view-orders orders-panel">
-            <div class="panel-head">
-              <h2>实时委托</h2>
-              <div class="head-actions">
-                <span id="orderCount" class="metric-note"></span>
-                <button id="cancelSelectedBtn">撤选中</button>
-              </div>
-            </div>
-            <div class="table-wrap compact-table">
-              <table>
-                <thead>
-                  <tr>
-                    <th><input id="selectAllOrders" type="checkbox"></th>
-                    <th>序号</th>
-                    <th><button class="sort-header" type="button" data-order-sort="time">时间<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th><button class="sort-header" type="button" data-order-sort="source">来源<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th><button class="sort-header" type="button" data-order-sort="code">代码<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th><button class="sort-header" type="button" data-order-sort="name">名称<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th class="num"><button class="sort-header" type="button" data-order-sort="volume">数量<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th class="num"><button class="sort-header" type="button" data-order-sort="traded">成交<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th><button class="sort-header" type="button" data-order-sort="status">状态<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    <th>最后回调</th>
-                    <th><button class="sort-header" type="button" data-order-sort="id">编号<span class="sort-mark" aria-hidden="true"></span></button></th>
-                  </tr>
-                </thead>
-                <tbody id="ordersBody"></tbody>
-              </table>
-            </div>
-          </div>
 
           <div class="panel span-6 view-panel view-trade trade-ticket">
             <div class="panel-head">
@@ -595,7 +565,6 @@
               <h2>交易数据</h2>
               <div class="head-actions">
                 <button class="data-tab active" data-tab="positions" type="button">持仓</button>
-                <button class="data-tab" data-tab="orders" type="button">委托</button>
                 <button class="data-tab" data-tab="trades" type="button">成交</button>
               </div>
             </div>
@@ -614,28 +583,6 @@
                     </tr>
                   </thead>
                   <tbody id="tradePositionsBody"></tbody>
-                </table>
-              </div>
-            </div>
-            <div class="tab-pane" data-pane="orders">
-              <div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th><input id="selectAllTradeOrders" type="checkbox"></th>
-                      <th>序号</th>
-                      <th><button class="sort-header" type="button" data-order-sort="time">时间<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th><button class="sort-header" type="button" data-order-sort="source">来源<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th><button class="sort-header" type="button" data-order-sort="code">代码<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th><button class="sort-header" type="button" data-order-sort="name">名称<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th class="num"><button class="sort-header" type="button" data-order-sort="volume">数量<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th class="num"><button class="sort-header" type="button" data-order-sort="traded">成交<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th><button class="sort-header" type="button" data-order-sort="status">状态<span class="sort-mark" aria-hidden="true"></span></button></th>
-                      <th>最后回调</th>
-                      <th><button class="sort-header" type="button" data-order-sort="id">编号<span class="sort-mark" aria-hidden="true"></span></button></th>
-                    </tr>
-                  </thead>
-                  <tbody id="tradeOrdersBody"></tbody>
                 </table>
               </div>
             </div>
@@ -3230,6 +3177,6 @@ else:
   <script src="/api-tester.js?v=20260916_apikey_01"></script>
   <script src="/python-api.js?v=20260925_trading_dates_01"></script>
   <script src="/docs.js?v=20260925_data_docs_01"></script>
-  <script src="/app.js?v=web_20261015_03"></script>
+  <script src="/app.js?v=web_20261015_04"></script>
 </body>
 </html>

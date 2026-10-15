@@ -5708,6 +5708,9 @@ class NormalQmtBridge(TxTradeBridge):
         super(NormalQmtBridge, self).close()
 
     def _recv_loop(self):
+        # 接收线程只负责把请求转交 worker 队列：QMT 原生交易接口有线程亲和性
+        # 要求（在接收线程直接调用会抛 'NoneType' object has no attribute
+        # 'request_id'），必须由固定的 worker 线程执行。
         while self.running:
             try:
                 raw = self.tx.Q.get()
@@ -5894,12 +5897,24 @@ class NormalQmtBridge(TxTradeBridge):
         if context is not None:
             self.context = context
         while self.running:
-            self.worker_event.wait(0.5)
+            # 等待唤醒，返回后立即清除标志并无条件排空队列。
+            #
+            # 周期取 20ms 而非更大值：实测本 QMT 嵌入式 Python 中
+            # threading.Event.set() 无法唤醒阻塞在 wait() 的线程——诊断日志出现
+            # "source=enqueue wait_ms=512"（set 已被调用，wait 仍等满超时），
+            # 说明 set() 快路径在该环境下不生效，实际处理节拍完全由超时决定。
+            # 原周期 0.5s 使响应耗时被量化成 0.5s 整数倍（实测双峰 513/1023ms）；
+            # 降到 20ms 后量化误差降到同量级。空转是纯 sleep 循环，CPU 代价可忽略。
+            # set() 仍保留：在唤醒正常的环境（如桌面 CPython）下可零延迟响应。
+            self.worker_event.wait(0.02)
+            self.worker_event.clear()
             if not self.running:
                 break
-            if not self.worker_event.is_set():
+            if not self.request_queue.qsize() and not self.order_priority_queue.qsize():
+                self._idle_ticks = getattr(self, "_idle_ticks", 0) + 1
+                if self._idle_ticks % 500 == 0:
+                    self._log("cfq worker idle_ticks=%d (每500次约10秒=20ms周期生效)" % self._idle_ticks)
                 continue
-            self.worker_event.clear()
             with self.worker_source_lock:
                 source = self.worker_source or "unknown"
             try:
