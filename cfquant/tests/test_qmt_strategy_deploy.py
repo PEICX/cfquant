@@ -4,6 +4,7 @@ import ast
 import copy
 import json
 from pathlib import Path
+import re
 import threading
 import time
 import tokenize
@@ -13,7 +14,8 @@ import pytest
 
 from cfquant.qmt_strategy_deploy import (
     QmtStrategyManager, _account_binding, _atomic_write, _read_document,
-    _write_json, _resolve_account_binding, account_qmt_roots, managed_source, normalize_strategy_settings,
+    _write_json, _resolve_account_binding, account_qmt_roots, is_stale_runtime_error,
+    managed_source, normalize_strategy_settings,
     normalize_strategy_mode,
     entry_script_for_mode, read_entry_source,
     _strategy_slot_name,
@@ -162,6 +164,37 @@ def test_model_configuration_preserves_account_and_is_idempotent(deployment):
     assert (root / "config" / "indexUserConfig.xml").read_bytes() == original
     assert len(models(root)) == 4
     assert b"<!--keep-->" in original and b'custom="preserved"' in original
+
+
+def test_model_remark_records_script_update_time(deployment):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    finish_import(manager, root)
+    manager.process_once()
+    job = next(iter(manager.jobs.values()))
+    model = models(root)[job["roles"][0]["name"]]
+
+    deployed_at = job.get("deployed_at_text")
+    assert deployed_at and re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", deployed_at)
+    remark = model.getAttribute("strategyRemark")
+    assert remark == "cfquant managed " + deployed_at
+
+    # The packaged strategy description carries the same timestamped remark,
+    # so QMT shows the update time in the strategy list too.
+    detail = json.loads(_cipher().decrypt(
+        Path(job["roles"][0]["package_path"]).read_bytes()).decode("utf-8", "surrogateescape"))["detail"]
+    assert detail["intro"] == remark
+
+    # Polling must not rewrite the remark: it belongs to the deployment, not the loop.
+    manager.process_once()
+    assert models(root)[job["roles"][0]["name"]].getAttribute("strategyRemark") == remark
+
+    # A fresh deployment replaces the timestamp with the new update time.
+    manager.jobs.clear()
+    manager.configure(row, infos, force=True)
+    rebuilt = next(iter(manager.jobs.values()))
+    assert rebuilt["generation"] != job["generation"]
+    assert rebuilt.get("deployed_at_text")
 
 
 def test_same_mode_reuses_model_name_when_deployment_fingerprint_changes(deployment):
@@ -540,6 +573,67 @@ def test_process_once_detects_stale_runtime_generation_and_queues_reimport(deplo
     manager.process_once()
     assert job["state"] == "waiting_import"
     assert (root / "formulas" / (role["name"] + ".rzrk")).is_file()
+
+
+@pytest.mark.parametrize("message", [
+    "unsupported action: cfquant.strategy.control",
+    "Unsupported Action: cfquant.strategy.control",
+])
+def test_stale_runtime_error_is_recognized(message):
+    assert is_stale_runtime_error(message)
+    assert is_stale_runtime_error(RuntimeError(message))
+
+
+@pytest.mark.parametrize("message", [
+    "", None, "cfquant pipe request timeout: cfquant.strategy.control",
+    "connection refused", "QMT ContextInfo尚未绑定",
+    # These two are raised only by *new* scripts during normal handshake /
+    # mode-change, so restarting QMT is not the fix — they must not be
+    # reported as an outdated-script condition.
+    "Managed strategy is awaiting account mode confirmation from cfquant Web.",
+    "The account's cfquant strategy mode has changed.",
+])
+def test_unrelated_errors_are_not_stale_runtime(message):
+    assert not is_stale_runtime_error(message)
+
+
+def test_outdated_script_reports_stale_runtime_instead_of_silent_pass(deployment):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    finish_import(manager, root)
+    running[0] = True
+    job = next(iter(manager.jobs.values()))
+
+    def outdated(identity, desired):
+        raise RuntimeError("unsupported action: cfquant.strategy.control")
+
+    manager.runtime_request = outdated
+    manager.process_once()
+    assert job["state"] == "stale_runtime"
+    assert "旧版托管脚本" in job["message"]
+    assert "unsupported action" in job["error"]
+    # A newer observation must not be masked by the stale-runtime branch.
+    assert job["state"] not in ("running", "waiting_start")
+
+    # A reachable endpoint that answers again resumes the normal state machine.
+    manager.runtime_request = lambda identity, desired: {}
+    manager.process_once()
+    assert job["state"] != "stale_runtime"
+
+
+def test_absent_endpoint_keeps_silent_pass(deployment):
+    manager, row, infos, running, root = deployment
+    manager.configure(row, infos)
+    finish_import(manager, root)
+    running[0] = True
+    job = next(iter(manager.jobs.values()))
+
+    def unreachable(identity, desired):
+        raise RuntimeError("cfquant pipe connect timeout")
+
+    manager.runtime_request = unreachable
+    manager.process_once()
+    assert job["state"] != "stale_runtime"
 
 
 @pytest.mark.parametrize("report_state", ["running", "stopped"])

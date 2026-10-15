@@ -41,8 +41,25 @@ STATES = {
     "waiting_account": "未找到此资金账号的 QMT 绑定键，请补充模型账号 Key",
     "configured": "模型已配置，等待下次启动 QMT 生效",
     "disabled": "自动运行已关闭，托管策略已禁用",
+    "stale_runtime": "QMT 正在运行旧版托管脚本，请重启 QMT 以加载新版脚本",
     "error": "策略部署失败",
 }
+
+# 只有不认识托管控制协议的旧版桥接脚本才会以 "unsupported action" 兜底拒绝
+# cfquant.strategy.control。模式变更/租约未确认这两条措辞反而只有新版脚本才有，
+# 属于正常握手中间态，重启 QMT 并不能解决，因此不计入旧版脚本判定。
+STALE_RUNTIME_MARKERS = (
+    "unsupported action: cfquant.strategy.control",
+    "unsupported action:cfquant.strategy.control",
+)
+
+
+def is_stale_runtime_error(error):
+    """判断控制请求是否因 QMT 侧脚本版本过旧而被拒绝。"""
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    return any(marker in text for marker in STALE_RUNTIME_MARKERS)
 
 
 def normalize_strategy_settings(value):
@@ -178,6 +195,18 @@ def _atomic_write(path, content):
 
 def _write_json(path, value):
     _atomic_write(path, json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2).encode("utf-8"))
+
+
+def _deployed_at_text(timestamp=None):
+    """本次生成策略包的时间，写入 QMT 模型备注供人查看。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(
+        time.time() if timestamp is None else float(timestamp)))
+
+
+def _strategy_remark(deployed_at_text):
+    """QMT 模型交易列表与策略包描述共用的备注，附加本次替换脚本的时间。"""
+    deployed_at_text = str(deployed_at_text or "").strip()
+    return "cfquant managed %s" % deployed_at_text if deployed_at_text else "cfquant managed"
 
 
 def _generation_values(value):
@@ -672,9 +701,12 @@ class QmtStrategyManager:
                     if isinstance(role, dict) and role.get("name")
                 )
                 retired.difference_update(current_names)
+                deployed_at = time.time()
+                deployed_at_text = _deployed_at_text(deployed_at)
                 job = dict(group, account_key=row["account_key"], account_id=row["account_id"],
                            account_type=row["account_type"], mode=mode, settings=settings,
                            enabled=True, generation=generation, fingerprint=fingerprint,
+                           deployed_at=deployed_at, deployed_at_text=deployed_at_text,
                            control_path=str(directory / "desired.json"),
                            retired=sorted(retired))
                 current_endpoints = {self._role_endpoint(role) for role in job["roles"]}
@@ -699,7 +731,8 @@ class QmtStrategyManager:
                                   "control_path": job["control_path"], "lease_dir": str(directory / "leases"),
                                   "runtime_status_path": role["runtime_status_path"]}
                     source = managed_source(Path(role["source"]), role["identity_path"], role["identity"], descriptor)
-                    package = build_package(role["name"], source, _role_stock(settings, role["role"]), settings["period"])
+                    package = build_package(role["name"], source, _role_stock(settings, role["role"]),
+                                            settings["period"], description=_strategy_remark(deployed_at_text))
                     role["package_path"] = str(directory / (role["name"] + ".rzrk"))
                     _atomic_write(role["package_path"], package)
                     role["package_sha256"] = hashlib.sha256(package).hexdigest()
@@ -743,6 +776,7 @@ class QmtStrategyManager:
                 self.runtime_request(role["identity"], dict(desired, enabled=False))
             except Exception:
                 pass
+        stale_error = ""
         for role in job["roles"]:
             try:
                 report = self.runtime_request(role["identity"], desired)
@@ -750,10 +784,22 @@ class QmtStrategyManager:
                         and report.get("role") == role["role"]):
                     # Only the external manager writes status files.
                     _write_json(role["runtime_status_path"], report)
-            except Exception:
-                # A stopped/not-yet-imported strategy has no Pipe endpoint.
-                # Existing reports expire normally in _observe_runtime.
-                pass
+            except Exception as error:
+                # A reachable Pipe endpoint that rejects the control action is
+                # running a script predating the managed-control protocol; a
+                # stopped/not-yet-imported strategy simply has no endpoint.
+                # Only the former is actionable, so surface it distinctly while
+                # existing reports still expire normally in _observe_runtime.
+                if is_stale_runtime_error(error):
+                    stale_error = str(error).strip()
+        if stale_error:
+            self._state(job, "stale_runtime",
+                        "QMT 正在运行旧版托管脚本，无法接收托管控制指令。"
+                        "请在 QMT 中移除并重新导入本策略，或重启 QMT 以加载新版脚本。(%s)" % stale_error)
+        elif job.get("state") == "stale_runtime":
+            # The endpoint answered the control request again; resume the
+            # normal state machine on the next observation.
+            self._state(job, "waiting_start")
 
     @staticmethod
     def _role_endpoint(role):
@@ -830,7 +876,8 @@ class QmtStrategyManager:
         root = qmt_root(job["root"], validate=True)
         if self.process_checker(root):
             self._sync_pipe_runtime(job)
-            self._observe_runtime(job)
+            if job.get("state") != "stale_runtime":
+                self._observe_runtime(job)
             return
         job["retired_roles"] = []
         if (job.get("state") in ("configured", "running", "waiting_start", "waiting_manual_start")
@@ -937,7 +984,7 @@ class QmtStrategyManager:
                               "m_strAccountKey": binding[1], "stock": _role_stock(job["settings"], role["role"]),
                               "peroid": str(job["settings"]["period"]), "eStrategyType": "4",
                               "strategymall": "0", "specialType": "48", "recover_type": "14",
-                              "runname": "", "strategyRemark": "cfquant managed",
+                              "runname": "", "strategyRemark": _strategy_remark(job.get("deployed_at_text")),
                               "runMode": "1" if job["settings"]["live"] else "0",
                               "startupAutorun": "1" if job["settings"]["autorun"] else "0",
                               "FromulaExpandData": json.dumps({"m_qsFormula": name,

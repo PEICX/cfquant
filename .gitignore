@@ -116,3 +116,4 @@ tem_delete/
 
 # ZCode agent session workspace.
 .zcode/
+.venv

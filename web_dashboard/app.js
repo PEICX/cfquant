@@ -115,6 +115,8 @@ const state = {
   bindingActionBusyKey: '',
   bindingActionBusyType: '',
   bindingNoticeTimer: null,
+  bindingDeployRows: [],
+  bindingDeployText: '',
   tests: [],
   testSourceId: '',
   testSearchText: '',
@@ -387,6 +389,7 @@ function strategyDeployTargetDetail(target = {}) {
     waiting_start: '策略配置已写入；请启动并登录 QMT，等待托管策略上线',
     waiting_manual_start: '策略已导入；请在 QMT 的模型交易中手动运行托管策略',
     waiting_account: '未找到该资金账号的 QMT 绑定键；请在绑定页补充模型账号 Key',
+    stale_runtime: 'QMT 中运行的是旧版托管脚本，无法接收托管控制指令；请在 QMT 中移除并重新导入本策略，或重启 QMT 以加载新版脚本',
   };
   let reason = stateMessages[target.state] || reasons.find((value) => !['error', '策略部署失败'].includes(value))
     || reasons[0] || target.state || '';
@@ -422,10 +425,11 @@ function qmtStartupInstruction(values = {}) {
   const strategy = values.qmt_strategy || {};
   const autoLogin = values.qmt_auto_login || {};
   if (values.enabled === false) return '账号绑定已停用；需要使用时，请启用绑定并保存。';
-  const actionableWaiting = targets.some((target) => ['waiting_exit', 'waiting_import', 'waiting_import_save', 'waiting_start', 'waiting_manual_start', 'waiting_account'].includes(target.state));
+  const deployWaitingStates = ['waiting_exit', 'waiting_import', 'waiting_import_save', 'waiting_start', 'waiting_manual_start', 'waiting_account', 'stale_runtime'];
+  const actionableWaiting = targets.some((target) => deployWaitingStates.includes(target.state));
   if (actionableWaiting) {
     const detail = targets
-      .filter((target) => ['waiting_exit', 'waiting_import', 'waiting_import_save', 'waiting_start', 'waiting_manual_start', 'waiting_account'].includes(target.state))
+      .filter((target) => deployWaitingStates.includes(target.state))
       .map((target) => strategyDeployTargetDetail(target))
       .join('；');
     return detail || '部署正在等待 QMT 完成下一步操作，请查看绑定状态中的处理建议。';
@@ -1231,6 +1235,28 @@ function wireTestsView() {
   if (copyCodeButton) copyCodeButton.addEventListener('click', copySelectedTestSource);
   const copyCommandButton = $('copyTestCommandBtn');
   if (copyCommandButton) copyCommandButton.addEventListener('click', copySelectedTestCommand);
+  const deployCopy = $('bindingDeployStatusCopy');
+  if (deployCopy) deployCopy.addEventListener('click', copyBindingDeployStatus);
+  const deployLines = $('bindingDeployStatusLines');
+  if (deployLines) {
+    deployLines.addEventListener('click', async (event) => {
+      const line = event.target.closest('.binding-deploy-line');
+      if (!line) return;
+      const index = Number(line.dataset.deployIndex);
+      const rows = currentBindingDeployRows();
+      const row = Number.isInteger(index) ? rows[index] : null;
+      const label = row ? String(row.label || '').trim() : '';
+      if (!label) return;
+      try {
+        await copyTextWithFallback(label);
+        line.classList.add('is-copied');
+        window.setTimeout(() => line.classList.remove('is-copied'), 1200);
+        setBindingNotice('已复制此行部署结果。', 'success');
+      } catch (error) {
+        setBindingNotice(`复制失败：${error.message}`, 'error', { autoHide: false });
+      }
+    });
+  }
 }
 
 function bindingQmtDeployRoleLabel(item = {}) {
@@ -2631,6 +2657,129 @@ function setBindingNotice(message = '', level = 'info', options = {}) {
   });
   if (message && options.autoHide !== false) {
     state.bindingNoticeTimer = window.setTimeout(() => setBindingNotice(''), options.duration || 6500);
+  }
+}
+
+function deployStatusLinesFrom(payloads) {
+  const rows = [];
+  (payloads || []).forEach((payload) => {
+    const lines = payload && Array.isArray(payload.status_lines) ? payload.status_lines : [];
+    lines.forEach((line) => { if (line && line.label) rows.push(line); });
+  });
+  return rows;
+}
+
+function deployStatusFallbackRows(payloads) {
+  // Older Web responses have no status_lines: derive rows from results/targets.
+  const rows = [];
+  (payloads || []).forEach((payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    (payload.results || []).forEach((item) => {
+      if (!item || typeof item !== 'object') return;
+      const path = item.current_core || item.python_dir || item.configured_dir || item.qmt_dir || 'QMT';
+      if (item.error) rows.push({ icon: '✗', status: 'failed', label: `核心包拷贝失败：${path}（${item.error}）` });
+      else if (item.updated) rows.push({ icon: '✓', status: 'copied', label: `核心包拷贝成功：${path}` });
+      else rows.push({ icon: '○', status: 'skipped', label: `核心包已是最新，无需拷贝：${path}` });
+    });
+    (payload.targets || []).forEach((target) => {
+      if (!target || typeof target !== 'object') return;
+      const root = target.root || target.account_id || '账号';
+      if (target.state === 'stale_runtime') rows.push({ icon: '✗', status: 'failed', label: `策略脚本部署失败：${root}（QMT 正在运行旧版托管脚本，请重启 QMT）` });
+      else if (target.error || target.state === 'error') rows.push({ icon: '✗', status: 'failed', label: `策略脚本部署失败：${root}（${target.error || target.state}）` });
+      else rows.push({ icon: '✓', status: 'copied', label: `策略脚本已部署：${root}` });
+    });
+    if (payload.error && !(payload.targets || []).length) {
+      rows.push({ icon: '✗', status: 'failed', label: `策略脚本部署失败：${payload.account_id || payload.account_key || '账号'}（${payload.error}）` });
+    }
+  });
+  return rows;
+}
+
+function deployRowLevel(row) {
+  // Level drives both the row styling and the copy text, so a success label
+  // that happens to contain the word "失败" cannot be miscounted as a failure.
+  if (row.status === 'failed') return 'failed';
+  if (row.status === 'skipped') return 'skipped';
+  return 'copied';
+}
+
+function currentBindingDeployRows() {
+  return (state.bindingDeployRows || []).filter((row) => row && row.label);
+}
+
+function bindingDeployStatusText() {
+  // Prefer the server-rendered text: it is the single source of truth for the
+  // summary line, so the frontend cannot drift from the backend format.
+  if (state.bindingDeployText) return state.bindingDeployText;
+  const rows = currentBindingDeployRows();
+  if (!rows.length) return '';
+  const failed = rows.filter((row) => deployRowLevel(row) === 'failed').length;
+  const head = failed ? `部署完成，${failed} 项失败：` : `部署全部成功（${rows.length} 项）：`;
+  return head + '\n' + rows.map((row) => String(row.label)).join('\n');
+}
+
+function deployStatusTextFrom(payloads) {
+  // Only trust the server text when a single payload produced it; merging two
+  // payloads would concatenate two summary lines, so fall back to local rows.
+  const parts = [];
+  (payloads || []).forEach((payload) => {
+    if (payload && typeof payload.status_text === 'string' && payload.status_text.trim()) {
+      parts.push(payload.status_text.trim());
+    }
+  });
+  return parts.length === 1 ? parts[0] : '';
+}
+
+function renderBindingDeployStatus(payloads) {
+  const box = $('bindingDeployStatus');
+  const list = $('bindingDeployStatusLines');
+  const title = $('bindingDeployStatusTitle');
+  if (!box || !list || !title) return;
+  const provided = deployStatusLinesFrom(payloads);
+  const rows = provided.length ? provided : deployStatusFallbackRows(payloads);
+  if (!rows.length) {
+    box.classList.add('hidden');
+    list.innerHTML = '';
+    state.bindingDeployRows = [];
+    state.bindingDeployText = '';
+    return;
+  }
+  const failed = rows.filter((row) => deployRowLevel(row) === 'failed').length;
+  title.textContent = failed ? `部署完成，${failed} 项失败` : `部署全部成功（${rows.length} 项）`;
+  title.classList.toggle('is-error', failed > 0);
+  list.innerHTML = rows.map((row, index) => {
+    const label = String(row.label || '');
+    return `<button type="button" class="binding-deploy-line is-${deployRowLevel(row)}" `
+      + `data-deploy-index="${index}" title="点击复制此行">`
+      + `<span class="binding-deploy-icon">${esc(row.icon || '•')}</span>`
+      + `<span class="binding-deploy-label">${esc(label)}</span></button>`;
+  }).join('');
+  // Keep the whole row (status + label), so copying a single row and copying
+  // all rows read from the same source and cannot drift apart.
+  state.bindingDeployRows = rows.map((row) => ({
+    status: row.status || '', icon: row.icon || '', label: String(row.label || ''),
+  }));
+  state.bindingDeployText = deployStatusTextFrom(payloads);
+  box.classList.remove('hidden');
+}
+
+function clearBindingDeployStatus() {
+  const box = $('bindingDeployStatus');
+  if (box) box.classList.add('hidden');
+  const list = $('bindingDeployStatusLines');
+  if (list) list.innerHTML = '';
+  state.bindingDeployRows = [];
+  state.bindingDeployText = '';
+}
+
+async function copyBindingDeployStatus() {
+  const text = bindingDeployStatusText();
+  if (!text) return;
+  try {
+    await copyTextWithFallback(text);
+    setBindingNotice('部署结果已复制到剪贴板。', 'success');
+  } catch (error) {
+    setBindingNotice(`复制失败：${error.message}`, 'error', { autoHide: false });
   }
 }
 
@@ -7909,6 +8058,10 @@ function setView(view) {
           state.bindingStatusRefreshInFlight = false;
         });
     }
+  } else {
+    // Leaving the bindings view drops the per-account deploy result so it
+    // cannot linger and be misread as belonging to the next account.
+    clearBindingDeployStatus();
   }
   if (state.appStarted && view === 'callbacks') {
     connectOrderCallbackSocket();
@@ -8810,6 +8963,7 @@ async function updateBindingCfquant(accountId, bridgeId, accountType = 'STOCK', 
     const identityIssue = !!(data.qmt_bridge_identity && data.qmt_bridge_identity.error);
     const message = qmtCoreDeploySummaryText(data.qmt_core_deploy) || 'cfquant 核心更新请求已完成。';
     setBindingNotice(identityIssue ? `${message}，身份配置写入失败：${data.qmt_bridge_identity.error}` : message, deployIssue || identityIssue ? 'warn' : 'success');
+    renderBindingDeployStatus([data.qmt_core_deploy]);
     log('绑定账号 cfquant 核心已更新', {
       account_id: payload.account_id,
       account_type: payload.account_type,
@@ -9833,6 +9987,7 @@ async function submitBindingForm(event) {
       qmtStrategyDeploy: data.qmt_strategy_deploy,
     });
     setBindingNotice(refreshError ? `${noticeMessage}，连接状态刷新失败：${refreshError.message}` : noticeMessage, noticeLevel);
+    renderBindingDeployStatus([data.qmt_core_deploy, data.qmt_strategy_deploy]);
     log('账号配置已保存', { account_id: accountId, display_name: displayName, account_type: accountType, mode, data_provider: dataProvider, qmt_dir_configured: !!qmtDir });
     showBindingQmtGuide({
       account_id: accountId,

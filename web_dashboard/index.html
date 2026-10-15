@@ -684,6 +684,13 @@
                 <span>绑定信息、运行状态和验证入口集中显示。</span>
               </div>
               <div id="bindingPageNotice" class="binding-page-notice hidden" role="status" aria-live="polite"></div>
+              <div id="bindingDeployStatus" class="binding-deploy-status hidden" role="status" aria-live="polite">
+                <div class="binding-deploy-status-head">
+                  <strong id="bindingDeployStatusTitle">部署结果</strong>
+                  <button id="bindingDeployStatusCopy" type="button" class="ghost">复制全部</button>
+                </div>
+                <div id="bindingDeployStatusLines" class="binding-deploy-status-lines"></div>
+              </div>
             </div>
           </div>
 

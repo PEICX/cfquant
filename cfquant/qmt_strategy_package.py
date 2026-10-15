@@ -33,7 +33,7 @@ def _cipher():
     return AES.new(material[:32], AES.MODE_CFB, iv=material[32:48], segment_size=128)
 
 
-def build_package(name, source, stock="SH000300", period=86400):
+def build_package(name, source, stock="SH000300", period=86400, description=""):
     if not re.fullmatch(r"CFQ_[A-Z0-9_]{1,59}", name):
         raise ValueError("Invalid managed QMT strategy name")
     if not source or "\x00" in source or len(source.encode("utf-8")) > 16 * 1024 * 1024:
@@ -43,7 +43,8 @@ def build_package(name, source, stock="SH000300", period=86400):
         "m_runPeriod": period, "m_runStock": stock, "m_nDrType": 3, "DataCount": 0,
         "arguName": [], "arguMax": [], "arguMin": [], "argDefault": [], "arguSteps": [],
         "outPutVars": [], "outputVarsPrecise": [], "defaultPeriod": -1, "scriptType": 1,
-        "minDataCount": 0, "visualAndEditableLevel": 2, "intro": "cfquant account bridge",
+        "minDataCount": 0, "visualAndEditableLevel": 2,
+        "intro": str(description or "").strip() or "cfquant account bridge",
         "isEncrypt": False, "pwd": "", "exportUsePwd": False, "importUsePwd": False,
         "brief": "", "arguTypes": [], "childFormula": [], "strArguName": [],
         "strArguDefault": [], "strArguInits": [], "investNames": [], "tradeBuyParam": "",

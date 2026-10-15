@@ -246,6 +246,32 @@ def get_instrument_detail(stock_code, iscomplete=False):
     })
 
 
+def get_instrument_detail_batch(stock_codes, iscomplete=False, chunk_size=200, timeout=None):
+    """批量获取合约详情, 返回 {stock_code: detail}。
+
+    逐只调 get_instrument_detail 每次都要一次桥往返; 桥开销大时(单次往返约百毫秒级)
+    拉全市场合约要几十分钟。此接口把列表交给服务端一次性遍历, 往返次数从 N 降到 N/chunk_size。
+    取不到的代码值为 None, 由调用方决定如何告警/跳过。
+    timeout 不传时用默认值; 批量单次遍历耗时远大于单只, 调用方应显式给足(见默认 chunk_size 的取舍)。
+    """
+    codes = [code for code in stock_codes if code]
+    step = max(1, int(chunk_size))
+    result = {}
+    for start in range(0, len(codes), step):
+        chunk = codes[start:start + step]
+        kwargs = {}
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
+        part = get_client().request(
+            "xtdata.get_instrument_detail_batch",
+            {"stock_codes": chunk, "iscomplete": iscomplete},
+            **kwargs
+        )
+        if isinstance(part, dict):
+            result.update(part)
+    return result
+
+
 def get_stock_list_in_sector(sector_name, real_timetag=-1):
     return get_client().request("xtdata.get_stock_list_in_sector", {
         "sector_name": sector_name,

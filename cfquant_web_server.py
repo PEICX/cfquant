@@ -10271,6 +10271,88 @@ def _qmt_entry_info_after_auto_sync(entry_info, deploy):
     return entry_info
 
 
+def _deploy_status_lines(core_results, strategy_results=None):
+    """把核心包拷贝与托管策略部署的结果，压成每目录一行、可复制的状态文本。
+
+    供界面直接展示与复制：成功用 ✓、跳过用 ○、失败用 ✗，失败附原因。
+    """
+    lines = []
+
+    def cleanup_path(value):
+        text = str(value or "").strip()
+        return os.path.normpath(text) if text else ""
+
+    for item in core_results or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("qmt_role") or item.get("market") or "QMT").strip() or "QMT"
+        path = cleanup_path(item.get("current_core") or item.get("python_dir")
+                            or item.get("configured_dir") or item.get("qmt_dir")) or "QMT"
+        error = str(item.get("error") or "").strip()
+        if error:
+            lines.append({"kind": "core", "status": "failed", "icon": "✗",
+                          "label": "核心包拷贝失败：%s（%s）" % (path, error),
+                          "path": path, "role": role, "error": error})
+        elif item.get("updated"):
+            lines.append({"kind": "core", "status": "copied", "icon": "✓",
+                          "label": "核心包拷贝成功：%s" % path,
+                          "path": path, "role": role, "error": ""})
+        elif item.get("skipped"):
+            lines.append({"kind": "core", "status": "skipped", "icon": "○",
+                          "label": "核心包已是最新，无需拷贝：%s" % path,
+                          "path": path, "role": role, "error": ""})
+        else:
+            warning = str(item.get("warning") or "").strip()
+            lines.append({"kind": "core", "status": "skipped", "icon": "○",
+                          "label": "核心包未拷贝：%s%s" % (path, ("（%s）" % warning) if warning else ""),
+                          "path": path, "role": role, "error": ""})
+
+    for item in strategy_results or []:
+        if not isinstance(item, dict):
+            continue
+        account_key = str(item.get("account_key") or "").strip()
+        account_id = str(item.get("account_id") or "").strip()
+        account_label = account_id or account_key or "账号"
+        top_error = str(item.get("error") or "").strip()
+        targets = [t for t in (item.get("targets") or []) if isinstance(t, dict)]
+        if top_error and not targets:
+            lines.append({"kind": "strategy", "status": "failed", "icon": "✗",
+                          "label": "策略脚本部署失败：%s（%s）" % (account_label, top_error),
+                          "path": account_label, "role": "", "error": top_error})
+            continue
+        for target in targets:
+            root = cleanup_path(target.get("root")) or account_label
+            error = str(target.get("error") or "").strip()
+            state = str(target.get("state") or "").strip()
+            if state == "stale_runtime":
+                lines.append({"kind": "strategy", "status": "failed", "icon": "✗",
+                              "label": "策略脚本部署失败：%s（QMT 正在运行旧版托管脚本，请重启 QMT）" % root,
+                              "path": root, "role": account_label, "error": error})
+            elif error or state == "error":
+                lines.append({"kind": "strategy", "status": "failed", "icon": "✗",
+                              "label": "策略脚本部署失败：%s（%s）" % (root, error or state or "未知错误"),
+                              "path": root, "role": account_label, "error": error})
+            else:
+                lines.append({"kind": "strategy", "status": "copied", "icon": "✓",
+                              "label": "策略脚本已部署：%s" % root,
+                              "path": root, "role": account_label, "error": ""})
+    return lines
+
+
+def _deploy_status_text(lines):
+    """可复制的多行文本；全部成功时首行给一句总结。"""
+    lines = [row for row in (lines or []) if isinstance(row, dict)]
+    if not lines:
+        return ""
+    failed = [row for row in lines if row.get("status") == "failed"]
+    body = "\n".join(str(row.get("label") or "") for row in lines)
+    if failed:
+        head = "部署完成，%d 项失败：" % len(failed)
+    else:
+        head = "部署全部成功（%d 项）：" % len(lines)
+    return head + "\n" + body
+
+
 def _auto_deploy_qmt_core_result_summary(results):
     results = [item for item in (results or []) if isinstance(item, dict)]
     updated = [item for item in results if item.get("updated")]
@@ -10446,9 +10528,12 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
             if target.get("market"):
                 result["market"] = target.get("market")
             results.append(result)
+    status_lines = _deploy_status_lines(results)
     return {
         "enabled": True,
         "results": results,
+        "status_lines": status_lines,
+        "status_text": _deploy_status_text(status_lines),
         "summary": _auto_deploy_qmt_core_result_summary(results),
     }
 
@@ -11511,6 +11596,7 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
         )
     if strategy_errors:
         summary["message"] += "；托管策略同步失败：" + "；".join(item["error"] for item in strategy_errors)
+    status_lines = _deploy_status_lines(results, strategy_results)
     return {
         "enabled": True,
         "source_dir": normalize_optional_path(source_dir or BASE_DIR),
@@ -11518,6 +11604,8 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
         "results": results,
         "identity_results": identity_results,
         "strategy_results": strategy_results,
+        "status_lines": status_lines,
+        "status_text": _deploy_status_text(status_lines),
         "summary": summary,
     }
 

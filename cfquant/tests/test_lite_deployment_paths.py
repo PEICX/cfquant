@@ -176,3 +176,34 @@ def test_update_uses_new_source_and_rejects_mislabeled_generic_entry(web_deploym
     assert result["summary"]["strategy_error_count"] == 1
     assert "通用模式代码" in result["summary"]["message"]
     assert (root / "python" / entry.name).read_bytes() == previous
+
+
+
+def test_deploy_status_lines_report_success_and_failure_per_directory(web_deployment, tmp_path):
+    web, manager, row, infos, root = web_deployment
+    row["mode"] = "lite"
+    result = web.auto_deploy_qmt_core_for_all_accounts(str(SCRIPTS.parent), sync_entry_scripts=True)
+    assert result["summary"]["ok"]
+
+    lines = result["status_lines"]
+    assert lines
+    assert all(row.get("label") and row.get("icon") for row in lines)
+    core_lines = [item for item in lines if item["kind"] == "core"]
+    strategy_lines = [item for item in lines if item["kind"] == "strategy"]
+    assert core_lines and strategy_lines
+    assert all(item["status"] in ("copied", "skipped") for item in lines)
+    text = result["status_text"]
+    assert text.startswith("部署全部成功（%d 项）：" % len(lines))
+    assert all(item["label"] in text for item in lines)
+
+    # An outdated entry source must surface as a failed line carrying the reason.
+    source = tmp_path / "broken_project"
+    (source / "qmt_scripts").mkdir(parents=True)
+    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(
+        (SCRIPTS / "CFQUANT_CTYPE_ALL_LOWLAT.py").read_bytes())
+    broken = web.auto_deploy_qmt_core_for_all_accounts(str(source), sync_entry_scripts=True)
+    assert not broken["summary"]["ok"]
+    failed = [item for item in broken["status_lines"] if item["status"] == "failed"]
+    assert failed and all(item["icon"] == "✗" for item in failed)
+    assert any("通用模式代码" in item["label"] for item in failed)
+    assert broken["status_text"].startswith("部署完成，%d 项失败：" % len(failed))

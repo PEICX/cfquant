@@ -2189,6 +2189,8 @@ class TxTradeBridge(object):
             return self._download_financial_data(params, msg)
         if action == "xtdata.get_instrument_detail":
             return self._get_instrument_detail(params)
+        if action == "xtdata.get_instrument_detail_batch":
+            return self._get_instrument_detail_batch(params)
         if action == "xtdata.get_stock_list_in_sector":
             return self._get_stock_list_in_sector(params)
         if action.startswith("xtdata."):
@@ -4586,6 +4588,32 @@ class TxTradeBridge(object):
                 self._log("%s unavailable: %s" % (name, e))
         self._log("get_instrument_detail not found, using fallback")
         return self._fallback_instrument_detail(params, stock_code)
+
+    def _get_instrument_detail_batch(self, params):
+        """单次 RPC 批量取合约详情, 免去客户端逐只往返(桥开销大时每次往返约百毫秒级)。
+
+        返回 {stock_code: detail}; 取不到的代码值为 None, 由客户端决定是否告警。
+        逐只仍复用 _get_instrument_detail, 保持原生/降级/别名逻辑完全一致。
+        """
+        params = params or {}
+        stock_codes = self._list_param(
+            params.get("stock_codes", params.get("stock_list", params.get("code_list")))
+        )
+        iscomplete = bool(params.get("iscomplete", params.get("is_complete", params.get("complete", False))))
+        detail_defaults = dict(params)
+        detail_defaults["iscomplete"] = iscomplete
+        result = {}
+        for stock_code in stock_codes:
+            if not stock_code:
+                continue
+            try:
+                sub_params = dict(detail_defaults)
+                sub_params["stock_code"] = stock_code
+                result[stock_code] = self._get_instrument_detail(sub_params)
+            except Exception as e:
+                self._log("get_instrument_detail_batch %s failed: %s" % (stock_code, e))
+                result[stock_code] = None
+        return result
 
     def _get_financial_data(self, params):
         func = self._get_callable("get_financial_data")
