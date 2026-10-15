@@ -11,6 +11,52 @@ MESSAGE_PREFIX = "cfquant:"
 _pd = None
 _pd_loaded = False
 
+# Exact builtin types json.dumps can emit verbatim; anything else (numpy
+# scalars, tuples, pandas objects, custom classes) must go through the slow
+# normalizer. ``bool`` is a subclass of ``int`` but listed separately anyway.
+_JSON_SAFE_SCALAR_TYPES = frozenset({str, bool, int, float})
+
+
+class _NotPlainJson(Exception):
+    """Internal: raised by _normalize_fast to request the full normalizer."""
+
+
+def _normalize_fast(value, _active=None):
+    """Return the value unchanged when it is already plain JSON data.
+
+    Raises ``_NotPlainJson`` on the first non-plain node (numpy scalars, tuples,
+    pandas objects, custom classes, circular references), falling back to
+    ``normalize_json_value`` which reports the exact field path.
+    """
+    value_type = type(value)
+    if value_type is dict:
+        active = set() if _active is None else _active
+        identity = id(value)
+        if identity in active:
+            raise _NotPlainJson()
+        active.add(identity)
+        try:
+            for item in value.values():
+                _normalize_fast(item, active)
+            return value
+        finally:
+            active.remove(identity)
+    if value_type is list:
+        active = set() if _active is None else _active
+        identity = id(value)
+        if identity in active:
+            raise _NotPlainJson()
+        active.add(identity)
+        try:
+            for item in value:
+                _normalize_fast(item, active)
+            return value
+        finally:
+            active.remove(identity)
+    if value_type is not str and value is not None and (value_type not in _JSON_SAFE_SCALAR_TYPES or (value_type is float and not math.isfinite(value))):
+        raise _NotPlainJson()
+    return value
+
 
 def now_ms():
     return int(time.time() * 1000)
@@ -72,7 +118,11 @@ def dumps_message(payload):
     data.setdefault("protocol", "cfquant")
     data.setdefault("version", PROTOCOL_VERSION)
     data.setdefault("ts", now_ms())
-    return MESSAGE_PREFIX + json.dumps(normalize_json_value(data), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    try:
+        normalized = _normalize_fast(data)
+    except _NotPlainJson:
+        normalized = normalize_json_value(data)
+    return MESSAGE_PREFIX + json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
 def loads_message(raw):
@@ -159,8 +209,12 @@ def pack_event_raw(event, data_json, client_id=None, subscription_id=None, meta=
     payload.setdefault("protocol", "cfquant")
     payload.setdefault("version", PROTOCOL_VERSION)
     payload.setdefault("ts", now_ms())
+    try:
+        normalized = _normalize_fast(payload)
+    except _NotPlainJson:
+        normalized = normalize_json_value(payload)
     head = json.dumps(
-        normalize_json_value(payload),
+        normalized,
         ensure_ascii=False,
         separators=(",", ":"),
         allow_nan=False,

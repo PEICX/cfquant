@@ -443,6 +443,40 @@ def read_static_asset(path):
     return rel_path, None
 
 
+_STATIC_ASSET_CACHE = {}
+_STATIC_ASSET_CACHE_LOCK = threading.RLock()
+
+
+def read_static_asset_cached(path):
+    """read_static_asset with an mtime/size keyed cache and a strong ETag.
+
+    app.js/python-api-data.js are megabyte-scale and re-read from disk on
+    every page load; the cache keeps the bytes in memory and the ETag lets
+    browsers turn repeat loads into cheap 304s.
+    """
+    rel_path, raw = read_static_asset(path)
+    if raw is None:
+        return rel_path, None, ""
+    static_root = os.path.abspath(STATIC_DIR)
+    full_path = os.path.abspath(os.path.join(static_root, rel_path.replace("/", os.sep)))
+    try:
+        stat = os.stat(full_path)
+        cache_key = (full_path, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        # Packaged (zipimport) asset: content is immutable, key on rel path.
+        cache_key = ("pkg", rel_path)
+    etag = '"%s"' % hashlib.sha256(repr(cache_key).encode("utf-8")).hexdigest()[:32]
+    with _STATIC_ASSET_CACHE_LOCK:
+        cached = _STATIC_ASSET_CACHE.get(cache_key)
+        if cached is not None and cached[1] == etag:
+            return rel_path, cached[0], etag
+    with _STATIC_ASSET_CACHE_LOCK:
+        if len(_STATIC_ASSET_CACHE) > 128:
+            _STATIC_ASSET_CACHE.clear()
+        _STATIC_ASSET_CACHE[cache_key] = (raw, etag)
+    return rel_path, raw, etag
+
+
 LTTX_HOST = os.environ.get("CFQUANT_LTTX_HOST", "127.0.0.1")
 LTTX_PORT = int(os.environ.get("CFQUANT_LTTX_PORT", "2049"))
 LTTX_DIR = os.path.join(BASE_DIR, "LTtx", "tx")
@@ -6334,16 +6368,24 @@ class WebSocketCallbackClient(object):
         self.job_id = str(job_id or "").strip()
         self._lock = threading.RLock()
         self.alive = True
+        # Resolve once at subscribe time; matches() runs per broadcast event
+        # and must not re-derive market routes (config deep copy) each time.
+        self._related_bridge_ids = None
+        if self.bridge_id and (self.account_id or self.account_key):
+            try:
+                self._related_bridge_ids = frozenset(account_related_bridge_ids(
+                    account_id=self.account_id,
+                    account_type=self.account_type or None,
+                    bridge_id=self.bridge_id,
+                    account_key=self.account_key,
+                ))
+            except Exception:
+                self._related_bridge_ids = None
 
     def matches(self, event):
         if self.bridge_id:
             event_bridge_id = normalize_bridge_id(CallbackEventStore.event_bridge_id_static(event) or "default")
-            bridge_ids = account_related_bridge_ids(
-                account_id=self.account_id,
-                account_type=self.account_type or None,
-                bridge_id=self.bridge_id,
-                account_key=self.account_key,
-            ) if (self.account_id or self.account_key) else [self.bridge_id]
+            bridge_ids = self._related_bridge_ids if self._related_bridge_ids is not None else [self.bridge_id]
             if event_bridge_id not in bridge_ids:
                 return False
         if self.account_id and CallbackEventStore.event_account_id_static(event) != self.account_id:
@@ -15199,8 +15241,25 @@ def _compare_project_versions(current_version, remote_version):
     return "different"
 
 
+_LOCAL_VERSION_CACHE = {"ts": 0.0, "data": None, "mtime": None, "size": None}
+_LOCAL_VERSION_CACHE_LOCK = threading.RLock()
+
+
 def _local_project_version_info():
+    # Reads the changelog (hundreds of lines) + version.py on every call and
+    # feeds polled endpoints (/api/config, /api/version); cache briefly. The
+    # cache is keyed on version.py's mtime/size so an update that lands new
+    # files invalidates it immediately (ensure_latest must see the new version).
     changelog_path = os.path.join(BASE_DIR, "docs", "版本日志.md")
+    try:
+        stat = os.stat(CORE_VERSION_PATH)
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = None
+    with _LOCAL_VERSION_CACHE_LOCK:
+        cached = _LOCAL_VERSION_CACHE["data"]
+        if cached is not None and _LOCAL_VERSION_CACHE["mtime"] == cache_key:
+            return dict(cached)
     changelog_text = _read_text_file(changelog_path)
     if not changelog_text:
         changelog_path = os.path.join(BASE_DIR, "README.md")
@@ -15208,7 +15267,7 @@ def _local_project_version_info():
     changelog = _extract_latest_changelog(changelog_text)
     core_info = current_core_version_info()
     version = core_info["version"]
-    return {
+    data = {
         "version": version,
         "changelog_version": changelog.get("version") or "",
         "source": core_info["source"],
@@ -15225,6 +15284,10 @@ def _local_project_version_info():
         "matches_changelog": (changelog.get("version") or "") == version if changelog.get("version") else None,
         "changelog": changelog,
     }
+    with _LOCAL_VERSION_CACHE_LOCK:
+        _LOCAL_VERSION_CACHE["mtime"] = cache_key
+        _LOCAL_VERSION_CACHE["data"] = data
+    return dict(data)
 
 
 def project_system_info(version_info=None):
@@ -17109,7 +17172,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
 
     def _serve_static(self, path):
         try:
-            rel_path, raw = read_static_asset(path)
+            rel_path, raw, etag = read_static_asset_cached(path)
         except PermissionError:
             self._write_json(fail("forbidden", 403), status=403)
             return
@@ -17117,11 +17180,23 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             self._write_json(fail("not found", 404), status=404)
             return
         content_type = mimetypes.guess_type(rel_path)[0] or "application/octet-stream"
+        if etag and self.headers.get("If-None-Match") == etag:
+            try:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as e:
+                safe_print("client disconnected while writing static 304: %s" % e)
+            return
         try:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", "no-cache")
+            if etag:
+                self.send_header("ETag", etag)
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as e:

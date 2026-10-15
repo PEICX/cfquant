@@ -787,7 +787,9 @@ def _filter_cancelable_orders(rows):
 
 _LANG_LOCK = threading.RLock()
 _LOG_LANGUAGE = ""
+_LOG_LANGUAGE_CACHED = False
 _LOG_ENABLED = None
+_LOG_ENABLED_CACHED = False
 
 
 _TRANSLATIONS = [
@@ -1092,6 +1094,8 @@ _TRANSLATIONS = [
     ),
 ]
 
+_TRANSLATIONS = tuple((re.compile(p), t) for p, t in _TRANSLATIONS)
+
 
 def normalize_log_language(value=None):
     value = str(value or "").strip().lower()
@@ -1112,25 +1116,34 @@ def normalize_log_enabled(value=None):
 
 
 def get_log_language():
+    global _LOG_LANGUAGE, _LOG_LANGUAGE_CACHED
     with _LANG_LOCK:
-        if _LOG_LANGUAGE:
+        if _LOG_LANGUAGE_CACHED:
             return _LOG_LANGUAGE
-    return normalize_log_language(os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANG") or "zh")
+        lang = normalize_log_language(os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANG") or "zh")
+        _LOG_LANGUAGE = lang
+        _LOG_LANGUAGE_CACHED = True
+        return lang
 
 
 def set_log_language(value):
-    global _LOG_LANGUAGE
+    global _LOG_LANGUAGE, _LOG_LANGUAGE_CACHED
     lang = normalize_log_language(value)
     with _LANG_LOCK:
         _LOG_LANGUAGE = lang
+        _LOG_LANGUAGE_CACHED = True
     return lang
 
 
 def get_log_enabled():
+    global _LOG_ENABLED, _LOG_ENABLED_CACHED
     with _LANG_LOCK:
-        if _LOG_ENABLED is not None:
+        if _LOG_ENABLED_CACHED:
             return bool(_LOG_ENABLED)
-    return normalize_log_enabled(os.environ.get("CFQUANT_QMT_LOG_ENABLED") or os.environ.get("CFQUANT_LOG_ENABLED") or "1")
+        enabled = normalize_log_enabled(os.environ.get("CFQUANT_QMT_LOG_ENABLED") or os.environ.get("CFQUANT_LOG_ENABLED") or "1")
+        _LOG_ENABLED = enabled
+        _LOG_ENABLED_CACHED = True
+        return bool(enabled)
 
 
 def set_log_enabled(value):
@@ -1143,10 +1156,13 @@ def set_log_enabled(value):
 
 def translate_log(message, language=None):
     text = str(message)
-    if normalize_log_language(language or get_log_language()) == "en":
+    if language is None and _LOG_LANGUAGE_CACHED:
+        if _LOG_LANGUAGE == "en":
+            return text
+    elif normalize_log_language(language or get_log_language()) == "en":
         return text
     for pattern, template in _TRANSLATIONS:
-        match = re.match(pattern, text)
+        match = pattern.match(text)
         if not match:
             continue
         try:

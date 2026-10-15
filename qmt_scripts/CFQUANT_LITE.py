@@ -773,7 +773,9 @@ def _filter_cancelable_orders(rows):
 
 _LANG_LOCK = threading.RLock()
 _LOG_LANGUAGE = ""
+_LOG_LANGUAGE_CACHED = False
 _LOG_ENABLED = None
+_LOG_ENABLED_CACHED = False
 
 
 _TRANSLATIONS = [
@@ -1078,6 +1080,8 @@ _TRANSLATIONS = [
     ),
 ]
 
+_TRANSLATIONS = tuple((re.compile(p), t) for p, t in _TRANSLATIONS)
+
 
 def normalize_log_language(value=None):
     value = str(value or "").strip().lower()
@@ -1098,25 +1102,34 @@ def normalize_log_enabled(value=None):
 
 
 def get_log_language():
+    global _LOG_LANGUAGE, _LOG_LANGUAGE_CACHED
     with _LANG_LOCK:
-        if _LOG_LANGUAGE:
+        if _LOG_LANGUAGE_CACHED:
             return _LOG_LANGUAGE
-    return normalize_log_language(os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANG") or "zh")
+        lang = normalize_log_language(os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANG") or "zh")
+        _LOG_LANGUAGE = lang
+        _LOG_LANGUAGE_CACHED = True
+        return lang
 
 
 def set_log_language(value):
-    global _LOG_LANGUAGE
+    global _LOG_LANGUAGE, _LOG_LANGUAGE_CACHED
     lang = normalize_log_language(value)
     with _LANG_LOCK:
         _LOG_LANGUAGE = lang
+        _LOG_LANGUAGE_CACHED = True
     return lang
 
 
 def get_log_enabled():
+    global _LOG_ENABLED, _LOG_ENABLED_CACHED
     with _LANG_LOCK:
-        if _LOG_ENABLED is not None:
+        if _LOG_ENABLED_CACHED:
             return bool(_LOG_ENABLED)
-    return normalize_log_enabled(os.environ.get("CFQUANT_QMT_LOG_ENABLED") or os.environ.get("CFQUANT_LOG_ENABLED") or "1")
+        enabled = normalize_log_enabled(os.environ.get("CFQUANT_QMT_LOG_ENABLED") or os.environ.get("CFQUANT_LOG_ENABLED") or "1")
+        _LOG_ENABLED = enabled
+        _LOG_ENABLED_CACHED = True
+        return bool(enabled)
 
 
 def set_log_enabled(value):
@@ -1129,10 +1142,13 @@ def set_log_enabled(value):
 
 def translate_log(message, language=None):
     text = str(message)
-    if normalize_log_language(language or get_log_language()) == "en":
+    if language is None and _LOG_LANGUAGE_CACHED:
+        if _LOG_LANGUAGE == "en":
+            return text
+    elif normalize_log_language(language or get_log_language()) == "en":
         return text
     for pattern, template in _TRANSLATIONS:
-        match = re.match(pattern, text)
+        match = pattern.match(text)
         if not match:
             continue
         try:
@@ -2019,6 +2035,12 @@ class TxTradeBridge(object):
         self.pending_sync_orders = []
         self.pending_sync_orders_lock = threading.RLock()
         self.order_request_metadata = {}
+        # order_id(str) -> metadata key：_enrich_order_request_fields 原先对每一行
+        # 全量扫描 order_request_metadata(上限 1000) 做备注兜底匹配，2000 行委托时
+        # 是 O(rows x 1000) 且全程持锁，实测格式化阶段因此耗时数十秒。用 order_id
+        # 建立索引后，正常路径（能拿到 order_id）退化为 O(1) 查表；拿不到 order_id
+        # 的行仍回退到原有备注匹配，语义不变。
+        self.order_request_metadata_by_id = {}
         self.order_request_metadata_lock = threading.RLock()
         self.order_callback_cache = OrderCallbackCache()
 
@@ -2313,6 +2335,7 @@ class TxTradeBridge(object):
             % (account_id, query_account_id, account_type.lower(), detail_type.lower())
         )
         used_query_account_id = query_account_id
+        _t_native0 = time.perf_counter()
         try:
             rows = self._call_trade_detail_data(func, query_account_id, account_type.lower(), detail_type.lower()) or []
         except Exception as e:
@@ -2336,6 +2359,10 @@ class TxTradeBridge(object):
             )
             used_query_account_id = account_id
             rows = self._call_trade_detail_data(func, account_id, account_type.lower(), detail_type.lower()) or []
+        _t_native_ms = (time.perf_counter() - _t_native0) * 1000
+        _t_fmt0 = time.perf_counter()
+        _t_enrich_total = 0.0
+        _t_remember_total = 0.0
         result = []
         for index, row in enumerate(rows):
             try:
@@ -2350,9 +2377,13 @@ class TxTradeBridge(object):
                     if used_query_account_id != account_id:
                         formatted.setdefault("query_account_id", used_query_account_id)
                     if detail_type.lower() in ("order", "deal"):
+                        _te = time.perf_counter()
                         self._enrich_order_request_fields(formatted)
+                        _t_enrich_total += time.perf_counter() - _te
                         if detail_type.lower() == "order":
+                            _tr = time.perf_counter()
                             self._remember_order_callback_fields(formatted)
+                            _t_remember_total += time.perf_counter() - _tr
                 result.append(formatted)
             except Exception as e:
                 self._log(
@@ -2367,8 +2398,9 @@ class TxTradeBridge(object):
         if detail_type.lower() == "order" and _truthy_param(params.get("cancelable_only")):
             result = _filter_cancelable_orders(result)
         self._log(
-            "query_trade_detail done detail_type=%s count=%s"
-            % (detail_type, len(result))
+            "query_trade_detail done detail_type=%s count=%s native_ms=%.0f format_ms=%.0f enrich_ms=%.0f remember_ms=%.0f"
+            % (detail_type, len(result), _t_native_ms, (time.perf_counter() - _t_fmt0) * 1000,
+               _t_enrich_total * 1000, _t_remember_total * 1000)
         )
         return result
 
@@ -3155,8 +3187,15 @@ class TxTradeBridge(object):
         }
         with self.order_request_metadata_lock:
             self.order_request_metadata[key] = metadata
+            order_id_value = metadata.get("order_id")
+            if order_id_value is not None:
+                self.order_request_metadata_by_id[(key[0], str(order_id_value))] = key
             while len(self.order_request_metadata) > 1000:
-                self.order_request_metadata.pop(next(iter(self.order_request_metadata)))
+                evicted_key = next(iter(self.order_request_metadata))
+                evicted = self.order_request_metadata.pop(evicted_key)
+                evicted_id = evicted.get("order_id") if isinstance(evicted, dict) else None
+                if evicted_id is not None:
+                    self.order_request_metadata_by_id.pop((evicted_key[0], str(evicted_id)), None)
 
     def _enrich_order_request_fields(self, order):
         if not isinstance(order, dict):
@@ -3166,38 +3205,42 @@ class TxTradeBridge(object):
             str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
             order_remark_key(order),
         )
+        # 先收集本行的候选委托号：既能用于 O(1) 索引命中，也供后面的备注兜底匹配。
+        callback_order_ids = set()
+        for name in (
+            "order_id",
+            "m_nRef",
+            "m_nOrderID",
+            "m_strOrderRef",
+            "m_strOrderID",
+        ):
+            order_id = self._normalize_order_id(self._first_value(order, (name,)))
+            if order_id is not None:
+                callback_order_ids.add(str(order_id))
         with self.order_request_metadata_lock:
             metadata = self.order_request_metadata.get(key)
             matched_key = key if metadata is not None else None
-            if metadata is None and key[0]:
-                callback_order_ids = set()
-                for name in (
-                    "order_id",
-                    "m_nRef",
-                    "m_nOrderID",
-                    "m_strOrderRef",
-                    "m_strOrderID",
-                ):
-                    order_id = self._normalize_order_id(self._first_value(order, (name,)))
-                    if order_id is not None:
-                        callback_order_ids.add(str(order_id))
-                if callback_order_ids:
-                    matches = []
-                    for candidate_key, candidate in self.order_request_metadata.items():
-                        if candidate_key[0] != key[0]:
-                            continue
-                        if not order_remark_matches_reference(candidate_key[2], key[2]):
-                            continue
-                        if key[1] and candidate_key[1] and key[1] != candidate_key[1]:
-                            continue
-                        if isinstance(candidate, dict):
-                            candidate_id = self._normalize_order_id(candidate.get("order_id"))
-                        else:
-                            candidate_id = None
-                        if candidate_id is not None and str(candidate_id) in callback_order_ids:
-                            matches.append((candidate_key, candidate))
-                    if len(matches) == 1:
-                        matched_key, metadata = matches[0]
+            if metadata is None and key[0] and callback_order_ids:
+                # O(1) 索引命中：绝大多数行能通过委托号直接定位，避免全量扫描。
+                # 与原全量扫描同语义：命中后仍要求备注可匹配（order_remark_matches_reference），
+                # 否则不同备注、相同委托号的行会被错误关联。
+                for candidate_id in callback_order_ids:
+                    indexed_key = self.order_request_metadata_by_id.get((key[0], candidate_id))
+                    if indexed_key is None:
+                        continue
+                    if not order_remark_matches_reference(indexed_key[2], key[2]):
+                        continue
+                    if key[1] and indexed_key[1] and key[1] != indexed_key[1]:
+                        continue
+                    candidate = self.order_request_metadata.get(indexed_key)
+                    if isinstance(candidate, dict):
+                        metadata = candidate
+                        matched_key = indexed_key
+                        break
+            # 索引未命中即视为无元数据：原全量扫描的匹配条件同样要求候选 order_id
+            # 落在 callback_order_ids 内，因此索引查不到时扫描也必然查不到（索引是
+            # 扫描的超集）。历史旧单的元数据早已被上限淘汰，此前每行仍要扫 1000 条
+            # 空跑——2000 行委托因此耗时数十秒。这里直接跳过，语义不变。
         if isinstance(metadata, dict):
             strategy_name = str(metadata.get("strategy_name") or "")
             order_remark = str(

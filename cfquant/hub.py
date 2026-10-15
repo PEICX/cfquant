@@ -39,6 +39,8 @@ class CfquantHub(object):
         self.status_file = os.path.abspath(
             os.environ.get("CFQUANT_HUB_STATUS_FILE") or default_status_file("cfquant_hub_status.json")
         )
+        self._status_dirty = threading.Event()
+        self._status_written_at = 0.0
 
     def start(self):
         if self.running:
@@ -49,7 +51,8 @@ class CfquantHub(object):
         self.server.bind((self.host, self.port))
         self.server.listen(100)
         self._log("cfquant Hub已启动:%s:%s" % (self.host, self.port))
-        self._write_status()
+        status_thread = threading.Thread(target=self._status_loop, daemon=True)
+        status_thread.start()
         try:
             while self.running:
                 client, address = self.server.accept()
@@ -85,7 +88,7 @@ class CfquantHub(object):
                     if old is not None and old is not sock:
                         self._close_socket(old)
                     self._log("QMT桥接端已注册:%s" % (address,))
-                    self._write_status()
+                    self._write_status_now()
                     continue
                 if role == "qmt":
                     self._handle_qmt_message(raw)
@@ -99,7 +102,7 @@ class CfquantHub(object):
                     if self.qmt_sock is sock:
                         self.qmt_sock = None
                 self._log("QMT桥接端已断开:%s" % (address,))
-                self._write_status()
+                self._write_status_now()
             else:
                 self._drop_api_client(sock)
                 self._log("API客户端已断开:%s" % (address,))
@@ -276,6 +279,25 @@ class CfquantHub(object):
         return (end - start) * 1000.0
 
     def _write_status(self):
+        """Mark status dirty; the background thread flushes it off the hot path."""
+        self._status_dirty.set()
+
+    def _status_loop(self):
+        # Coalesce status writes: at most one disk write per second, and only
+        # when something actually changed. Connection-level changes (qmt
+        # register/disconnect) still land promptly.
+        while self.running:
+            if not self._status_dirty.wait(timeout=1.0):
+                continue
+            time.sleep(0.05)  # let request/response pairs merge into one write
+            self._status_dirty.clear()
+            now = time.monotonic()
+            if now - self._status_written_at < 1.0:
+                continue
+            self._status_written_at = now
+            self._write_status_now()
+
+    def _write_status_now(self):
         try:
             with self.qmt_lock:
                 qmt_connected = self.qmt_sock is not None

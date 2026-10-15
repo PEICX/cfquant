@@ -67,6 +67,7 @@ class CfquantQmtBridge(object):
         self.auto_trade_callback_enabled = False
         self.pending_async_orders = []
         self.pending_async_orders_lock = threading.RLock()
+        self._pending_async_orders_last_prune = 0.0
         self.order_request_metadata = {}
         self.order_request_metadata_lock = threading.RLock()
 
@@ -944,12 +945,16 @@ class CfquantQmtBridge(object):
         return restore_order_remark(order)
 
     def _prune_pending_async_orders_locked(self):
+        now = time.time()
+        if now - self._pending_async_orders_last_prune < 5.0:
+            return
+        self._pending_async_orders_last_prune = now
         wait_seconds = os.environ.get("CFQUANT_ASYNC_ORDER_RESPONSE_WAIT_SECONDS", 60.0)
         try:
             wait_seconds = max(1.0, float(wait_seconds or 60.0))
         except Exception:
             wait_seconds = 60.0
-        cutoff = time.time() - wait_seconds
+        cutoff = now - wait_seconds
         self.pending_async_orders[:] = [
             item for item in self.pending_async_orders
             if item.get("created_at", 0) >= cutoff

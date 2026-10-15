@@ -454,6 +454,7 @@ class OrderMetaCache(object):
         self.by_user = {}
         self.by_ref = {}
         self.pending = []
+        self._last_prune_monotonic = 0.0
 
     def _ctx(self, record):
         return (
@@ -510,9 +511,17 @@ class OrderMetaCache(object):
         with self.lock:
             return self._upsert_locked(record)
 
+    def _maybe_prune_locked(self, trade_day, now):
+        """Prune at most once per second; correctness only needs the day/ttl
+        boundary, and upsert/resolve call this on every order and callback."""
+        if now - self._last_prune_monotonic < 1.0:
+            return
+        self._last_prune_monotonic = now
+        self._prune_locked(trade_day, time.time())
+
     def _upsert_locked(self, record):
         trade_day = current_trade_day()
-        self._prune_locked(trade_day, time.time())
+        self._maybe_prune_locked(trade_day, time.monotonic())
         status = normalize_text(record.get("status")).lower()
         if status in ("delete", "deleted", "failed", "cancelled"):
             self._remove_locked(record)
@@ -602,7 +611,7 @@ class OrderMetaCache(object):
             account_id=account_id or data.get("account_id"),
         )
         with self.lock:
-            self._prune_locked(current_trade_day(), time.time())
+            self._maybe_prune_locked(current_trade_day(), time.monotonic())
             record = None
             confidence = ""
             order_refs = order_ref_candidates_from_data(callback_record)

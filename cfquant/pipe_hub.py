@@ -67,6 +67,8 @@ class CfquantPipeHub(object):
         self.qmt_heartbeat_timeout_seconds = float(os.environ.get("CFQUANT_PIPE_HUB_QMT_HEARTBEAT_TIMEOUT", "30"))
         self.maintenance_interval_seconds = float(os.environ.get("CFQUANT_PIPE_HUB_MAINTENANCE_INTERVAL", "2"))
         self.maintenance_thread = None
+        self._status_dirty = threading.Event()
+        self._status_written_at = 0.0
 
     def start(self):
         if self.running:
@@ -74,7 +76,7 @@ class CfquantPipeHub(object):
         self.running = True
         self._log("pipe hub started pipe=%s" % self.pipe_name)
         self._start_maintenance()
-        self._write_status()
+        self._write_status_snapshot()
         while self.running:
             conn = None
             try:
@@ -122,7 +124,7 @@ class CfquantPipeHub(object):
                 conn.close()
             except Exception:
                 pass
-        self._write_status()
+        self._write_status_snapshot()
 
     def _client_loop(self, conn):
         role = "api"
@@ -167,7 +169,7 @@ class CfquantPipeHub(object):
             except Exception:
                 pass
             self._log("pipe client disconnected role=%s" % role)
-            self._write_status()
+            self._write_status_snapshot()
 
     def _passive_rx_loop(self, conn, role):
         while self.running:
@@ -225,7 +227,7 @@ class CfquantPipeHub(object):
             if client_id:
                 self._remember_client(conn, client_id, receive_conn=role in ("api", "api_rx"))
             self._log("api pipe client registered role=%s client_id=%s" % (role, client_id or "-"))
-        self._write_status()
+        self._write_status_snapshot()
         if binary_hotpath and role in ("qmt_rx", "api_rx"):
             # Ack on the direction the peer actually reads, so it can switch
             # its hot messages to binary frames.
@@ -797,9 +799,37 @@ class CfquantPipeHub(object):
                 stale_qmt_count = self._cleanup_stale_qmt()
                 if expired_count or stale_qmt_count:
                     self._write_status()
+                self._flush_dirty_status()
             except Exception as e:
                 self._log("pipe hub maintenance failed: %s" % e)
             time.sleep(max(0.2, self.maintenance_interval_seconds))
+
+    def _flush_dirty_status(self):
+        if not self._status_dirty.is_set():
+            return
+        self._status_dirty.clear()
+        now = time.monotonic()
+        if now - self._status_written_at < 1.0:
+            # Too soon: keep the flag set so the next maintenance pass retries.
+            self._status_dirty.set()
+            return
+        self._status_written_at = now
+        self._write_status_snapshot()
+
+    def _write_status(self):
+        """Mark status dirty; the maintenance thread flushes it off the hot path."""
+        self._status_dirty.set()
+
+    def _write_status_snapshot(self):
+        try:
+            data = self._status_snapshot()
+            status_dir = os.path.dirname(self.status_file)
+            if status_dir:
+                os.makedirs(status_dir, exist_ok=True)
+            with open(self.status_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _qmt_heartbeat_deadline_seconds(self, meta):
         try:
@@ -990,17 +1020,6 @@ class CfquantPipeHub(object):
             "pending_ids": pending_ids,
             "api_client_count": client_count,
         }
-
-    def _write_status(self):
-        try:
-            data = self._status_snapshot()
-            status_dir = os.path.dirname(self.status_file)
-            if status_dir:
-                os.makedirs(status_dir, exist_ok=True)
-            with open(self.status_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
 
 def run_pipe_hub(pipe_name=None, show=True, default_request_channel="cfquant.normal.request"):

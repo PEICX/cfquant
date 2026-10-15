@@ -2,6 +2,7 @@
 import os
 import inspect
 import json
+import queue
 import sys
 import threading
 import time
@@ -231,6 +232,8 @@ class TxTradeBridge(object):
         self.running = False
         self.tx = None
         self.log_file = self._default_log_file()
+        self.log_queue = queue.Queue(maxsize=20000)
+        self.log_thread = None
         self.account_subscribers = {}
         self.client_accounts = {}
         self.subscriber_lock = threading.RLock()
@@ -239,13 +242,21 @@ class TxTradeBridge(object):
         self.auto_trade_callback_enabled = False
         self.pending_async_orders = []
         self.pending_async_orders_lock = threading.RLock()
+        self._pending_async_orders_last_prune = 0.0
         self.pending_sync_orders = []
         self.pending_sync_orders_lock = threading.RLock()
         self.order_request_metadata = {}
+        # order_id(str) -> metadata key：_enrich_order_request_fields 原先对每一行
+        # 全量扫描 order_request_metadata(上限 1000) 做备注兜底匹配，2000 行委托时
+        # 是 O(rows x 1000) 且全程持锁，实测格式化阶段因此耗时数十秒。用 order_id
+        # 建立索引后，正常路径（能拿到 order_id）退化为 O(1) 查表；拿不到 order_id
+        # 的行仍回退到原有备注匹配，语义不变。
+        self.order_request_metadata_by_id = {}
         self.order_request_metadata_lock = threading.RLock()
         self.order_callback_cache = OrderCallbackCache()
         self.order_error_contexts = {}
         self.order_error_contexts_lock = threading.RLock()
+        self.order_error_contexts_last_prune = 0.0
         self.order_meta_enabled = bool(order_meta_enabled)
         self.order_meta_cache = order_meta.OrderMetaCache(self.bridge_id)
         self.order_meta_store_lock = threading.RLock()
@@ -269,6 +280,7 @@ class TxTradeBridge(object):
         self.running = True
         if not self.started_at:
             self.started_at = time.time()
+        self._start_log_thread()
         txl = self._load_txl()
         self.tx = txl(self.ip, self.port, self.token)
         self.tx.start_tx()
@@ -1146,19 +1158,23 @@ class TxTradeBridge(object):
         key = (str(account_id or "").strip(), self._order_error_code(stock_code), internal)
         now = time.time()
         with self.order_error_contexts_lock:
-            cutoff = now - 300.0
-            self.order_error_contexts = {
-                item_key: item for item_key, item in self.order_error_contexts.items()
-                if item.get("created_at", now) >= cutoff
-            }
-            self.order_error_contexts[key] = {
+            contexts = self.order_error_contexts
+            if now - self.order_error_contexts_last_prune >= 30.0:
+                self.order_error_contexts_last_prune = now
+                cutoff = now - 300.0
+                contexts = {
+                    item_key: item for item_key, item in contexts.items()
+                    if item.get("created_at", now) >= cutoff
+                }
+                self.order_error_contexts = contexts
+            contexts[key] = {
                 "account_id": key[0], "stock_code": key[1],
                 "internal_strategy_name": internal, "strategy_name": original,
                 "order_remark": str(order_remark or ""), "created_at": now,
                 "lifecycle": "pending",
             }
-            while len(self.order_error_contexts) > 4096:
-                self.order_error_contexts.pop(next(iter(self.order_error_contexts)))
+            while len(contexts) > 4096:
+                contexts.pop(next(iter(contexts)))
         return internal
 
     def _discard_order_error_context(self, account_id, stock_code, internal_strategy):
@@ -1663,8 +1679,15 @@ class TxTradeBridge(object):
         }
         with self.order_request_metadata_lock:
             self.order_request_metadata[key] = metadata
+            order_id_value = metadata.get("order_id")
+            if order_id_value is not None:
+                self.order_request_metadata_by_id[(key[0], str(order_id_value))] = key
             while len(self.order_request_metadata) > 1000:
-                self.order_request_metadata.pop(next(iter(self.order_request_metadata)))
+                evicted_key = next(iter(self.order_request_metadata))
+                evicted = self.order_request_metadata.pop(evicted_key)
+                evicted_id = evicted.get("order_id") if isinstance(evicted, dict) else None
+                if evicted_id is not None:
+                    self.order_request_metadata_by_id.pop((evicted_key[0], str(evicted_id)), None)
 
     def _enrich_order_request_fields(self, order):
         if not isinstance(order, dict):
@@ -1674,38 +1697,42 @@ class TxTradeBridge(object):
             str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
             order_remark_key(order),
         )
+        # 先收集本行的候选委托号：既能用于 O(1) 索引命中，也供后面的备注兜底匹配。
+        callback_order_ids = set()
+        for name in (
+            "order_id",
+            "m_nRef",
+            "m_nOrderID",
+            "m_strOrderRef",
+            "m_strOrderID",
+        ):
+            order_id = self._normalize_order_id(self._first_value(order, (name,)))
+            if order_id is not None:
+                callback_order_ids.add(str(order_id))
         with self.order_request_metadata_lock:
             metadata = self.order_request_metadata.get(key)
             matched_key = key if metadata is not None else None
-            if metadata is None and key[0]:
-                callback_order_ids = set()
-                for name in (
-                    "order_id",
-                    "m_nRef",
-                    "m_nOrderID",
-                    "m_strOrderRef",
-                    "m_strOrderID",
-                ):
-                    order_id = self._normalize_order_id(self._first_value(order, (name,)))
-                    if order_id is not None:
-                        callback_order_ids.add(str(order_id))
-                if callback_order_ids:
-                    matches = []
-                    for candidate_key, candidate in self.order_request_metadata.items():
-                        if candidate_key[0] != key[0]:
-                            continue
-                        if not order_remark_matches_reference(candidate_key[2], key[2]):
-                            continue
-                        if key[1] and candidate_key[1] and key[1] != candidate_key[1]:
-                            continue
-                        if isinstance(candidate, dict):
-                            candidate_id = self._normalize_order_id(candidate.get("order_id"))
-                        else:
-                            candidate_id = None
-                        if candidate_id is not None and str(candidate_id) in callback_order_ids:
-                            matches.append((candidate_key, candidate))
-                    if len(matches) == 1:
-                        matched_key, metadata = matches[0]
+            if metadata is None and key[0] and callback_order_ids:
+                # O(1) 索引命中：绝大多数行能通过委托号直接定位，避免全量扫描。
+                # 与原全量扫描同语义：命中后仍要求备注可匹配（order_remark_matches_reference），
+                # 否则不同备注、相同委托号的行会被错误关联。
+                for candidate_id in callback_order_ids:
+                    indexed_key = self.order_request_metadata_by_id.get((key[0], candidate_id))
+                    if indexed_key is None:
+                        continue
+                    if not order_remark_matches_reference(indexed_key[2], key[2]):
+                        continue
+                    if key[1] and indexed_key[1] and key[1] != indexed_key[1]:
+                        continue
+                    candidate = self.order_request_metadata.get(indexed_key)
+                    if isinstance(candidate, dict):
+                        metadata = candidate
+                        matched_key = indexed_key
+                        break
+            # 索引未命中即视为无元数据：原全量扫描的匹配条件同样要求候选 order_id
+            # 落在 callback_order_ids 内，因此索引查不到时扫描也必然查不到（索引是
+            # 扫描的超集）。历史旧单的元数据早已被上限淘汰，此前每行仍要扫 1000 条
+            # 空跑——2000 行委托因此耗时数十秒。这里直接跳过，语义不变。
         if isinstance(metadata, dict):
             strategy_name = str(metadata.get("strategy_name") or "")
             order_remark = str(
@@ -1824,12 +1851,16 @@ class TxTradeBridge(object):
         return None, {}
 
     def _prune_pending_async_orders_locked(self):
+        now = time.time()
+        if now - self._pending_async_orders_last_prune < 5.0:
+            return
+        self._pending_async_orders_last_prune = now
         wait_seconds = os.environ.get("CFQUANT_ASYNC_ORDER_RESPONSE_WAIT_SECONDS", 60.0)
         try:
             wait_seconds = max(1.0, float(wait_seconds or 60.0))
         except Exception:
             wait_seconds = 60.0
-        cutoff = time.time() - wait_seconds
+        cutoff = now - wait_seconds
         self.pending_async_orders[:] = [
             item for item in self.pending_async_orders
             if item.get("created_at", 0) >= cutoff
@@ -4090,6 +4121,36 @@ class TxTradeBridge(object):
                 % (package_error, path_error)
             )
 
+    def _start_log_thread(self):
+        if self.log_thread is not None and self.log_thread.is_alive():
+            return
+        if not getattr(self, "file_io_enabled", True) or not self.log_file:
+            return
+        self.log_thread = threading.Thread(target=self._log_loop, name="cfquant-bridge-log")
+        self.log_thread.daemon = True
+        self.log_thread.start()
+
+    def _log_loop(self):
+        buffer = []
+        while self.running or not self.log_queue.empty():
+            try:
+                buffer.append(self.log_queue.get(timeout=0.5))
+                while len(buffer) < 200:
+                    try:
+                        buffer.append(self.log_queue.get_nowait())
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                pass
+            if not buffer:
+                continue
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write("\n".join(buffer) + "\n")
+            except Exception:
+                pass
+            buffer = []
+
     def _default_log_file(self):
         if not getattr(self, "file_io_enabled", True):
             return ""
@@ -4111,11 +4172,10 @@ class TxTradeBridge(object):
         if not force and not get_log_enabled():
             return
         msg = translate_log(msg)
-        line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-        if getattr(self, "file_io_enabled", True):
+        if getattr(self, "file_io_enabled", True) and self.log_file:
+            line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
             try:
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                self.log_queue.put_nowait(line)
             except Exception:
                 pass
         if self.show:

@@ -6,7 +6,34 @@ import threading
 
 _LANG_LOCK = threading.RLock()
 _LOG_LANGUAGE = ""
+_LOG_LANGUAGE_CACHED = False
 _LOG_ENABLED = None
+_LOG_ENABLED_CACHED = False
+
+
+def _build_translations(raw_translations):
+    compiled = []
+    for pattern, template in raw_translations:
+        compiled.append((re.compile(pattern), template))
+    return tuple(compiled)
+
+
+def translate_log(message, language=None):
+    text = str(message)
+    if language is None and _LOG_LANGUAGE_CACHED:
+        if _LOG_LANGUAGE == "en":
+            return text
+    elif normalize_log_language(language or get_log_language()) == "en":
+        return text
+    for pattern, template in _TRANSLATIONS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        try:
+            return template.format(**match.groupdict())
+        except Exception:
+            return text
+    return text
 
 
 _TRANSLATIONS = [
@@ -284,6 +311,8 @@ _TRANSLATIONS = [
     ),
 ]
 
+_TRANSLATIONS = _build_translations(_TRANSLATIONS)
+
 
 def normalize_log_language(value=None):
     value = str(value or "").strip().lower()
@@ -304,45 +333,48 @@ def normalize_log_enabled(value=None):
 
 
 def get_log_language():
+    global _LOG_LANGUAGE, _LOG_LANGUAGE_CACHED
     with _LANG_LOCK:
-        if _LOG_LANGUAGE:
+        if _LOG_LANGUAGE_CACHED:
             return _LOG_LANGUAGE
-    return normalize_log_language(os.environ.get("CFQUANT_QMT_LOG_LANGUAGE") or os.environ.get("CFQUANT_LOG_LANGUAGE") or "zh")
+        lang = normalize_log_language(
+            os.environ.get("CFQUANT_QMT_LOG_LANGUAGE")
+            or os.environ.get("CFQUANT_LOG_LANGUAGE")
+            or "zh"
+        )
+        _LOG_LANGUAGE = lang
+        _LOG_LANGUAGE_CACHED = True
+        return lang
 
 
 def set_log_language(value):
-    global _LOG_LANGUAGE
+    global _LOG_LANGUAGE, _LOG_LANGUAGE_CACHED
     lang = normalize_log_language(value)
     with _LANG_LOCK:
         _LOG_LANGUAGE = lang
+        _LOG_LANGUAGE_CACHED = True
     return lang
 
 
 def get_log_enabled():
+    global _LOG_ENABLED, _LOG_ENABLED_CACHED
     with _LANG_LOCK:
-        if _LOG_ENABLED is not None:
+        if _LOG_ENABLED_CACHED:
             return bool(_LOG_ENABLED)
-    return normalize_log_enabled(os.environ.get("CFQUANT_QMT_LOG_ENABLED") or os.environ.get("CFQUANT_LOG_ENABLED") or "1")
+        enabled = normalize_log_enabled(
+            os.environ.get("CFQUANT_QMT_LOG_ENABLED")
+            or os.environ.get("CFQUANT_LOG_ENABLED")
+            or "1"
+        )
+        _LOG_ENABLED = enabled
+        _LOG_ENABLED_CACHED = True
+        return bool(enabled)
 
 
 def set_log_enabled(value):
-    global _LOG_ENABLED
+    global _LOG_ENABLED, _LOG_ENABLED_CACHED
     enabled = normalize_log_enabled(value)
     with _LANG_LOCK:
         _LOG_ENABLED = enabled
+        _LOG_ENABLED_CACHED = True
     return enabled
-
-
-def translate_log(message, language=None):
-    text = str(message)
-    if normalize_log_language(language or get_log_language()) == "en":
-        return text
-    for pattern, template in _TRANSLATIONS:
-        match = re.match(pattern, text)
-        if not match:
-            continue
-        try:
-            return template.format(**match.groupdict())
-        except Exception:
-            return text
-    return text
