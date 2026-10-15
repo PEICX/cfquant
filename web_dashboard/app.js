@@ -30,6 +30,7 @@ const state = {
   orderCallbackRefreshInFlight: false,
   orderCallbackRefreshPending: false,
   orderCallbackRefreshSections: new Set(),
+  orderCallbackLastReconcileAt: -Infinity,
   orderCallbackMeta: new Map(),
   latestOrders: [],
   orderSort: { key: 'time', direction: 'desc' },
@@ -1520,6 +1521,10 @@ const STATUS_REFRESH_INTERVAL_MS = 30000;
 const ACCOUNT_CACHE_POLL_INTERVAL_MS = 15000;
 const ONBOARDING_BRIDGE_POLL_MS = 3000;
 const CALLBACK_POLL_INTERVAL_MS = 3000;
+// 交易回调事件只在本地合并行数据；全量 force 委托/成交查询改为节流核对，
+// 避免每笔回调都触发一次穿到 QMT 的全表查询（大委托表时单次 30-80 秒）。
+// 手动刷新（刷新按钮/切页签/换账号）不受此限制。
+const ORDER_CALLBACK_RECONCILE_MIN_MS = 60000;
 const ORDER_SNAPSHOT_LIMIT = 500;
 const ORDER_HIGHLIGHT_MS = 6500;
 const DOWNLOAD_EVENT_PREFIX = 'xtdata:download';
@@ -11922,7 +11927,15 @@ function runOrderCallbackRefresh() {
   if (!sections.length) return;
   state.orderCallbackRefreshInFlight = true;
   const snapshots = sections.filter((section) => section === 'asset' || section === 'positions');
-  const live = sections.filter((section) => section !== 'asset' && section !== 'positions');
+  // 回调事件已经把行数据本地合并进表格（mergeOrderCallbackRow），
+  // 全量 force 查询只作为节流核对：两次至少间隔 ORDER_CALLBACK_RECONCILE_MIN_MS，
+  // 且只在委托/成交页可见时进行，避免回调风暴把 QMT 查询打满。
+  const now = Date.now();
+  const reconcileDue = now - state.orderCallbackLastReconcileAt >= ORDER_CALLBACK_RECONCILE_MIN_MS;
+  const live = reconcileDue && tradesTabVisible()
+    ? sections.filter((section) => section !== 'asset' && section !== 'positions')
+    : [];
+  if (live.length) state.orderCallbackLastReconcileAt = now;
   Promise.all([
     snapshots.length && accountSnapshotVisible() ? refreshVisibleAccountCache() : Promise.resolve(),
     live.length ? refreshAccount(live.join(','), { force: true, subscribe: false }) : Promise.resolve(),
@@ -11935,6 +11948,13 @@ function runOrderCallbackRefresh() {
         scheduleOrderCallbackRefresh();
       }
     });
+}
+
+function tradesTabVisible() {
+  if (state.currentView !== 'trade') return false;
+  const active = document.querySelector('.data-tab.active');
+  if (!active) return false;
+  return active.dataset.tab === 'orders' || active.dataset.tab === 'trades';
 }
 
 function scheduleOrderCallbackRefresh(sections = 'orders') {
