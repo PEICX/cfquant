@@ -105,6 +105,8 @@ class txl:
         self.txg_running = False
         self.__tx = False
         self.__tx_plus = False
+        # d_push 专用 put 连接（懒建立）：False 表示未建立
+        self.__d_push_tx = False
         #put 连接的发送互斥锁：d_push 直发与 main_tx_que 发送线程共用同一
         #socket，并发 sendall 遇到部分发送时长度前缀帧会交错损坏
         self._tx_send_lock = threading.Lock()
@@ -119,7 +121,7 @@ class txl:
         self.__ZMQ_broadcast = None
         self.__txg_heartbeat_on = True#通信系统Push模式心跳检测线程状态
         self.__txg_heartbeat_time = time.time()
-        self.version = '7.2.8'
+        self.version = '8.0.1'
         self.__version__ = self.version
         self.check_version_on = check_version        
         self.dict_TradeDay = {}        
@@ -127,7 +129,7 @@ class txl:
         self.current_file = sys.modules[__name__].__file__ #当前文件名
         self.current_dir = os.path.dirname(os.path.abspath(self.current_file))#当前目录
         self.local_ip = self.get_local_ip()
-        self.__version__msg = '更新于2025-09-08'    
+        self.__version__msg = '更新于2026-07-07'
         self.txg_dict = {}#存储txg对象        
         msg = '通信系统V%s加载成功,Have fun!当前版本更新于%s'%(self.__version__,self.__version__msg)
         self.sys_print(msg)
@@ -1250,19 +1252,60 @@ class txl:
     def send_data_plus(self,client, msg):
         self.tx_que_plus.put(msg)
     
+    def __connect_d_push(self,):
+        '''
+        d_push连接
+        '''
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192*100)
+        # 设置立即发送（关闭 Nagle 算法，降低延迟）
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        client.connect((self.ip,self.port))
+        tem_dict = {'con_type':'put_mode','tocken':self.tocken,
+                    'local_ip':self.local_ip,
+                    'current_file':self.current_file,'current_dir':self.current_dir,
+                    }
+        self.sys_print(tem_dict)
+        client.sendall(json.dumps(tem_dict).encode('utf-8'))
+        if self.recv_msg_start_tx(client):
+            self.__d_push_tx = client
+        self.sys_print('d_push模式启动成功')
+
+    def close_d_push(self):
+        '''
+        主动关闭d_push
+        '''
+        try:
+            self.close_connection(self.__d_push_tx)
+        except Exception:
+            pass
+        self.__d_push_tx = False
+        self.sys_print('d_push模式主动关闭')
+
     def d_push(self,key,data,who):
         '''
-        绕过多线程直接在当前线程进行消息推送，适合在QMT里直接调用
+        绕过多线程直接在当前线程进行消息推送，适合在QMT里直接调用。
+        走专用 put 连接（懒建立）：与 main_tx_que 发送线程的 socket 隔离，
+        单帧 sendall 不会再与队列发送交错；_tx_send_lock 仅作为
+        start_tx 连接上的防御性兜底保留。
         '''
+        if not self.__d_push_tx:
+            self.__connect_d_push()
         frame = _build_v2_push_frame(who, '%s|%s'%(key,data))
         try:
-            with self._tx_send_lock:
-                self.__tx.sendall(frame)
-        except:
-            if self.__tx == False:
-                raise OSError('当前start_tx未执行，请先执行start_tx()')
-            else:
+            self.__d_push_tx.sendall(frame)
+        except Exception as e:
+            try:
+                self.close_d_push()
+            except Exception:
+                self.__d_push_tx = False
+            self.__connect_d_push()
+            try:
+                self.__d_push_tx.sendall(frame)
+            except Exception:
+                self.close_d_push()
                 raise OSError('网络不可达，请稍后重试')
+            self.sys_print('d_push异常>>>%s'%(str(e)))
 
     def main_tx_que(self):
         while self.run_on:
@@ -1289,6 +1332,7 @@ class txl:
             
     def main_tx_que_plus(self):
         while self.run_on:
+            old_msg = None
             try:
                 old_msg = self.tx_que_plus.get()
                 msg=old_msg.encode('utf-8')
@@ -1296,10 +1340,15 @@ class txl:
                 struct_bytes = struct.pack('Q', data_len)
                 self.__tx_plus.sendall(struct_bytes)
                 self.__tx_plus.sendall(msg)
-            except:
+            except Exception as e:
+                # old_msg 可能在赋值前就抛出（get 本身出错），
+                # 此时无消息可回补，直接重连即可
                 self.__tx_plus = False
                 self.start_plus()
-                self.tx_que_plus.put(old_msg)
+                if old_msg is not None:
+                    self.tx_que_plus.put(old_msg)
+                else:
+                    self.sys_print('main_tx_que_plus取队列异常>>>%s' % (e,))
                 break
     
     def recv_msg_broadcast(self,who,client,pwd):
@@ -1386,6 +1435,12 @@ class txl:
 
     def close_tx(self):
         self.tx_running = False
+        if self.__d_push_tx is not False:
+            # d_push 专用连接随主连接一起关闭，避免残留半开 socket
+            try:
+                self.close_d_push()
+            except Exception:
+                self.__d_push_tx = False
         if self.__tx == False:
             code = -1
             msg = '当前tx未连接'

@@ -191,11 +191,12 @@ def test_push_always_uses_v2_frame():
     assert body[offset + who_len:].decode("utf-8") == 'event|{"a":1}'
 
 
-def test_d_push_and_sender_thread_are_mutually_exclusive():
-    """d_push 直发与 main_tx_que 发送线程共用 put 连接，sendall 必须互斥。
+def test_d_push_uses_dedicated_socket_isolated_from_sender_thread():
+    """d_push 走专用连接（懒建立），与 main_tx_que 发送线程的 put 连接隔离。
 
-    并发 sendall 遇到部分发送时，长度前缀帧会交错损坏协议。用可检测
-    重叠的假 socket 验证两处发送从不同时在 sendall 里。
+    历史版本 d_push 与发送线程共用同一 socket，靠 _tx_send_lock 互斥避免
+    并发 sendall 帧交错；现在 d_push 直发专用连接，两个 socket 从结构上
+    不可能交错。本测试同时保留发送线程自身的锁互斥验证。
     """
     class RaceDetectingSocket:
         def __init__(self):
@@ -214,9 +215,11 @@ def test_d_push_and_sender_thread_are_mutually_exclusive():
             with self._guard:
                 self.inside -= 1
 
-    sock = RaceDetectingSocket()
+    put_sock = RaceDetectingSocket()
+    dpush_sock = RaceDetectingSocket()
     client = _bare_client(run_on=True, _tx_send_lock=threading.Lock())
-    client._txl__tx = sock
+    client._txl__tx = put_sock
+    client._txl__d_push_tx = dpush_sock
     sender = threading.Thread(target=client.main_tx_que, daemon=True)
     sender.start()
     try:
@@ -228,10 +231,12 @@ def test_d_push_and_sender_thread_are_mutually_exclusive():
         client.tx_que.put(("v2", b"\x01stop"))
         sender.join(timeout=5)
     assert not sender.is_alive()
-    # d_push 的 50 次同步发送必然全部完成；发送线程在退出前也已消费了
-    # 大量队列帧（run_on 翻转后循环顶直接退出，尾部帧允许残留）
-    assert sock.calls >= 50
-    assert sock.overlap is False
+    # d_push 的 50 次发送全部落在专用连接上；put 连接只承载队列帧
+    assert dpush_sock.calls == 50
+    assert put_sock.calls >= 1
+    # 两个连接各自都不应出现并发 sendall 重叠
+    assert dpush_sock.overlap is False
+    assert put_sock.overlap is False
 
 
 # ---------------------------------------------------------------------------
