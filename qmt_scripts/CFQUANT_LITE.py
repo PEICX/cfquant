@@ -5911,9 +5911,6 @@ class NormalQmtBridge(TxTradeBridge):
             if not self.running:
                 break
             if not self.request_queue.qsize() and not self.order_priority_queue.qsize():
-                self._idle_ticks = getattr(self, "_idle_ticks", 0) + 1
-                if self._idle_ticks % 500 == 0:
-                    self._log("cfq worker idle_ticks=%d (每500次约10秒=20ms周期生效)" % self._idle_ticks)
                 continue
             with self.worker_source_lock:
                 source = self.worker_source or "unknown"
