@@ -2043,6 +2043,8 @@ class TxTradeBridge(object):
         self.order_request_metadata_by_id = {}
         self.order_request_metadata_lock = threading.RLock()
         self.order_callback_cache = OrderCallbackCache()
+        # 行级字段读取缓存：(obj, {name: value})；由 _format_trade_detail 逐行重置。
+        self._row_value_cache = None
 
     def set_context(self, context):
         self.context = context
@@ -2361,8 +2363,6 @@ class TxTradeBridge(object):
             rows = self._call_trade_detail_data(func, account_id, account_type.lower(), detail_type.lower()) or []
         _t_native_ms = (time.perf_counter() - _t_native0) * 1000
         _t_fmt0 = time.perf_counter()
-        _t_enrich_total = 0.0
-        _t_remember_total = 0.0
         result = []
         for index, row in enumerate(rows):
             try:
@@ -2377,13 +2377,14 @@ class TxTradeBridge(object):
                     if used_query_account_id != account_id:
                         formatted.setdefault("query_account_id", used_query_account_id)
                     if detail_type.lower() in ("order", "deal"):
-                        _te = time.perf_counter()
-                        self._enrich_order_request_fields(formatted)
-                        _t_enrich_total += time.perf_counter() - _te
-                        if detail_type.lower() == "order":
-                            _tr = time.perf_counter()
-                            self._remember_order_callback_fields(formatted)
-                            _t_remember_total += time.perf_counter() - _tr
+                        # 只对"仍在跟踪的委托"（元数据索引能命中的新单）做富化和
+                        # 回调缓存登记。历史旧单的元数据早已被上限淘汰，对它们
+                        # 富化必然落空、登记也只会立刻被挤出缓存，纯属逐行空耗
+                        # （2000 行委托实测此两项各约 5.7 秒）。索引未命中即跳过。
+                        if self._order_metadata_known(formatted):
+                            self._enrich_order_request_fields(formatted)
+                            if detail_type.lower() == "order":
+                                self._remember_order_callback_fields(formatted)
                 result.append(formatted)
             except Exception as e:
                 self._log(
@@ -2398,9 +2399,8 @@ class TxTradeBridge(object):
         if detail_type.lower() == "order" and _truthy_param(params.get("cancelable_only")):
             result = _filter_cancelable_orders(result)
         self._log(
-            "query_trade_detail done detail_type=%s count=%s native_ms=%.0f format_ms=%.0f enrich_ms=%.0f remember_ms=%.0f"
-            % (detail_type, len(result), _t_native_ms, (time.perf_counter() - _t_fmt0) * 1000,
-               _t_enrich_total * 1000, _t_remember_total * 1000)
+            "query_trade_detail done detail_type=%s count=%s native_ms=%.0f format_ms=%.0f"
+            % (detail_type, len(result), _t_native_ms, (time.perf_counter() - _t_fmt0) * 1000)
         )
         return result
 
@@ -3196,6 +3196,33 @@ class TxTradeBridge(object):
                 evicted_id = evicted.get("order_id") if isinstance(evicted, dict) else None
                 if evicted_id is not None:
                     self.order_request_metadata_by_id.pop((evicted_key[0], str(evicted_id)), None)
+
+    def _order_metadata_known(self, order):
+        # 判断该行是否存在于 order_request_metadata 的委托号索引中。
+        # 与 _enrich_order_request_fields 使用同一判据（account_id + 任一委托号），
+        # 因此"跳过"不会漏掉富化本可命中的行。
+        if not isinstance(order, dict):
+            return False
+        account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
+        if not account_id:
+            return False
+        index = getattr(self, "order_request_metadata_by_id", None)
+        if not index:
+            return False
+        for name in (
+            "order_id",
+            "m_nRef",
+            "m_nOrderID",
+            "m_strOrderRef",
+            "m_strOrderID",
+        ):
+            order_id = self._normalize_order_id(self._first_value(order, (name,)))
+            if order_id is None:
+                continue
+            with self.order_request_metadata_lock:
+                if (account_id, str(order_id)) in index:
+                    return True
+        return False
 
     def _enrich_order_request_fields(self, order):
         if not isinstance(order, dict):
@@ -4999,6 +5026,7 @@ class TxTradeBridge(object):
         return 0
 
     def _format_trade_detail(self, obj, detail_type):
+        self._row_value_cache = (obj, {})
         detail_type = str(detail_type).lower()
         if detail_type == "order":
             return {
@@ -5046,52 +5074,6 @@ class TxTradeBridge(object):
                 "status_msg": self._first_value(obj, ("m_strStatusMsg", "m_strErrorMsg", "m_strCancelInfo", "m_strStatus", "m_strOrderStatus")),
                 "strategy_name": self._get_value(obj, "m_strStrategyName"),
                 "order_remark": self._first_value(obj, ("m_strRemark", "m_strOrderRemark")),
-                "m_strAccountID": self._get_value(obj, "m_strAccountID"),
-                "m_strInstrumentID": self._get_value(obj, "m_strInstrumentID"),
-                "m_strExchangeID": self._get_value(obj, "m_strExchangeID"),
-                "m_nMarket": self._get_value(obj, "m_nMarket"),
-                "m_strMarket": self._get_value(obj, "m_strMarket"),
-                "m_strInstrumentName": self._get_value(obj, "m_strInstrumentName"),
-                "m_nOrderType": self._get_value(obj, "m_nOrderType"),
-                "m_nBusinessType": self._get_value(obj, "m_nBusinessType"),
-                "m_nDirection": self._get_value(obj, "m_nDirection"),
-                "m_nOffsetFlag": self._get_value(obj, "m_nOffsetFlag"),
-                "m_nVolumeTotalOriginal": self._get_value(obj, "m_nVolumeTotalOriginal"),
-                "m_nPriceType": self._get_value(obj, "m_nPriceType"),
-                "m_nOrderPriceType": self._get_value(obj, "m_nOrderPriceType"),
-                "m_dLimitPrice": self._get_value(obj, "m_dLimitPrice"),
-                "m_dOrderPrice": self._get_value(obj, "m_dOrderPrice"),
-                "m_dPrice": self._get_value(obj, "m_dPrice"),
-                "m_dTradedPrice": self._get_value(obj, "m_dTradedPrice"),
-                "m_nVolumeTraded": self._get_value(obj, "m_nVolumeTraded"),
-                "m_dTradeAmount": self._get_value(obj, "m_dTradeAmount"),
-                "m_strRemark": self._get_value(obj, "m_strRemark"),
-                "m_strStrategyName": self._get_value(obj, "m_strStrategyName"),
-                "m_strOrderSysID": self._get_value(obj, "m_strOrderSysID"),
-                "m_nRef": self._get_value(obj, "m_nRef"),
-                "m_strOrderRef": self._get_value(obj, "m_strOrderRef"),
-                "m_nOrderID": self._first_value(obj, ("m_nOrderID", "m_nRef")),
-                "m_strOrderID": self._first_value(obj, ("m_strOrderID", "m_strOrderRef")),
-                "m_nOrderStatus": self._get_value(obj, "m_nOrderStatus"),
-                "m_nOrderSubmitStatus": self._get_value(obj, "m_nOrderSubmitStatus"),
-                "m_nVolumeTotal": self._get_value(obj, "m_nVolumeTotal"),
-                "m_nErrorID": self._get_value(obj, "m_nErrorID"),
-                "m_strErrorMsg": self._get_value(obj, "m_strErrorMsg"),
-                "m_strCancelInfo": self._get_value(obj, "m_strCancelInfo"),
-                "m_strOptName": self._get_value(obj, "m_strOptName"),
-                "m_strOrderStatus": self._get_value(obj, "m_strOrderStatus"),
-                "m_nOrderState": self._get_value(obj, "m_nOrderState"),
-                "m_strStatus": self._get_value(obj, "m_strStatus"),
-                "m_strOrderTime": self._get_value(obj, "m_strOrderTime"),
-                "m_strEntrustTime": self._get_value(obj, "m_strEntrustTime"),
-                "m_strInsertTime": self._get_value(obj, "m_strInsertTime"),
-                "m_strInsertDate": self._get_value(obj, "m_strInsertDate"),
-                "m_nOrderTime": self._get_value(obj, "m_nOrderTime"),
-                "m_nEntrustTime": self._get_value(obj, "m_nEntrustTime"),
-                "m_nInsertTime": self._get_value(obj, "m_nInsertTime"),
-                "m_strOrderDate": self._get_value(obj, "m_strOrderDate"),
-                "m_strEntrustDate": self._get_value(obj, "m_strEntrustDate"),
-                "m_strTradingDay": self._get_value(obj, "m_strTradingDay"),
             }
         if detail_type == "deal":
             return {
@@ -5313,6 +5295,22 @@ class TxTradeBridge(object):
     def _get_value(self, obj, name):
         if obj is None:
             return None
+        # 行级缓存：同一行对象对同一字段名只做一次 getattr。格式化一条委托要读
+        # 69 个 key，其中大量是同一底层属性的重复暴露（如 stock_code 与
+        # m_strInstrumentID），未缓存时会重复走 getattr + 异常处理链。
+        cache = self._row_value_cache
+        if cache is not None and cache[0] is obj:
+            hit = cache[1]
+            if name in hit:
+                return hit[name]
+        else:
+            hit = None
+        value = self._read_value_uncached(obj, name)
+        if hit is not None:
+            hit[name] = value
+        return value
+
+    def _read_value_uncached(self, obj, name):
         try:
             return self._plain_value(getattr(obj, name))
         except AttributeError:
