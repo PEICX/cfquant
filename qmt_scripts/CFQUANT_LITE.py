@@ -2789,8 +2789,7 @@ class TxTradeBridge(object):
         price_type = params.get("price_type", 11)
         order_remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy_name = params.get("strategy_name", "")
-        previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) if capture_previous_id else None
-        pending_sync_order = None
+        previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) if capture_previous_id else None        pending_sync_order = None
         if resolve_order_id:
             pending_sync_order = self._register_pending_sync_order(
                 account_id,
@@ -3147,7 +3146,10 @@ class TxTradeBridge(object):
 
     def _order_stock_async(self, params, msg):
         seq = params.get("seq")
-        result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False)
+        # 异步单回调匹配依赖唯一 order_remark（prepare_order_remark 必带 uuid 后缀），
+        # previous_order_id 仅是备注不唯一时的兜底去重；跳过可省一次 get_last_order_id 原生调用。
+        result = self._order_stock(params, msg, resolve_order_id=False, trust_request_order_id=False,
+                                   capture_previous_id=False)
         request_result = result.get("request_result")
         accepted = not self._is_failed_order_result(request_result)
         if not accepted:
@@ -5641,6 +5643,9 @@ class NormalQmtBridge(TxTradeBridge):
             globals_dict=globals_dict,
         )
         self.request_queue = queue.Queue(maxsize=10000)
+        # 下单/撤单走优先队列，避免排在心跳查询(get_trade_detail_data ~70-90ms)后面
+        self.order_priority_queue = queue.Queue(maxsize=10000)
+
         self.recv_thread = None
         self.worker_thread = None
         self.worker_event = threading.Event()
@@ -5733,7 +5738,9 @@ class NormalQmtBridge(TxTradeBridge):
         if self._try_enqueue_coalesced_request(msg):
             return
         try:
-            self.request_queue.put_nowait((msg, time.time(), None))
+            _order_first = str(action or "").startswith(("xttrader.order_stock", "xttrader.cancel_order_stock"))
+            _target_queue = self.order_priority_queue if _order_first else self.request_queue
+            _target_queue.put_nowait((msg, time.time(), None))
             self._release_worker("enqueue")
             self._log(
                 "normal bridge request queued action=%s id=%s queue_size=%s"
@@ -5908,9 +5915,12 @@ class NormalQmtBridge(TxTradeBridge):
                 if self.pump_max_ms > 0 and (time.perf_counter() - start) * 1000 >= self.pump_max_ms:
                     break
                 try:
-                    item = self.request_queue.get_nowait()
+                    item = self.order_priority_queue.get_nowait()
                 except queue.Empty:
-                    break
+                    try:
+                        item = self.request_queue.get_nowait()
+                    except queue.Empty:
+                        break
                 msg, received_at, coalesce_key = self._queue_item_parts(item)
                 if coalesce_key:
                     self._drain_coalesced_request(source, msg, received_at, coalesce_key)
@@ -7180,6 +7190,25 @@ class NamedPipeConnection(object):
                 offset += written.value
 
 
+_TIMER_RESOLUTION_RAISED = False
+
+
+def _raise_windows_timer_resolution():
+    # Windows 默认定时器分辨率约 15.6ms，会让线程 wait/Event 的唤醒出现量化延迟。
+    # timeBeginPeriod(1) 把分辨率提到 1ms，缩短接收线程到 worker 的唤醒等待。
+    global _TIMER_RESOLUTION_RAISED
+    if _TIMER_RESOLUTION_RAISED:
+        return
+    try:
+        import ctypes as _ct
+        _winmm = _ct.windll.winmm
+        if _winmm.timeBeginPeriod(1) == 0:
+            _TIMER_RESOLUTION_RAISED = True
+            _print_log("cfq timer resolution raised to 1ms")
+    except Exception:
+        pass
+
+
 def connect_pipe(pipe_name=None, timeout_ms=3000):
     pipe_name = normalize_pipe_name(pipe_name)
     k32 = kernel32()
@@ -7458,8 +7487,12 @@ class PipeTxClient(object):
                 if isinstance(payload, (bytes, bytearray)):
                     if not (frame.get("flags", 0) & FRAME_FLAG_COLUMNAR):
                         payload = payload.decode("utf-8", errors="replace")
+                    if self.endpoint_name == "trade" and _trade_fast_dispatch(payload):
+                        continue
                     self.Q.put(payload)
                 elif payload:
+                    if self.endpoint_name == "trade" and _trade_fast_dispatch(payload):
+                        continue
                     self.Q.put(payload)
                 continue
             if isinstance(raw, (bytes, bytearray)):
@@ -7702,6 +7735,7 @@ class PipeTradeBridge(TxTradeBridge):
         if self.running:
             return self
         self.running = True
+        _raise_windows_timer_resolution()
         self.tx = PipeTxClient(
             pipe_name=self.pipe_name,
             request_channel=self.request_channel,
@@ -8298,6 +8332,60 @@ def _attach_normal_status_extra():
     _normal_bridge._status_extra = status_extra_with_trade
 
 
+
+
+_trade_fast_dispatch_count = 0
+# 接收线程直通的动作：仅单笔异步下单（passorder 亚毫秒级且线程安全）。
+# 注意：QMT 原生 cancel 依赖 QMT 线程内状态（实测在接收线程直调会抛
+# 'NoneType' object has no attribute 'request_id'），撤单类动作不得进入直通集，
+# 必须留在 normal bridge worker / QMT 定时器线程执行。passorder 无此限制。
+_DIRECT_DISPATCH_ACTIONS = frozenset((
+    "xttrader.order_stock_async",
+))
+
+
+def _trade_fast_dispatch(payload):
+    # 零跳转：trade 端点收到的 xttrader.* 请求直接转发给 normal bridge（其内部
+    # 线程安全队列会立刻唤醒 worker），不再经过 tx.Q + 接收线程两级排队。
+    # 返回 True 表示已接管该消息；其余消息保持原路径。
+    global _trade_fast_dispatch_count
+    try:
+        if _normal_bridge is None:
+            return False
+        msg = loads_message(payload)
+        if not isinstance(msg, dict) or msg.get("type") != "request":
+            return False
+        _action = str(msg.get("action") or "")
+        if not (_action.startswith("xttrader.") or _action in CFTRADER_BATCH_ORDER_ACTIONS
+                or _action in CFTRADER_BATCH_CANCEL_ACTIONS):
+            return False
+        _trade_fast_dispatch_count += 1
+        if str(msg.get("action") or "") in _DIRECT_DISPATCH_ACTIONS:
+            # 单笔异步下单在接收线程内直接执行（passorder 已验证线程安全，且为
+            # 亚毫秒级本地调用），跳过 normal bridge 队列等待，实现零排队。
+            _direct_async_order(msg)
+            return True
+        _normal_bridge._handle_raw_from_thread(payload)
+        return True
+    except Exception:
+        return False
+
+
+
+
+
+def _direct_async_order(msg):
+    # 接收线程直通：异步下单不经任何队列，直接 dispatch 并回包。
+    try:
+        result = _normal_bridge._dispatch(msg.get("action"), msg.get("params") or {}, msg)
+        _normal_bridge._send_response(msg, result)
+    except Exception as _direct_err:
+        try:
+            _normal_bridge._send_error(msg, _direct_err)
+        except Exception:
+            pass
+
+
 def _run_trade_loop():
     global _trade_loop_error, _trade_recv_count, _trade_queue_full_count, _trade_last_recv_at
 
@@ -8310,7 +8398,18 @@ def _run_trade_loop():
             raw = tx.Q.get(timeout=TRADE_SLEEP_SECONDS)
             if raw is None:
                 continue
-            _trade_request_queue.put_nowait(raw)
+            _fast_path = False
+            try:
+                _msg2 = loads_message(raw)
+                if isinstance(_msg2, dict) and _msg2.get("type") == "request":
+                    _action2 = str(_msg2.get("action") or "")
+                    if _action2.startswith("xttrader.") and _normal_bridge:
+                        _normal_bridge._handle_raw_from_thread(raw)
+                        _fast_path = True
+            except Exception:
+                _fast_path = False
+            if not _fast_path:
+                _trade_request_queue.put_nowait(raw)
             _trade_recv_count += 1
             _trade_last_recv_at = time.time()
         except Exception as e:

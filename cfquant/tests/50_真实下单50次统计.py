@@ -38,20 +38,25 @@ BRIDGE_ID = "default"
 REQUEST_TIMEOUT = 15.0
 ACCOUNT_ID = "10110148"
 ACCOUNT_TYPE = "STOCK"
-STOCK_CODE = "000001.SZ"
+STOCK_CODE = "510300.SH"
 SIDE = "buy"              # buy=买入，sell=卖出
-PRICE = 11.5
+PRICE = 3.5               # 远低于买一(4.24)，只挂单不成交，冻结资金极少
 VOLUME = 100
 PRICE_TYPE = FIX_PRICE
 STRATEGY_NAME = "cfquant_real_order_latency"
 ORDER_REMARK_PREFIX = ""  # 留空自动生成前缀
 
 ORDER_COUNT = 50          # 下单次数
-INTERVAL = 0.2            # 两次下单之间的间隔（秒）
-ORDER_MODE = "async"      # sync=同步 order_stock；async=异步 order_stock_async
+INTERVAL = 0.0            # 两次下单之间的间隔（秒）；0=一直发，不等待
+ORDER_MODE = "sync"       # sync=同步 order_stock；async=异步 order_stock_async
 FIND_ORDER_TIMEOUT = 5.0
 CALLBACK_TIMEOUT = 5.0
 QUERY_INTERVAL = 0.05
+
+# False（默认）：每笔只计时下单接口本身，不逐笔轮询委托表/等回调，
+#                 用于测量“连续发 50 笔”的总时间；委托表核对在全部发完后统一做一次。
+# True           ：保留逐笔委托表轮询与回调等待，耗时会被 5s 超时主导。
+VERIFY_EACH_ORDER = False
 
 JSON_OUTPUT = False       # True 额外打印逐次 JSON（机器可读）
 SHOW_TRANSPORT_LOG = False
@@ -366,6 +371,19 @@ def query_until_order_visible(
         time.sleep(max(float(interval or 0), 0.0))
 
 
+def percentile(values, fraction):
+    """线性插值分位数（与 statistics.quantiles / numpy 默认口径一致）。"""
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    position = (len(values) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    weight = position - lower
+    return values[lower] * (1.0 - weight) + values[upper] * weight
+
+
 def stats(values):
     values = [v for v in values if v is not None]
     if not values:
@@ -375,9 +393,10 @@ def stats(values):
         "count": len(values),
         "min_ms": round(values[0], 3),
         "max_ms": round(values[-1], 3),
-        "mean_ms": round(statistics.fmean(values), 3),
-        "p50_ms": round(values[len(values) // 2], 3),
-        "p90_ms": round(values[min(len(values) - 1, int(len(values) * 0.9))], 3),
+        "mean_ms": round(statistics.mean(values), 3),
+        "p50_ms": round(percentile(values, 0.50), 3),
+        "p90_ms": round(percentile(values, 0.90), 3),
+        "p95_ms": round(percentile(values, 0.95), 3),
     }
     if len(values) > 1:
         result["stdev_ms"] = round(statistics.pstdev(values), 3)
@@ -466,6 +485,7 @@ def main():
             print_info("连接检查完成，未下单")
             return 0
 
+        burst_started = time.perf_counter()
         for index in range(1, order_count + 1):
             order_remark = "%s_%03d" % (remark_prefix, index)
             callback = OrderLatencyCallback(account_id, stock_code, order_remark,
@@ -524,22 +544,31 @@ def main():
                 order_id = normalize_text(order_id)
                 record["order_id"] = order_id
 
-            visible = query_until_order_visible(
-                trader, account, account_id, stock_code, order_id, order_remark,
-                order_started, config.find_order_timeout, config.query_interval,
-                allow_stock_fallback=config.allow_stock_fallback,
-            )
-            record["query_visible_ms"] = visible.get("latency_from_submit_ms")
-            record["query_ok"] = bool(visible.get("ok"))
+            visible = None
+            if VERIFY_EACH_ORDER:
+                visible = query_until_order_visible(
+                    trader, account, account_id, stock_code, order_id, order_remark,
+                    order_started, config.find_order_timeout, config.query_interval,
+                    allow_stock_fallback=config.allow_stock_fallback,
+                )
+                record["query_visible_ms"] = visible.get("latency_from_submit_ms")
+                record["query_ok"] = bool(visible.get("ok"))
 
-            deadline = order_started + max(float(config.callback_timeout or 0), 0.0)
-            event = callback.wait_first("on_stock_order", deadline)
-            record["callback_from_submit_ms"] = event.get("latency_from_submit_ms") if event else None
-            record["callback_ok"] = event is not None
-            match_keys = [record["query_ok"], record["callback_ok"]]
-            if order_mode == "async":
-                match_keys.append(record.get("async_ok"))
-            record["ok"] = any(match_keys)
+            event = None
+            if VERIFY_EACH_ORDER:
+                deadline = order_started + max(float(config.callback_timeout or 0), 0.0)
+                event = callback.wait_first("on_stock_order", deadline)
+                record["callback_from_submit_ms"] = event.get("latency_from_submit_ms") if event else None
+                record["callback_ok"] = event is not None
+
+            if VERIFY_EACH_ORDER:
+                match_keys = [record["query_ok"], record["callback_ok"]]
+                if order_mode == "async":
+                    match_keys.append(record.get("async_ok"))
+                record["ok"] = any(match_keys)
+            else:
+                # 快速连发模式：以“下单接口返回了委托编号/请求序号且没有抛异常”作为本笔成功
+                record["ok"] = bool(normalize_text(record.get("order_id")) or record.get("seq") is not None)
 
             per_order.append(record)
             print_info(
@@ -553,6 +582,36 @@ def main():
             print_json({"type": "order", **record})
             time.sleep(max(float(config.interval or 0), 0.0))
 
+        burst_elapsed_ms = elapsed_ms(burst_started)
+
+        # 批量核对：一次性拉取委托表，确认本次 50 笔是否都已落地
+        batch_verify = {}
+        if not VERIFY_EACH_ORDER:
+            verify_started = time.perf_counter()
+            try:
+                with capture_external_output() as logs:
+                    orders = trader.query_stock_orders(account, cancelable_only=False) or []
+                print_external_logs("query_stock_orders", logs, show=config.show_transport_log)
+                wanted = {r["order_remark"] for r in per_order}
+                hit = {}
+                for order in orders:
+                    remark = normalize_text(pick_value(
+                        order, "order_remark", "remark", "m_strRemark", "m_strOrderRemark"))
+                    if remark in wanted:
+                        hit[remark] = order_id_candidates(order)[0]
+                batch_verify = {
+                    "query_ms": elapsed_ms(verify_started),
+                    "orders_in_table": len(orders),
+                    "matched": len(hit),
+                    "missing": sorted(wanted - set(hit)),
+                }
+            except Exception as error:
+                batch_verify = {
+                    "query_ms": elapsed_ms(verify_started),
+                    "error": "%s: %s" % (type(error).__name__, error),
+                }
+            print_info("批量核对委托表", **batch_verify)
+
         # ===== 汇总统计 =====
         ok_count = sum(1 for r in per_order if r.get("ok"))
         summary = {
@@ -561,19 +620,27 @@ def main():
             "order_count": order_count,
             "ok_count": ok_count,
             "failed_count": order_count - ok_count,
+            "burst_total_ms": burst_elapsed_ms,
+            "burst_avg_ms": round(burst_elapsed_ms / order_count, 3) if order_count else None,
+            "burst_throughput_per_sec": round(order_count / (burst_elapsed_ms / 1000.0), 3) if burst_elapsed_ms > 0 else None,
             "order_call_ms": stats([r.get("order_call_ms") for r in per_order]),
             "async_response_ms": stats([r.get("async_response_ms") for r in per_order if r.get("async_ok")]),
             "query_visible_ms": stats([r.get("query_visible_ms") for r in per_order if r.get("query_ok")]),
             "callback_from_submit_ms": stats([r.get("callback_from_submit_ms") for r in per_order if r.get("callback_ok")]),
+            "batch_verify": batch_verify,
         }
         print_info("========== 汇总统计 (%s) ==========" % order_mode)
         print_info("成功/总数", ok=ok_count, total=order_count,
                    failed=order_count - ok_count)
+        print_info("连发总耗时", burst_total_ms=burst_elapsed_ms,
+                   burst_avg_ms=summary["burst_avg_ms"],
+                   burst_throughput_per_sec=summary["burst_throughput_per_sec"])
         print_info("下单调用耗时 ms", **summary["order_call_ms"])
         if order_mode == "async":
             print_info("异步反馈耗时 ms", **summary["async_response_ms"])
-        print_info("委托表可见耗时 ms", **summary["query_visible_ms"])
-        print_info("回调(自提交)耗时 ms", **summary["callback_from_submit_ms"])
+        if VERIFY_EACH_ORDER:
+            print_info("委托表可见耗时 ms", **summary["query_visible_ms"])
+            print_info("回调(自提交)耗时 ms", **summary["callback_from_submit_ms"])
         print_json(summary)
         return 0 if ok_count == order_count else 1
     finally:
