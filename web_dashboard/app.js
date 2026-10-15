@@ -281,6 +281,10 @@ const DEFAULT_UPDATE_REPO_URL = 'https://github.com/95ge/cfquant.git';
 const DEFAULT_OFFICIAL_SITE_URL = 'https://cfquant.org';
 const API_DEBUG_TIMEOUT_MS = 18000;
 const API_DEBUG_QMT_TIMEOUT_SECONDS = 12;
+// 账户 orders/trades 段是全表查询，大委托表下单次可达数十秒。
+// 注意服务端链路上限：PipeHub 的 pending 超时（CFQUANT_PIPE_HUB_PENDING_TIMEOUT，
+// 默认 60s）会先截断，这里给 55s 让请求在到达上限前自然结束，拿到明确错误而非断连。
+const ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS = 55;
 const HELP_TOOLTIP_LAYER_ID = 'helpTooltipLayer';
 let mermaidRendererReady = false;
 let forceCloseVersionPopover = () => {};
@@ -8110,7 +8114,7 @@ function setDataTab(name, shouldRefresh = true) {
     refreshAccount('trades').catch((error) => log('成交刷新失败', { error: error.message }));
   }
   if (shouldRefresh && name === 'orders') {
-    refreshAccount('orders', { force: true, subscribe: false }).catch((error) => log('委托刷新失败', { error: error.message }));
+    refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log('委托刷新失败', { error: error.message }));
   }
 }
 
@@ -9600,7 +9604,7 @@ function selectAccountPair(accountId, bridgeId, accountType = 'STOCK', accountKe
   restartOrderCallbackSocket();
   refreshStatus().catch((error) => log('账号配置状态刷新失败', { error: error.message }));
   refreshAccount('asset,positions').catch((error) => log('账号配置资产刷新失败', { error: error.message }));
-  refreshAccount('orders', { force: true, subscribe: false }).catch((error) => log('账号配置委托刷新失败', { error: error.message }));
+  refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log('账号配置委托刷新失败', { error: error.message }));
   refreshAccount('trades').catch((error) => log('账号配置成交刷新失败', { error: error.message }));
 }
 
@@ -10749,7 +10753,7 @@ async function refreshInitialAccountData() {
     },
     {
       sections: 'orders',
-      options: { force: true, subscribe: false },
+      options: { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS },
       error: '委托初始化失败',
     },
     {
@@ -10953,7 +10957,7 @@ function refreshCurrentSelection(reason) {
   restartOrderCallbackSocket();
   refreshStatus().catch((error) => log(`${reason}状态刷新失败`, { error: error.message }));
   refreshAccount('asset,positions').catch((error) => log(`${reason}资产刷新失败`, { error: error.message }));
-  refreshAccount('orders', { force: true, subscribe: false }).catch((error) => log(`${reason}委托刷新失败`, { error: error.message }));
+  refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log(`${reason}委托刷新失败`, { error: error.message }));
   refreshAccount('trades').catch((error) => log(`${reason}成交刷新失败`, { error: error.message }));
 }
 
@@ -12231,6 +12235,8 @@ async function refreshAccount(sections = 'asset,positions', options = {}) {
   params.set('sections', sections);
   if (options.force) params.set('force', '1');
   if (options.subscribe === false) params.set('subscribe', '0');
+  // orders/trades 全表查询在大委托表下可超过默认 30s，允许调用方指定更宽松的超时。
+  if (options.timeout) params.set('timeout', String(options.timeout));
   const data = await api(`/api/account?${params.toString()}`);
   if (selectedAccount() !== accountId || selectedAccountType() !== accountType || selectedAccountKey() !== accountKey) return;
   if (data.asset) {
@@ -12322,7 +12328,7 @@ async function submitOrder(event) {
     rememberCfquantOrder(data);
     log('委托已提交', data);
     await refreshAccount('asset,positions', { force: true });
-    await refreshAccount('orders', { force: true, subscribe: false });
+    await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
   } catch (error) {
     log('委托失败', { error: error.message });
   }
@@ -12400,7 +12406,7 @@ async function submitBatchOrders(event) {
     rememberCfquantOrder(data);
     log('批量委托已提交', data);
     await refreshAccount('asset,positions', { force: true });
-    await refreshAccount('orders', { force: true, subscribe: false });
+    await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
   } catch (error) {
     log('批量委托失败', { error: error.message });
   }
@@ -12418,7 +12424,7 @@ async function sendCancel(orderId, channel) {
   };
   const data = await api('/api/cancel', { method: 'POST', body: JSON.stringify(body) });
   log('撤单已提交', data);
-  await refreshAccount('orders', { force: true, subscribe: false });
+  await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
 }
 
 async function cancelOrder(event) {
@@ -12462,7 +12468,7 @@ async function cancelSelectedOrders() {
       log('批量撤单失败', { order_id: orderId, error: error.message });
     }
   }
-  await refreshAccount('orders', { force: true, subscribe: false });
+  await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
 }
 
 function wireForms() {
@@ -13998,7 +14004,7 @@ async function boot() {
   $('refreshBtn').addEventListener('click', async () => {
     try {
       await refreshAccount('asset,positions', { force: true });
-      await refreshAccount('orders', { force: true, subscribe: false });
+      await refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS });
       await refreshAccount('trades', { force: true });
     } catch (error) {
       log('刷新失败', { error: error.message });
@@ -14350,7 +14356,7 @@ async function boot() {
       if (apiToggle) apiToggle.checked = overviewRemoteToggle.checked;
     });
   }
-  $('ordersBtn').addEventListener('click', () => refreshAccount('orders', { force: true, subscribe: false }).catch((error) => log('委托刷新失败', { error: error.message })));
+  $('ordersBtn').addEventListener('click', () => refreshAccount('orders', { timeout: ACCOUNT_SLOW_SECTION_TIMEOUT_SECONDS }).catch((error) => log('委托刷新失败', { error: error.message })));
   const realtimeOrdersToggle = $('autoRefresh');
   if (realtimeOrdersToggle) {
     realtimeOrdersToggle.addEventListener('change', () => {
