@@ -30,7 +30,6 @@ const state = {
   orderCallbackRefreshInFlight: false,
   orderCallbackRefreshPending: false,
   orderCallbackRefreshSections: new Set(),
-  orderCallbackLastReconcileAt: -Infinity,
   orderCallbackMeta: new Map(),
   latestOrders: [],
   orderSort: { key: 'time', direction: 'desc' },
@@ -1521,10 +1520,8 @@ const STATUS_REFRESH_INTERVAL_MS = 30000;
 const ACCOUNT_CACHE_POLL_INTERVAL_MS = 15000;
 const ONBOARDING_BRIDGE_POLL_MS = 3000;
 const CALLBACK_POLL_INTERVAL_MS = 3000;
-// 交易回调事件只在本地合并行数据；全量 force 委托/成交查询改为节流核对，
-// 避免每笔回调都触发一次穿到 QMT 的全表查询（大委托表时单次 30-80 秒）。
-// 手动刷新（刷新按钮/切页签/换账号）不受此限制。
-const ORDER_CALLBACK_RECONCILE_MIN_MS = 60000;
+// 交易回调事件只做本地行合并，不触发任何全量委托/成交查询（web 页不需要
+// 精确到笔）；需要精确数据时用刷新按钮/切页签手动触发。
 const ORDER_SNAPSHOT_LIMIT = 500;
 const ORDER_HIGHLIGHT_MS = 6500;
 const DOWNLOAD_EVENT_PREFIX = 'xtdata:download';
@@ -11859,11 +11856,6 @@ function appendServerCallbackEvent(event, options = {}) {
   return row;
 }
 
-function callbackEventIsTradeRelated(event) {
-  const name = callbackEventName(event);
-  return name.includes('order') || name.includes('on_stock_trade') || name.includes('deal') || name.includes('cancel');
-}
-
 function callbackEventIsOrderRow(event) {
   return callbackEventName(event).includes('on_stock_order');
 }
@@ -11927,20 +11919,14 @@ function runOrderCallbackRefresh() {
   if (!sections.length) return;
   state.orderCallbackRefreshInFlight = true;
   const snapshots = sections.filter((section) => section === 'asset' || section === 'positions');
-  // 回调事件已经把行数据本地合并进表格（mergeOrderCallbackRow），
-  // 全量 force 查询只作为节流核对：两次至少间隔 ORDER_CALLBACK_RECONCILE_MIN_MS，
-  // 且只在委托/成交页可见时进行，避免回调风暴把 QMT 查询打满。
-  const now = Date.now();
-  const reconcileDue = now - state.orderCallbackLastReconcileAt >= ORDER_CALLBACK_RECONCILE_MIN_MS;
-  const live = reconcileDue && tradesTabVisible()
-    ? sections.filter((section) => section !== 'asset' && section !== 'positions')
-    : [];
-  if (live.length) state.orderCallbackLastReconcileAt = now;
+  // 回调事件已经把行数据本地合并进表格（mergeOrderCallbackRow），委托/成交
+  // 不做任何事件驱动的全量查询——web 页不需要精确到笔，避免大委托表时
+  // 单次 30-80 秒的 get_trade_detail_data 霸占 worker。需要精确数据时
+  // 用刷新按钮/切页签手动触发。
   Promise.all([
     snapshots.length && accountSnapshotVisible() ? refreshVisibleAccountCache() : Promise.resolve(),
-    live.length ? refreshAccount(live.join(','), { force: true, subscribe: false }) : Promise.resolve(),
   ])
-    .catch((error) => log('回调刷新交易数据失败', { sections, error: error.message }))
+    .catch((error) => log('回调刷新账户快照失败', { sections, error: error.message }))
     .finally(() => {
       state.orderCallbackRefreshInFlight = false;
       if (state.orderCallbackRefreshPending || state.orderCallbackRefreshSections.size) {
@@ -11948,13 +11934,6 @@ function runOrderCallbackRefresh() {
         scheduleOrderCallbackRefresh();
       }
     });
-}
-
-function tradesTabVisible() {
-  if (state.currentView !== 'trade') return false;
-  const active = document.querySelector('.data-tab.active');
-  if (!active) return false;
-  return active.dataset.tab === 'orders' || active.dataset.tab === 'trades';
 }
 
 function scheduleOrderCallbackRefresh(sections = 'orders') {
@@ -11972,14 +11951,12 @@ function handleOrderCallbackEvent(event, options = {}) {
   const data = callbackEventData(event);
   rememberCfquantOrder(data);
   rememberOrderCallbackMeta(row);
-  const merged = mergeOrderCallbackRow(orderRowFromCallbackEvent(event));
+  mergeOrderCallbackRow(orderRowFromCallbackEvent(event));
   const name = callbackEventName(event);
-  if (name.includes('stock_trade')) {
-    scheduleOrderCallbackRefresh('asset,positions,orders,trades');
-  } else if (name.includes('stock_asset') || name.includes('stock_position')) {
-    refreshVisibleAccountCache();
-  } else if (!merged && callbackEventIsTradeRelated(event)) {
-    scheduleOrderCallbackRefresh('orders');
+  // 委托/成交行数据已由 mergeOrderCallbackRow 本地合并；
+  // 事件只额外刷新资产/持仓快照（服务端缓存，轻量）。
+  if (name.includes('stock_trade') || name.includes('stock_asset') || name.includes('stock_position')) {
+    scheduleOrderCallbackRefresh('asset,positions');
   }
   if (options.render !== false && state.currentView === 'callbacks' && callbackEventVisible(row)) {
     renderCallbacks();

@@ -2,4 +2,4 @@
 """cfquant core version metadata."""
 
 __version__ = "0.2.53"
-WEB_VERSION = "web_20261015_01"
+WEB_VERSION = "web_20261015_02"
