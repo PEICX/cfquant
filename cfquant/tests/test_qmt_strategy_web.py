@@ -174,7 +174,7 @@ def test_new_binding_defaults_strategy_to_live_mode(web_config, tmp_path):
 def test_new_binding_defaults_qmt_auto_login_to_enabled(web_config, tmp_path):
     _, config = web_config
     row = config.save_account_config("1000000001", qmt_dir=str(tmp_path))
-    assert row["qmt_auto_login"] == {"enabled": True, "restart_times": []}
+    assert row["qmt_auto_login"] == {"enabled": True, "restart_times": ["08:00"]}
 
 
 def test_binding_preserves_explicitly_disabled_qmt_auto_login(web_config, tmp_path):
@@ -185,7 +185,7 @@ def test_binding_preserves_explicitly_disabled_qmt_auto_login(web_config, tmp_pa
         qmt_auto_login={"enabled": False},
     )
     row = config.save_account_config("1000000001", qmt_dir=str(tmp_path))
-    assert row["qmt_auto_login"] == {"enabled": False, "restart_times": []}
+    assert row["qmt_auto_login"] == {"enabled": False, "restart_times": ["08:00"]}
 
 
 def test_same_qmt_same_fund_has_one_mode_across_path_aliases_and_bindings(web_config, tmp_path):

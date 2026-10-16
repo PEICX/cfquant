@@ -361,9 +361,13 @@ function normalizeQmtDeploymentTargets(values = {}) {
   return next;
 }
 
+// 跨交易日后柜台交易会话需要一次完整重登，否则委托会被 120141 拒绝。
+// 默认每天 08:00 重启一次 QMT 兜底。
+const DEFAULT_QMT_RESTART_TIMES = ['08:00'];
+
 function defaultQmtAutoLoginSettings(value = undefined) {
   return value === undefined || value === null
-    ? { enabled: true, restart_times: [] }
+    ? { enabled: true, restart_times: DEFAULT_QMT_RESTART_TIMES.slice() }
     : normalizeQmtAutoLoginSettings(value);
 }
 
@@ -5490,7 +5494,7 @@ async function submitSetupForm(event) {
     if (input) input.focus();
     return;
   }
-  body.qmt_auto_login = { enabled: !!($('setupQmtAutoLogin') && $('setupQmtAutoLogin').checked), restart_times: [] };
+  body.qmt_auto_login = { enabled: !!($('setupQmtAutoLogin') && $('setupQmtAutoLogin').checked), restart_times: DEFAULT_QMT_RESTART_TIMES.slice() };
   if (adminRequired) {
     const adminUsername = $('setupAdminUsername') ? $('setupAdminUsername').value.trim() : '';
     const adminPassword = $('setupAdminPassword') ? $('setupAdminPassword').value : '';

@@ -1737,9 +1737,14 @@ def parse_config_bool(value, default=False):
     return bool(default)
 
 
-def normalize_qmt_auto_login_restart_times(value):
+# 跨交易日后柜台交易会话需要一次完整重登才能重建，否则委托会被
+# [120141][证券交易未初始化] 拒绝。默认每天 08:00 重启一次 QMT 兜底。
+DEFAULT_QMT_AUTO_LOGIN_RESTART_TIMES = ("08:00",)
+
+
+def normalize_qmt_auto_login_restart_times(value, default_times=DEFAULT_QMT_AUTO_LOGIN_RESTART_TIMES):
     if value is None:
-        items = []
+        items = list(default_times or ())
     elif isinstance(value, str):
         items = re.split(r"[,;\s]+", value)
     elif isinstance(value, (list, tuple, set)):
@@ -1779,14 +1784,28 @@ def normalize_qmt_auto_login_settings(value=None, existing=None):
         elif "restartTime" in value:
             restart_source = value.get("restartTime")
         else:
-            restart_source = existing.get("restart_times") or []
+            # 未显式给出重启时刻时沿用已保存的值；两者都缺省则回落到默认 08:00。
+            restart_source = existing.get("restart_times")
     else:
         enabled = parse_config_bool(value, default_enabled)
-        restart_source = existing.get("restart_times") or []
+        restart_source = existing.get("restart_times")
     return {
         "enabled": bool(enabled),
         "restart_times": normalize_qmt_auto_login_restart_times(restart_source),
     }
+
+
+def normalize_saved_qmt_auto_login_settings(value=None, existing=None):
+    """Load-time variant: an unset daily restart falls back to the 08:00 default.
+
+    Unlike :func:`normalize_qmt_auto_login_settings`, an explicitly empty
+    ``restart_times`` read back from disk is treated as "never configured" and
+    upgraded to the default, so existing bindings pick up the daily restart.
+    """
+    settings = normalize_qmt_auto_login_settings(value, existing=existing)
+    if not settings["restart_times"]:
+        settings["restart_times"] = list(DEFAULT_QMT_AUTO_LOGIN_RESTART_TIMES)
+    return settings
 
 
 def account_config_is_enabled(config):
@@ -2423,6 +2442,7 @@ class WebRuntimeConfig(object):
     def load(self):
         with self._lock:
             legacy_settings = {}
+            migrated_auto_login = False
             if os.path.isfile(self.path):
                 try:
                     with open(self.path, "r", encoding="utf-8") as f:
@@ -2431,6 +2451,7 @@ class WebRuntimeConfig(object):
                         self._data["bridges"] = self._normalize_bridges(raw.get("bridges") or {})
                         self._data["account_pairs"] = self._normalize_pairs(raw.get("account_pairs") or {})
                         self._data["account_configs"] = self._normalize_account_configs(raw.get("account_configs") or {})
+                        migrated_auto_login = self._auto_login_restart_times_migrated_locked(raw)
                         self._data["default_account_id"] = str(
                             raw.get("default_account_id") or DEFAULT_ACCOUNT_ID
                         ).strip() or DEFAULT_ACCOUNT_ID
@@ -2478,6 +2499,13 @@ class WebRuntimeConfig(object):
             except Exception as e:
                 safe_print("web sqlite settings load failed: %s" % e)
             self._repair_account_defaults_locked()
+            # Persist the default daily restart once, so an on-disk config that
+            # predates the 08:00 default stops reporting an empty schedule.
+            if migrated_auto_login:
+                try:
+                    self._save_locked()
+                except Exception as e:
+                    safe_print("web runtime config save after auto login migration failed: %s" % e)
 
     def snapshot(self):
         with self._lock:
@@ -3657,10 +3685,30 @@ class WebRuntimeConfig(object):
                         parent_bridge_id=bridge_id,
                         enabled=parse_config_bool(item.get("market_routing_enabled"), False),
                     ),
-                    "qmt_auto_login": normalize_qmt_auto_login_settings(item.get("qmt_auto_login")),
+                    "qmt_auto_login": normalize_saved_qmt_auto_login_settings(item.get("qmt_auto_login")),
                     "updated_at": float(item.get("updated_at") or 0),
                 }
         return result
+
+    def _auto_login_restart_times_migrated_locked(self, raw):
+        """True when loading upgraded an empty daily-restart schedule to the default."""
+        if not isinstance(raw, dict):
+            return False
+        for key in ("account_configs", "account_pairs"):
+            for item in (raw.get(key) or {}).values():
+                if not isinstance(item, dict):
+                    continue
+                settings = item.get("qmt_auto_login")
+                if not isinstance(settings, dict):
+                    continue
+                if normalize_qmt_auto_login_restart_times(
+                    settings.get("restart_times", settings.get("restartTimes"))
+                ):
+                    continue
+                normalized = normalize_saved_qmt_auto_login_settings(settings)
+                if normalized["restart_times"]:
+                    return True
+        return False
 
     def _normalize_account_configs(self, value):
         result = {}
@@ -3702,7 +3750,7 @@ class WebRuntimeConfig(object):
                 "qmt_trade_dir": qmt_trade_dir,
                 "mode": normalize_transport_mode(item.get("mode") or "ctypes"),
                 "qmt_strategy": normalize_strategy_settings(item.get("qmt_strategy")),
-                "qmt_auto_login": normalize_qmt_auto_login_settings(item.get("qmt_auto_login")),
+                "qmt_auto_login": normalize_saved_qmt_auto_login_settings(item.get("qmt_auto_login")),
                 "data_provider": bool(item.get("data_provider")),
                 "enabled": item.get("enabled", True) is not False,
                 "market_routing_enabled": parse_config_bool(item.get("market_routing_enabled"), False),
