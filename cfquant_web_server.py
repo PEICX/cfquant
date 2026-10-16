@@ -7559,6 +7559,16 @@ def file_content_equal(path_a, path_b):
         return False
 
 
+def _rmtree_onerror(func, failed_path, exc_info):
+    """Windows read-only fixup for shutil.rmtree; module-level so both
+    updaters share it and it resolves before CfquantUpdater instantiation."""
+    try:
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+    except Exception:
+        raise
+
+
 class CfquantUpdater(object):
     BACKUP_KEEP = 2
 
@@ -12285,14 +12295,6 @@ def parse_sections(value):
 
 def parse_bool(value):
     return parse_config_bool(value, False)
-
-
-def _rmtree_onerror(func, failed_path, exc_info):
-    try:
-        os.chmod(failed_path, stat.S_IWRITE)
-        func(failed_path)
-    except Exception:
-        raise
 
 
 def close_quietly(tx):

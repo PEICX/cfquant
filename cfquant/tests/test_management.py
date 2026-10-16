@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import time
 from types import SimpleNamespace
 from http.server import ThreadingHTTPServer
 
@@ -471,6 +472,12 @@ def test_conditional_http_reloads_only_when_needed(service, release_state, monke
     monkeypatch.setattr(service.web.PROJECT_UPDATER, '_update_from_official', lambda: {'update_completed': True})
     updated = service.runtime._request('POST', '/api/project-updates/ensure-latest', {})
     assert updated['status'] == 'updated'
+    # The handler appends the reload after writing the response, so the
+    # client may observe the reply before the server thread reaches the
+    # schedule call. Poll briefly instead of asserting immediately.
+    deadline = time.monotonic() + 2
+    while not reloads and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert reloads[0]['port'] == service.server.server_port
 
 

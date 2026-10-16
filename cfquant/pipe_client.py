@@ -5,6 +5,7 @@ import threading
 
 from .config import get_config
 from .callback_dispatcher import CallbackDispatcher, dispatch_callbacks
+from .errors import CfquantError, CfquantTimeout
 from ._fastjson import loads_message_typed
 from .pipe_transport import (
     DEFAULT_PIPE_NAME,
@@ -113,13 +114,9 @@ class PipeRpcClient(object):
             try:
                 msg = q.get(timeout=effective_timeout)
             except queue.Empty:
-                from .client import CfquantTimeout
-
                 raise CfquantTimeout("cfquant pipe request timeout: %s" % action)
             if not msg.get("ok"):
                 err = msg.get("error") or {}
-                from .client import CfquantError
-
                 raise CfquantError(err.get("message") or str(err))
             if msg.pop("_cf_typed", True):
                 return decode_value(msg.get("result"))
@@ -146,8 +143,6 @@ class PipeRpcClient(object):
     def _send_request(self, payload, request_channel, request_id=None, action=None):
         conn = self._tx_conn
         if conn is None:
-            from .client import CfquantError
-
             raise CfquantError("cfquant pipe client not started")
         if self._hub_binary and request_id:
             # Only pack_request outputs take the binary hot path; everything

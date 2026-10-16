@@ -8,15 +8,8 @@ import time
 from .config import get_config
 from .callback_dispatcher import CallbackDispatcher, dispatch_callbacks
 from ._fastjson import loads_message_typed
+from .errors import CfquantError, CfquantTimeout
 from .protocol import decode_value, dumps_message, new_id, pack_request
-
-
-class CfquantError(RuntimeError):
-    pass
-
-
-class CfquantTimeout(TimeoutError):
-    pass
 
 
 PIPE_TRANSPORTS = ("pipe", "ctypes", "named_pipe", "named-pipe")
