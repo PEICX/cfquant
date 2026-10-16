@@ -259,11 +259,6 @@ def user_order_id_from_data(data):
     )
 
 
-def order_ref_from_data(data):
-    refs = order_ref_candidates_from_data(data)
-    return refs[0] if refs else ""
-
-
 def order_ref_candidates_from_data(data):
     if not isinstance(data, dict):
         return []

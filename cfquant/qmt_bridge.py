@@ -9,7 +9,7 @@ import time
 from .config import get_config
 from .order_identity import prepare_order_remark, order_remark_key, original_order_remark, restore_order_remark, is_unique_order_remark
 from .stock_connect import connect_account_type, validate_connect_order, validate_connect_market, query_connect_exchange_rate
-from .logging_i18n import get_log_language, set_log_language, translate_log
+from .logging_i18n import get_log_enabled, get_log_language, set_log_enabled, set_log_language, translate_log
 from .protocol import loads_message, pack_event, pack_response
 from .batch_orders import CFTRADER_BATCH_CANCEL_ACTIONS, execute_qmt_cancel_batch
 from .level2 import (
@@ -22,7 +22,7 @@ from .level2 import (
     require_l2_callable,
     thousand_price,
 )
-from .xttype import _is_zero_time_value, filter_cancelable_orders
+from .xttype import _exchange_suffix, _is_zero_time_value, filter_cancelable_orders
 
 
 class CfquantQmtBridge(object):
@@ -250,6 +250,18 @@ class CfquantQmtBridge(object):
             return {"language": lang}
         if action == "cfquant.get_log_language":
             return {"language": get_log_language()}
+        if action == "cfquant.set_log_enabled":
+            params = params or {}
+            if "enabled" in params:
+                value = params.get("enabled")
+            else:
+                value = params.get("show")
+            enabled = set_log_enabled(value)
+            self.show = True
+            self._log("QMT log output enabled=%s" % ("1" if enabled else "0"), force=True)
+            return {"enabled": enabled}
+        if action == "cfquant.get_log_enabled":
+            return {"enabled": get_log_enabled()}
         if action == "cfquant.status":
             return {
                 "bridge": type(self).__name__,
@@ -1345,49 +1357,7 @@ class CfquantQmtBridge(object):
         return instrument_id
 
     def _market_suffix(self, value):
-        text = str(value or "").strip().upper()
-        aliases = {
-            "0": "SH",
-            "SH": "SH",
-            "SSE": "SH",
-            "SHSE": "SH",
-            "1": "SZ",
-            "SZ": "SZ",
-            "SZSE": "SZ",
-            "70": "BJ",
-            "BJ": "BJ",
-            "BSE": "BJ",
-            "3": "SF",
-            "SF": "SF",
-            "SHFE": "SF",
-            "SHF": "SF",
-            "4": "DF",
-            "DF": "DF",
-            "DCE": "DF",
-            "DLCE": "DF",
-            "5": "ZF",
-            "ZF": "ZF",
-            "CZCE": "ZF",
-            "ZCE": "ZF",
-            "2": "IF",
-            "IF": "IF",
-            "CFFEX": "IF",
-            "CFX": "IF",
-            "6": "INE",
-            "INE": "INE",
-            "75": "GF",
-            "GF": "GF",
-            "GFEX": "GF",
-            "7": "SHO",
-            "SHO": "SHO",
-            "SSEOPTION": "SHO",
-            "SSE_OPTION": "SHO",
-            "67": "SZO",
-            "SZO": "SZO",
-            "SZSEOPTION": "SZO",
-            "SZSE_OPTION": "SZO",
-        }
-        return aliases.get(text, text)
+        return _exchange_suffix(value)
 
     def _order_source(self, obj):
         values = [
@@ -1756,7 +1726,9 @@ class CfquantQmtBridge(object):
         except Exception as path_error:
             raise RuntimeError("无法导入 LTtx txl，请确认 cfquant 包完整或 tx.py 在 QMT Python 路径中: %s; fallback: %s" % (package_error, path_error))
 
-    def _log(self, msg):
+    def _log(self, msg, force=False):
+        if not force and not get_log_enabled():
+            return
         msg = translate_log(msg)
         line = "%s %s" % (self._timestamp_ms(), msg)
         try:

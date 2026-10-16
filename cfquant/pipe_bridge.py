@@ -200,9 +200,9 @@ class PipeTradeBridge(TxTradeBridge):
 def start_pipe_normal_bridge(
     context,
     pipe_name=None,
-        request_channel="cfquant.normal.request",
-        request_channels=None,
-        callback_event_channel="cfquant.callback.event",
+    request_channel="cfquant.normal.request",
+    request_channels=None,
+    callback_event_channel="cfquant.callback.event",
     bridge_id="default",
     account_id="",
     show=True,

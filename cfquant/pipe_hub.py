@@ -12,7 +12,6 @@ from .pipe_transport import (
     decode_pipe_frame,
     dumps_pipe_message,
     encode_pipe_frame,
-    loads_pipe_message,
     normalize_pipe_name,
     wait_for_pipe_client,
 )

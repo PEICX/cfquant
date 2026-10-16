@@ -8,7 +8,7 @@ import time
 from .config import get_config
 from .callback_dispatcher import CallbackDispatcher, dispatch_callbacks
 from ._fastjson import loads_message_typed
-from .protocol import decode_value, dumps_message, loads_message, new_id, pack_request
+from .protocol import decode_value, dumps_message, new_id, pack_request
 
 
 class CfquantError(RuntimeError):

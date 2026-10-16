@@ -22,10 +22,6 @@ from .protocol import MESSAGE_PREFIX, has_typed_payload
 _PREFIX_BYTES = MESSAGE_PREFIX.encode("utf-8")
 
 
-def fast_json_available():
-    return orjson is not None
-
-
 def _loads_json(payload):
     """json.loads semantics (bytes or str input); orjson when available."""
     if orjson is not None:

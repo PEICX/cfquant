@@ -16,7 +16,7 @@ from .pipe_transport import (
     encode_pipe_frame,
     normalize_pipe_name,
 )
-from .protocol import decode_value, dumps_message, loads_message, new_id, pack_request
+from .protocol import decode_value, dumps_message, new_id, pack_request
 from .quote_wire import decode_whole_quote
 
 

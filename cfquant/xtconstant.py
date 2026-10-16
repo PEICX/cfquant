@@ -352,19 +352,6 @@ def _upstream_xtconstant_module():
     return _UPSTREAM_XTCONSTANT
 
 
-def _load_upstream_xtquant_constants():
-    module = _upstream_xtconstant_module()
-    if module is None:
-        return
-    for name in dir(module):
-        if not name.isupper() or name.startswith("_") or name in globals():
-            continue
-        try:
-            globals()[name] = getattr(module, name)
-        except Exception:
-            pass
-
-
 def __getattr__(name):
     if name.isupper() and not name.startswith("_"):
         module = _upstream_xtconstant_module()
