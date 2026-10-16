@@ -10365,21 +10365,7 @@ async function verifyPair(accountId, bridgeId, accountType = 'STOCK', accountKey
 
 function renderPairVerification(payload) {
   const asset = payload && payload.account && payload.account.asset;
-  const assetRow = firstRow(asset);
-  const values = [
-    assetRow.balance ?? assetRow.m_dBalance,
-    assetRow.available ?? assetRow.m_dAvailable,
-    assetRow.market_value ?? assetRow.m_dInstrumentValue,
-    assetRow.position_profit ?? assetRow.m_dPositionProfit,
-  ];
-  const assetGrid = $('pairAssetGrid');
-  if (assetGrid) {
-    const cells = assetGrid.querySelectorAll('strong');
-    values.forEach((value, index) => {
-      cells[index].textContent = money(value);
-      cells[index].className = index === 3 ? signedClass(value) : '';
-    });
-  }
+  renderAssetInto($('pairAssetGrid'), firstRow(asset));
   const positions = payload && payload.account && payload.account.positions && Array.isArray(payload.account.positions.data)
     ? payload.account.positions.data
     : [];
@@ -10728,6 +10714,19 @@ async function refreshInitialAccountData() {
 async function refreshStatus() {
   const lttxPromise = refreshLttxStatus({ log: false });
   const transportPromise = refreshTransport();
+  // Both branches render the same label/status chrome; only the data source
+  // and the tooltip payloads differ.
+  const renderRouteChrome = (mode) => {
+    const routeIsPipe = isCtypesTransportMode(mode);
+    const pipeLabel = transportModeLabel(mode, true);
+    const normalLabel = routeIsPipe ? `${pipeLabel}查询通道` : '高级模式·普通 QMT';
+    const tradeLabel = routeIsPipe ? `${pipeLabel}交易通道` : '高级模式·极速交易端';
+    const normalLabelNode = $('normalStatusLabel');
+    const tradeLabelNode = $('tradeStatusLabel');
+    if (normalLabelNode) normalLabelNode.textContent = routeIsPipe ? `${pipeLabel}查询通道` : '普通 QMT';
+    if (tradeLabelNode) tradeLabelNode.textContent = routeIsPipe ? `${pipeLabel}交易通道` : '极速交易端';
+    return { normalLabel, tradeLabel };
+  };
   try {
     const params = accountQueryParams();
     const data = await api(`/api/status?${params.toString()}`);
@@ -10739,15 +10738,7 @@ async function refreshStatus() {
     state.accountRouteFallback = !!data.fallback;
     syncTopStatusDisplay();
     syncTransportChannelControls();
-    const routeMode = state.accountRouteMode;
-    const routeIsPipe = isCtypesTransportMode(routeMode);
-    const pipeLabel = transportModeLabel(routeMode, true);
-    const normalLabel = routeIsPipe ? `${pipeLabel}查询通道` : '高级模式·普通 QMT';
-    const tradeLabel = routeIsPipe ? `${pipeLabel}交易通道` : '高级模式·极速交易端';
-    const normalLabelNode = $('normalStatusLabel');
-    const tradeLabelNode = $('tradeStatusLabel');
-    if (normalLabelNode) normalLabelNode.textContent = routeIsPipe ? `${pipeLabel}查询通道` : '普通 QMT';
-    if (tradeLabelNode) tradeLabelNode.textContent = routeIsPipe ? `${pipeLabel}交易通道` : '极速交易端';
+    const { normalLabel, tradeLabel } = renderRouteChrome(state.accountRouteMode);
     const status = data.status || data;
     setStatus('normalStatus', !!(status.normal && status.normal.online), statusTooltipLines(normalLabel, status.normal || {}, data));
     setStatus('tradeStatus', !!(status.trade && status.trade.online), statusTooltipLines(tradeLabel, status.trade || {}, data));
@@ -10761,15 +10752,7 @@ async function refreshStatus() {
     state.accountRouteFallback = false;
     syncTopStatusDisplay();
     syncTransportChannelControls();
-    const routeMode = state.accountRouteMode;
-    const routeIsPipe = isCtypesTransportMode(routeMode);
-    const pipeLabel = transportModeLabel(routeMode, true);
-    const normalLabel = routeIsPipe ? `${pipeLabel}查询通道` : '高级模式·普通 QMT';
-    const tradeLabel = routeIsPipe ? `${pipeLabel}交易通道` : '高级模式·极速交易端';
-    const normalLabelNode = $('normalStatusLabel');
-    const tradeLabelNode = $('tradeStatusLabel');
-    if (normalLabelNode) normalLabelNode.textContent = routeIsPipe ? `${pipeLabel}查询通道` : '普通 QMT';
-    if (tradeLabelNode) tradeLabelNode.textContent = routeIsPipe ? `${pipeLabel}交易通道` : '极速交易端';
+    const { normalLabel, tradeLabel } = renderRouteChrome(state.accountRouteMode);
     setStatus('normalStatus', false, [
       `${normalLabel}：状态检查失败`,
       `内部通道：${selectedBridge()}`,
@@ -10986,19 +10969,23 @@ function firstRow(section) {
   return data || {};
 }
 
-function renderAsset(section) {
-  const row = firstRow(section);
+function renderAssetInto(gridEl, row) {
+  if (!gridEl) return;
   const values = [
     row.balance ?? row.m_dBalance,
     row.available ?? row.m_dAvailable,
     row.market_value ?? row.m_dInstrumentValue,
     row.position_profit ?? row.m_dPositionProfit,
   ];
-  const cells = $('assetGrid').querySelectorAll('strong');
+  const cells = gridEl.querySelectorAll('strong');
   values.forEach((value, index) => {
     cells[index].textContent = money(value);
     cells[index].className = index === 3 ? signedClass(value) : '';
   });
+}
+
+function renderAsset(section) {
+  renderAssetInto($('assetGrid'), firstRow(section));
   $('assetLatency').textContent = section && section.latency_ms ? `${section.latency_ms} ms` : '';
 }
 
