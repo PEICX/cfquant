@@ -388,6 +388,57 @@ def test_reset_web_auth_password_enables_auth_when_it_was_not_configured(web_con
     assert config.verify_web_auth("admin", new_password)
 
 
+def test_wait_processes_exit_polls_until_directory_is_quiet(web_config, monkeypatch):
+    web, _ = web_config
+    snapshots = [[{"pid": 1}], [{"pid": 1}], []]
+    calls = {"n": 0}
+
+    def fake_processes(path):
+        index = min(calls["n"], len(snapshots) - 1)
+        calls["n"] += 1
+        return snapshots[index]
+
+    monkeypatch.setattr(web, "_qmt_auto_login_processes", fake_processes)
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+    remaining = web._qmt_auto_login_wait_processes_exit("bin.x64", timeout=5.0, interval=0.01)
+    assert remaining == []
+    assert calls["n"] == 3
+
+
+def test_wait_processes_exit_returns_stragglers_on_timeout(web_config, monkeypatch):
+    web, _ = web_config
+    monkeypatch.setattr(web, "_qmt_auto_login_processes", lambda path: [{"pid": 9}])
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+    # Deadline already elapsed -> return without spinning forever.
+    monkeypatch.setattr(web.time, "monotonic", lambda: 1000.0)
+    assert web._qmt_auto_login_wait_processes_exit("bin.x64", timeout=0.0) == [{"pid": 9}]
+
+
+def test_scheduled_restart_waits_for_exit_then_relaunches(web_config, monkeypatch, tmp_path):
+    web, config = web_config
+    qmt_bin = tmp_path / "QMT" / "bin.x64"
+    qmt_bin.mkdir(parents=True)
+    (qmt_bin / "XtItClient.exe").write_bytes(b"")
+    row = config.save_account_config(
+        "8885060548",
+        qmt_dir=str(qmt_bin.parent),
+        qmt_auto_login={"enabled": True, "restart_times": ["08:00"]},
+    )
+    events = []
+    monkeypatch.setattr(web, "_qmt_auto_login_stop_xtitclient",
+                        lambda row, paths, session=None: events.append("stop") or {"requested_pids": [1]})
+    monkeypatch.setattr(web, "_qmt_auto_login_wait_processes_exit",
+                        lambda bin_dir, **kwargs: events.append("wait") or [])
+    monkeypatch.setattr(web, "_qmt_auto_login_start_xtitclient",
+                        lambda paths, use_link=False: events.append("launch") or {"pid": 4321, "bin_dir": paths["bin_dir"]})
+    monkeypatch.setattr(web, "_qmt_auto_login_processes",
+                        lambda path: [] if "launch" in events else [{"pid": 1, "name": "XtItClient.exe"}])
+    result = web.qmt_auto_login_restart_for_account(row, reason="scheduled:08:00")
+    assert events == ["stop", "wait", "launch"]
+    assert result["restarted"] is True
+    assert result["restart_pid"] == 4321
+
+
 def test_qmt_process_snapshot_matches_directory_and_reports_pids(web_config, monkeypatch, tmp_path):
     web, _ = web_config
     qmt_bin = tmp_path / "QMT" / "bin.x64"

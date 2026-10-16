@@ -11134,6 +11134,22 @@ def _qmt_auto_login_stop_xtitclient(row, paths, session=None):
     return {"requested_pids": pids, "results": results}
 
 
+def _qmt_auto_login_wait_processes_exit(bin_dir, timeout=30.0, interval=0.5):
+    """Block until no XtItClient.exe remains under ``bin_dir``, or timeout.
+
+    ``taskkill /T`` tears down a whole child-process tree, so the process can
+    linger past a fixed short sleep. Restart must wait for the directory to go
+    quiet before re-launching, otherwise the stale entry is mistaken for a live
+    process and the relaunch is skipped.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        remaining = _qmt_auto_login_processes(bin_dir)
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+
 def _qmt_auto_login_copy_current_link(paths):
     source = ""
     for candidate in (paths["link_path"], paths["link_lower_path"]):
@@ -11375,7 +11391,12 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
             stop = None
             if restart:
                 stop = _qmt_auto_login_stop_xtitclient(row, paths, session=_qmt_auto_login_saved_session(row))
-            running = _qmt_auto_login_processes(paths["bin_dir"])
+                # Wait for the killed tree to fully exit so a stale process entry
+                # does not suppress the relaunch below.
+                remaining = _qmt_auto_login_wait_processes_exit(paths["bin_dir"])
+            else:
+                remaining = _qmt_auto_login_processes(paths["bin_dir"])
+            running = remaining
             launch = None
             if not running:
                 launch = _qmt_auto_login_start_xtitclient(paths, use_link=False)
