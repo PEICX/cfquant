@@ -3593,7 +3593,7 @@ class WebRuntimeConfig(object):
             )
 
     def _settings_bool(self, value):
-        return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+        return parse_config_bool(value, False)
 
     def _save_locked(self):
         temp_path = self.path + ".tmp"
@@ -5759,11 +5759,7 @@ class LttxWebRouteServer(object):
                 safe_print("cfquant quote cleanup failed: %s" % error)
         tx = self.tx
         self.tx = None
-        if tx is not None:
-            try:
-                tx.close()
-            except Exception:
-                pass
+        close_quietly(tx)
 
     def publish_registry(self, force=False):
         tx = self.tx
@@ -5809,11 +5805,7 @@ class LttxWebRouteServer(object):
             finally:
                 if self.tx is tx:
                     self.tx = None
-                if tx is not None:
-                    try:
-                        tx.close()
-                    except Exception:
-                        pass
+                close_quietly(tx)
 
     def _handle_raw(self, raw):
         msg = loads_message(raw)
@@ -6960,11 +6952,7 @@ class CallbackEventStore(object):
         self._pipe_clients = {}
         tx = self._tx
         self._tx = None
-        if tx is not None:
-            try:
-                tx.close()
-            except Exception:
-                pass
+        close_quietly(tx)
 
     def refresh_channels(self, channels):
         channels = channels or callback_channels()
@@ -8829,17 +8817,7 @@ class CfquantUpdater(object):
         return {"method": method, "url": url, "bytes": len(data)}
 
     def _parse_github_repo(self, repo_url):
-        value = str(repo_url or "").strip()
-        value = re.sub(r"\.git$", "", value)
-        patterns = [
-            r"github\.com[:/]+([^/\s]+)/([^/\s#?]+)",
-            r"^([^/\s]+)/([^/\s#?]+)$",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, value)
-            if match:
-                return match.group(1), match.group(2)
-        raise ValueError("无法识别 GitHub 仓库地址: %s" % repo_url)
+        return _parse_github_repo_name(repo_url)
 
     def _safe_extract_zip(self, zip_path, output_dir):
         os.makedirs(output_dir, exist_ok=True)
@@ -9086,13 +9064,7 @@ class CfquantUpdater(object):
     def _remove_tree(self, path):
         if not path or not os.path.exists(path):
             return
-        def onerror(func, failed_path, exc_info):
-            try:
-                os.chmod(failed_path, stat.S_IWRITE)
-                func(failed_path)
-            except Exception:
-                raise
-        shutil.rmtree(path, onerror=onerror)
+        shutil.rmtree(path, onerror=_rmtree_onerror)
 
     def _timestamp(self):
         return time.strftime("%Y%m%d_%H%M%S")
@@ -10003,13 +9975,7 @@ class CfquantProjectUpdater(object):
             os.remove(path)
             return
         if os.path.isdir(path):
-            def onerror(func, failed_path, exc_info):
-                try:
-                    os.chmod(failed_path, stat.S_IWRITE)
-                    func(failed_path)
-                except Exception:
-                    raise
-            shutil.rmtree(path, onerror=onerror)
+            shutil.rmtree(path, onerror=_rmtree_onerror)
 
     def _backup_root(self):
         return os.path.join(PROJECT_UPDATE_DIR, "backups")
@@ -12318,7 +12284,24 @@ def parse_sections(value):
 
 
 def parse_bool(value):
-    return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    return parse_config_bool(value, False)
+
+
+def _rmtree_onerror(func, failed_path, exc_info):
+    try:
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+    except Exception:
+        raise
+
+
+def close_quietly(tx):
+    """Close an LTtx client, ignoring shutdown-time errors."""
+    if tx is not None:
+        try:
+            tx.close()
+        except Exception:
+            pass
 
 
 def request_timeout_value(value, default=12.0, minimum=0.5, maximum=180.0):
@@ -13740,6 +13723,22 @@ def submit_cftrader_order(body, method):
                 latency_ms=round((time.perf_counter() - started) * 1000, 3))
 
 
+def resolve_order_action_alias(source, account_type):
+    """First order-action alias present in source (body or single order row)."""
+    return (
+        source.get("order_action")
+        or source.get("future_action")
+        or source.get("future_business")
+        or source.get("stock_option_action")
+        or source.get("future_option_action")
+        or source.get("option_action")
+        or source.get("option_business")
+        or source.get("derivative_action")
+        or (source.get("business_type") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
+        or (source.get("action") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
+    )
+
+
 def submit_order(body, credit_only=False, asynchronous=False):
     account_id = str(body.get("account_id") or "").strip()
     account_type = normalize_account_type(body.get("account_type") or ("CREDIT" if credit_only else "STOCK"))
@@ -13752,18 +13751,7 @@ def submit_order(body, credit_only=False, asynchronous=False):
     validate_connect_order({"stock_code": stock_code}, account_type)
     side = str(body.get("side") or "").strip().lower()
     credit_action = body.get("credit_action") or body.get("credit_business") or body.get("action")
-    order_action = (
-        body.get("order_action")
-        or body.get("future_action")
-        or body.get("future_business")
-        or body.get("stock_option_action")
-        or body.get("future_option_action")
-        or body.get("option_action")
-        or body.get("option_business")
-        or body.get("derivative_action")
-        or (body.get("business_type") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
-        or (body.get("action") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
-    )
+    order_action = resolve_order_action_alias(body, account_type)
     price = float(body.get("price"))
     volume = int(body.get("volume"))
     price_type = int(body.get("price_type") or FIX_PRICE)
@@ -13927,18 +13915,7 @@ def submit_batch_orders(body, credit_only=False):
     expected = "BATCH %s" % len(raw_orders)
     if confirm_text != expected:
         raise ValueError("confirmation mismatch, expected: %s" % expected)
-    body_order_action = (
-        body.get("order_action")
-        or body.get("future_action")
-        or body.get("future_business")
-        or body.get("stock_option_action")
-        or body.get("future_option_action")
-        or body.get("option_action")
-        or body.get("option_business")
-        or body.get("derivative_action")
-        or (body.get("business_type") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
-        or (body.get("action") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
-    )
+    body_order_action = resolve_order_action_alias(body, account_type)
     orders = []
     for index, row in enumerate(raw_orders):
         if not isinstance(row, dict):
@@ -13951,19 +13928,7 @@ def submit_batch_orders(body, credit_only=False):
             or body.get("credit_business")
             or body.get("action")
         )
-        row_order_action = (
-            row.get("order_action")
-            or row.get("future_action")
-            or row.get("future_business")
-            or row.get("stock_option_action")
-            or row.get("future_option_action")
-            or row.get("option_action")
-            or row.get("option_business")
-            or row.get("derivative_action")
-            or (row.get("business_type") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
-            or (row.get("action") if account_type in DERIVATIVE_ACCOUNT_TYPES else None)
-            or body_order_action
-        )
+        row_order_action = resolve_order_action_alias(row, account_type) or body_order_action
         side = str(row.get("side") or body.get("side") or ("buy" if account_type != "CREDIT" else "")).strip().lower()
         if account_type == "STOCK" and side not in ("buy", "sell"):
             raise ValueError("orders[%s].side must be buy or sell" % index)
@@ -15095,11 +15060,7 @@ def read_lttx_runtime_report(bridge_id=None):
     except Exception:
         return None
     finally:
-        if tx is not None:
-            try:
-                tx.close()
-            except Exception:
-                pass
+        close_quietly(tx)
 
 
 def read_qmt_runtime_marker_reports(bridge_id=None):
@@ -15317,12 +15278,16 @@ _LOCAL_VERSION_CACHE_LOCK = threading.RLock()
 def _local_project_version_info():
     # Reads the changelog (hundreds of lines) + version.py on every call and
     # feeds polled endpoints (/api/config, /api/version); cache briefly. The
-    # cache is keyed on version.py's mtime/size so an update that lands new
-    # files invalidates it immediately (ensure_latest must see the new version).
+    # cache is keyed on version.py's content (mtime/size/digest) so an update
+    # that lands new files invalidates it immediately (ensure_latest must see
+    # the new version). Content is part of the key because shutil.copy2
+    # preserves source mtimes and same-length version strings would otherwise
+    # collide after an in-place project update.
     changelog_path = os.path.join(BASE_DIR, "docs", "版本日志.md")
+    version_text = _read_text_file(CORE_VERSION_PATH)
     try:
         stat = os.stat(CORE_VERSION_PATH)
-        cache_key = (stat.st_mtime_ns, stat.st_size)
+        cache_key = (stat.st_mtime_ns, stat.st_size, hashlib.sha256(version_text.encode("utf-8", "replace")).hexdigest())
     except OSError:
         cache_key = None
     with _LOCAL_VERSION_CACHE_LOCK:
@@ -16660,21 +16625,31 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             return True
         return self._api_key_valid(parsed)
 
+    def _read_multipart_upload(self, max_bytes, too_large_prefix="upload"):
+        """Shared multipart preflight: content-type/length checks + body parse.
+
+        Returns (fields, files) or None after writing the error response.
+        """
+        content_type = self.headers.get("Content-Type") or ""
+        if "multipart/form-data" not in content_type.lower():
+            self._write_json(fail("multipart/form-data is required", 400), status=400)
+            return None
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._write_json(fail("empty upload", 400), status=400)
+            return None
+        if length > max_bytes:
+            self._write_json(fail("%s too large: %s bytes" % (too_large_prefix, length), 400), status=400)
+            return None
+        raw = self.rfile.read(length)
+        return self._parse_multipart(content_type, raw)
+
     def _handle_update_upload(self, parsed):
         try:
-            content_type = self.headers.get("Content-Type") or ""
-            if "multipart/form-data" not in content_type.lower():
-                self._write_json(fail("multipart/form-data is required", 400), status=400)
+            upload = self._read_multipart_upload(UPDATE_UPLOAD_MAX_BYTES)
+            if upload is None:
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0:
-                self._write_json(fail("empty upload", 400), status=400)
-                return
-            if length > UPDATE_UPLOAD_MAX_BYTES:
-                self._write_json(fail("upload too large: %s bytes" % length, 400), status=400)
-                return
-            raw = self.rfile.read(length)
-            fields, files = self._parse_multipart(content_type, raw)
+            fields, files = upload
             bridge_id = normalize_bridge_id(fields.get("bridge_id") or DEFAULT_BRIDGE_ID)
             bridge = bridge_config(bridge_id)
             qmt_process_preflight(body={
@@ -16697,19 +16672,10 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
 
     def _handle_project_update_upload(self, parsed):
         try:
-            content_type = self.headers.get("Content-Type") or ""
-            if "multipart/form-data" not in content_type.lower():
-                self._write_json(fail("multipart/form-data is required", 400), status=400)
+            upload = self._read_multipart_upload(UPDATE_UPLOAD_MAX_BYTES)
+            if upload is None:
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0:
-                self._write_json(fail("empty upload", 400), status=400)
-                return
-            if length > UPDATE_UPLOAD_MAX_BYTES:
-                self._write_json(fail("upload too large: %s bytes" % length, 400), status=400)
-                return
-            raw = self.rfile.read(length)
-            fields, files = self._parse_multipart(content_type, raw)
+            fields, files = upload
             file_item = files.get("file") or files.get("zip")
             if not file_item:
                 self._write_json(fail("file is required", 400), status=400)
@@ -16735,19 +16701,10 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
 
     def _handle_avatar_upload(self, parsed):
         try:
-            content_type = self.headers.get("Content-Type") or ""
-            if "multipart/form-data" not in content_type.lower():
-                self._write_json(fail("multipart/form-data is required", 400), status=400)
+            upload = self._read_multipart_upload(AVATAR_UPLOAD_MAX_BYTES, too_large_prefix="avatar upload")
+            if upload is None:
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0:
-                self._write_json(fail("empty upload", 400), status=400)
-                return
-            if length > AVATAR_UPLOAD_MAX_BYTES:
-                self._write_json(fail("avatar upload too large: %s bytes" % length, 400), status=400)
-                return
-            raw = self.rfile.read(length)
-            fields, files = self._parse_multipart(content_type, raw)
+            fields, files = upload
             file_item = files.get("file") or files.get("avatar")
             if not file_item:
                 self._write_json(fail("file is required", 400), status=400)
@@ -17031,19 +16988,20 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._write_json(fail(e, 400), status=400)
 
-    def _handle_ws_callbacks(self, parsed):
+    def _upgrade_websocket(self, parsed):
+        """Auth check + HTTP 101 websocket upgrade. Returns True when upgraded."""
         if not self._authorized(parsed):
             self.send_response(401)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(fail("invalid credentials", 401), ensure_ascii=False).encode("utf-8"))
-            return
+            return False
         key = self.headers.get("Sec-WebSocket-Key")
         upgrade = (self.headers.get("Upgrade") or "").lower()
         if upgrade != "websocket" or not key:
             self.send_response(400)
             self.end_headers()
-            return
+            return False
         accept = base64.b64encode(
             hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
         ).decode("ascii")
@@ -17052,6 +17010,11 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
+        return True
+
+    def _handle_ws_callbacks(self, parsed):
+        if not self._upgrade_websocket(parsed):
+            return
 
         query = urllib.parse.parse_qs(parsed.query)
         account_id = (query.get("account_id") or [""])[0]
@@ -17129,26 +17092,8 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _handle_ws_quotes(self, parsed):
-        if not self._authorized(parsed):
-            self.send_response(401)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(fail("invalid credentials", 401), ensure_ascii=False).encode("utf-8"))
+        if not self._upgrade_websocket(parsed):
             return
-        key = self.headers.get("Sec-WebSocket-Key")
-        upgrade = (self.headers.get("Upgrade") or "").lower()
-        if upgrade != "websocket" or not key:
-            self.send_response(400)
-            self.end_headers()
-            return
-        accept = base64.b64encode(
-            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
-        ).decode("ascii")
-        self.send_response(101)
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
-        self.send_header("Sec-WebSocket-Accept", accept)
-        self.end_headers()
 
         query = urllib.parse.parse_qs(parsed.query)
         subscribe_id = (query.get("subscribe_id") or [""])[0]
