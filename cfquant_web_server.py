@@ -10929,7 +10929,8 @@ def qmt_update_preflight(body=None, rows=None):
     return qmt_process_preflight(body=body)
 
 
-def stop_qmt_processes_for_request(body):
+def _qmt_process_targets_from_request(body):
+    """Normalize the /api/qmt/processes/* targets field into configured dirs."""
     body = body or {}
     targets = body.get("targets") or []
     if not isinstance(targets, (list, tuple, dict, str, bytes)):
@@ -10938,12 +10939,17 @@ def stop_qmt_processes_for_request(body):
         targets = [{"qmt_dir": targets}]
     if isinstance(targets, dict):
         targets = [targets]
-    results = []
     for target in targets:
         qmt_dir = (target.get("qmt_dir") or target.get("path")) if isinstance(target, dict) else target
         configured = normalize_optional_path(qmt_dir)
         if not configured:
             continue
+        yield configured
+
+
+def stop_qmt_processes_for_request(body):
+    results = []
+    for configured in _qmt_process_targets_from_request(body):
         paths = _qmt_auto_login_paths(configured)
         before = qmt_process_snapshot(configured)
         stop = _qmt_auto_login_stop_xtitclient({}, paths, session={})
@@ -10961,20 +10967,8 @@ def stop_qmt_processes_for_request(body):
 
 
 def start_qmt_processes_for_request(body):
-    body = body or {}
-    targets = body.get("targets") or []
-    if not isinstance(targets, (list, tuple, dict, str, bytes)):
-        raise ValueError("targets must be a list of QMT directories")
-    if isinstance(targets, (str, bytes)):
-        targets = [{"qmt_dir": targets}]
-    if isinstance(targets, dict):
-        targets = [targets]
     results = []
-    for target in targets:
-        qmt_dir = (target.get("qmt_dir") or target.get("path")) if isinstance(target, dict) else target
-        configured = normalize_optional_path(qmt_dir)
-        if not configured:
-            continue
+    for configured in _qmt_process_targets_from_request(body):
         paths = _qmt_auto_login_paths(configured)
         before = qmt_process_snapshot(configured)
         launch = {"started": False, "reason": "target QMT is already running"}
@@ -12295,6 +12289,21 @@ def parse_sections(value):
 
 def parse_bool(value):
     return parse_config_bool(value, False)
+
+
+def query_param(query, key, default=""):
+    """First value of a parse_qs entry, with a default; '' means param absent."""
+    values = query.get(key)
+    return values[0] if values else default
+
+
+def query_param_any(query, keys, default=""):
+    """First present value among alias keys (repo_url/url, ref/branch/tag...)."""
+    for key in keys:
+        values = query.get(key)
+        if values:
+            return values[0]
+    return default
 
 
 def close_quietly(tx):
@@ -16771,9 +16780,9 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/web-auth/status":
                 self._write_json(ok(web_auth_status(self._provided_web_token(parsed))))
             elif parsed.path == "/api/log-files":
-                self._write_json(ok({"files": list_log_files(LOG_DIR, (query.get("date") or [time.strftime("%Y-%m-%d")])[0])}))
+                self._write_json(ok({"files": list_log_files(LOG_DIR, query_param(query, "date", time.strftime("%Y-%m-%d")))}))
             elif parsed.path == "/api/log-file":
-                self._write_json(ok(read_managed_log(LOG_DIR, (query.get("name") or [""])[0])))
+                self._write_json(ok(read_managed_log(LOG_DIR, query_param(query, "name", ""))))
             elif parsed.path == "/api/qmt-scripts/source":
                 raw_names = []
                 for key in ("name", "names", "script"):
@@ -16787,59 +16796,59 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 for key in ("name", "names", "script", "test"):
                     for value in query.get(key) or []:
                         raw_names.extend(part.strip() for part in str(value).split(",") if part.strip())
-                include_source = parse_bool((query.get("source") or ["1"])[0])
+                include_source = parse_bool(query_param(query, "source", "1"))
                 self._write_json(ok({
                     "root": "cfquant/tests",
                     "tests": test_source_catalog(raw_names or None, include_source=include_source),
                 }))
             elif parsed.path == "/api/updates/status":
-                bridge_id = normalize_bridge_id((query.get("bridge_id") or [DEFAULT_BRIDGE_ID])[0])
-                repo_url = (query.get("repo_url") or query.get("url") or [""])[0]
-                ref = (query.get("ref") or query.get("branch") or query.get("tag") or [""])[0]
+                bridge_id = normalize_bridge_id(query_param(query, "bridge_id", DEFAULT_BRIDGE_ID))
+                repo_url = query_param_any(query, ("repo_url", "url"))
+                ref = query_param_any(query, ("ref", "branch", "tag"))
                 self._write_json(ok(bridge_update_status(bridge_id, repo_url=repo_url, ref=ref)))
             elif parsed.path == "/api/project-updates/status":
-                repo_url = (query.get("repo_url") or query.get("url") or [""])[0]
-                ref = (query.get("ref") or query.get("branch") or query.get("tag") or [""])[0]
-                include_remote = parse_bool((query.get("remote") or ["1"])[0])
+                repo_url = query_param_any(query, ("repo_url", "url"))
+                ref = query_param_any(query, ("ref", "branch", "tag"))
+                include_remote = parse_bool(query_param(query, "remote", "1"))
                 self._write_json(ok(project_update_status(
                     repo_url=repo_url,
                     ref=ref,
                     include_remote=include_remote,
-                    force=parse_bool((query.get("force") or ["0"])[0]),
+                    force=parse_bool(query_param(query, "force", "0")),
                 )))
             elif parsed.path == "/api/version":
-                include_remote = parse_bool((query.get("remote") or ["1"])[0])
-                force = parse_bool((query.get("force") or ["0"])[0])
-                repo_url = (query.get("repo_url") or query.get("url") or [""])[0]
-                ref = (query.get("ref") or query.get("branch") or query.get("tag") or [""])[0]
-                bridge_id = (query.get("bridge_id") or [""])[0]
+                include_remote = parse_bool(query_param(query, "remote", "1"))
+                force = parse_bool(query_param(query, "force", "0"))
+                repo_url = query_param_any(query, ("repo_url", "url"))
+                ref = query_param_any(query, ("ref", "branch", "tag"))
+                bridge_id = query_param(query, "bridge_id", "")
                 version_info = project_version_info(
                     include_remote=include_remote,
                     force=force,
                     repo_url=repo_url,
                     ref=ref,
                     bridge_id=bridge_id,
-                    force_remote=parse_bool((query.get("force_remote") or ["0"])[0]),
+                    force_remote=parse_bool(query_param(query, "force_remote", "0")),
                 )
                 version_info["system_info"] = project_system_info(version_info)
                 self._write_json(ok(version_info))
             elif parsed.path == "/api/quotes/latest":
-                since = int((query.get("since") or ["0"])[0] or 0)
-                limit = int((query.get("limit") or ["200"])[0] or 200)
-                subscribe_id = (query.get("subscribe_id") or [""])[0]
+                since = int(query_param(query, "since", "0") or 0)
+                limit = int(query_param(query, "limit", "200") or 200)
+                subscribe_id = query_param(query, "subscribe_id", "")
                 self._write_json(ok({
                     "events": QUOTES.latest(since=since, limit=limit, subscribe_id=subscribe_id),
                     "status": QUOTES.status(),
                 }))
             elif parsed.path == "/api/status":
-                account_id = str((query.get("account_id") or [""])[0] or "").strip()
-                account_type = normalize_account_type((query.get("account_type") or [configured_default_account_type()])[0])
-                account_key = str((query.get("account_key") or [""])[0] or "").strip()
+                account_id = str(query_param(query, "account_id", "") or "").strip()
+                account_type = normalize_account_type(query_param(query, "account_type", configured_default_account_type()))
+                account_key = str(query_param(query, "account_key", "") or "").strip()
                 bridge_id = resolve_bridge_id(
                     account_id=account_id,
                     account_type=account_type,
                     account_key=account_key,
-                    bridge_id=(query.get("bridge_id") or [""])[0],
+                    bridge_id=query_param(query, "bridge_id", ""),
                 )
                 bridge_config(bridge_id)
                 self._write_json(ok(
@@ -16847,24 +16856,24 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     if account_id else STATUS_MONITOR.latest(bridge_id=bridge_id)
                 ))
             elif parsed.path == "/api/qmt/processes":
-                qmt_dir = (query.get("qmt_dir") or query.get("path") or [""])[0]
+                qmt_dir = query_param_any(query, ("qmt_dir", "path"))
                 self._write_json(ok(qmt_process_snapshot(qmt_dir)))
             elif parsed.path == "/api/callbacks":
-                account_id = (query.get("account_id") or [""])[0]
-                account_type = normalize_account_type((query.get("account_type") or ["STOCK"])[0]) if query.get("account_type") else ""
-                account_key = str((query.get("account_key") or [""])[0] or "").strip()
+                account_id = query_param(query, "account_id", "")
+                account_type = normalize_account_type(query_param(query, "account_type", "STOCK")) if query.get("account_type") else ""
+                account_key = str(query_param(query, "account_key", "") or "").strip()
                 bridge_id = resolve_bridge_id(
                     account_id=account_id,
                     account_type=account_type or None,
                     account_key=account_key,
-                    bridge_id=(query.get("bridge_id") or [""])[0],
+                    bridge_id=query_param(query, "bridge_id", ""),
                 )
                 bridge = bridge_config(bridge_id)
-                since = int((query.get("since") or ["0"])[0] or 0)
-                limit = int((query.get("limit") or ["200"])[0] or 200)
-                event_name = (query.get("event") or [""])[0]
-                event_prefix = (query.get("event_prefix") or [""])[0]
-                job_id = (query.get("job_id") or [""])[0]
+                since = int(query_param(query, "since", "0") or 0)
+                limit = int(query_param(query, "limit", "200") or 200)
+                event_name = query_param(query, "event", "")
+                event_prefix = query_param(query, "event_prefix", "")
+                job_id = query_param(query, "job_id", "")
                 self._write_json(ok({
                     "bridge_id": bridge_id,
                     "account_id": account_id,
@@ -16888,22 +16897,22 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 }))
             elif parsed.path == "/api/account":
                 account_request_started = time.perf_counter()
-                account_id = (query.get("account_id") or [configured_default_account_id()])[0]
-                account_type = normalize_account_type((query.get("account_type") or [configured_default_account_type()])[0])
-                account_key = str((query.get("account_key") or [""])[0] or "").strip()
+                account_id = query_param(query, "account_id", configured_default_account_id())
+                account_type = normalize_account_type(query_param(query, "account_type", configured_default_account_type()))
+                account_key = str(query_param(query, "account_key", "") or "").strip()
                 bridge_id = resolve_bridge_id(
                     account_id=account_id,
                     account_type=account_type,
                     account_key=account_key,
-                    bridge_id=(query.get("bridge_id") or [""])[0],
+                    bridge_id=query_param(query, "bridge_id", ""),
                 )
                 bridge_config(bridge_id)
-                channel = (query.get("channel") or ["normal"])[0]
-                sections = parse_sections((query.get("sections") or [""])[0])
-                force = parse_bool((query.get("force") or ["0"])[0])
-                subscribe = parse_bool((query.get("subscribe") or ["1"])[0])
+                channel = query_param(query, "channel", "normal")
+                sections = parse_sections(query_param(query, "sections", ""))
+                force = parse_bool(query_param(query, "force", "0"))
+                subscribe = parse_bool(query_param(query, "subscribe", "1"))
                 timeout = request_timeout_value(
-                    (query.get("timeout") or [""])[0],
+                    query_param(query, "timeout", ""),
                     default=ACCOUNT_QUERY_TIMEOUT_SECONDS,
                     maximum=max(ACCOUNT_QUERY_TIMEOUT_SECONDS, 180.0),
                 )
@@ -16962,17 +16971,17 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             return
 
         query = urllib.parse.parse_qs(parsed.query)
-        account_id = (query.get("account_id") or [""])[0]
-        account_type = normalize_account_type((query.get("account_type") or ["STOCK"])[0]) if query.get("account_type") else ""
-        account_key = str((query.get("account_key") or [""])[0] or "").strip()
-        event_name = (query.get("event") or [""])[0]
-        event_prefix = (query.get("event_prefix") or [""])[0]
-        job_id = (query.get("job_id") or [""])[0]
+        account_id = query_param(query, "account_id")
+        account_type = normalize_account_type(query_param(query, "account_type", "STOCK")) if query.get("account_type") else ""
+        account_key = str(query_param(query, "account_key") or "").strip()
+        event_name = query_param(query, "event")
+        event_prefix = query_param(query, "event_prefix")
+        job_id = query_param(query, "job_id")
         bridge_id = resolve_bridge_id(
             account_id=account_id,
             account_type=account_type or None,
             account_key=account_key,
-            bridge_id=(query.get("bridge_id") or [""])[0],
+            bridge_id=query_param(query, "bridge_id"),
         ) if account_id or account_key or query.get("bridge_id") else ""
         client = WebSocketCallbackClient(
             self.request,
