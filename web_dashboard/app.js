@@ -1401,6 +1401,21 @@ function setBindingQmtGuideCheckBusy(busy) {
   }
 }
 
+function openModalOverlay(overlay) {
+  if (!overlay) return;
+  overlay.classList.remove('hidden');
+  overlay.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('binding-dialog-open');
+}
+
+function closeModalOverlay(overlay) {
+  if (overlay) {
+    overlay.classList.add('hidden');
+    overlay.setAttribute('aria-hidden', 'true');
+  }
+  document.body.classList.remove('binding-dialog-open');
+}
+
 function finishBindingQmtGuide() {
   closeBindingQmtGuide();
 }
@@ -1412,9 +1427,7 @@ function closeBindingQmtGuide() {
   state.bindingQmtGuideContext = '';
   state.bindingQmtGuideCheckToken += 1;
   setBindingQmtGuideCheckBusy(false);
-  overlay.classList.add('hidden');
-  overlay.setAttribute('aria-hidden', 'true');
-  document.body.classList.remove('binding-dialog-open');
+  closeModalOverlay(overlay);
 }
 
 async function checkBindingQmtConnection() {
@@ -1429,11 +1442,12 @@ async function checkBindingQmtConnection() {
   setBindingQmtGuideCheckBusy(true);
   renderBindingQmtLoginCheck(null, null);
   try {
-    const params = new URLSearchParams();
-    params.set('account_id', values.account_id);
-    params.set('account_type', values.account_type || 'STOCK');
-    if (values.account_key) params.set('account_key', values.account_key);
-    params.set('bridge_id', values.bridge_id || bridgeIdForAccount(values.account_id, values.account_type) || selectedBridge());
+    const params = accountQueryParams({
+      accountId: values.account_id,
+      accountType: values.account_type || 'STOCK',
+      accountKey: values.account_key || '',
+      bridgeId: values.bridge_id || bridgeIdForAccount(values.account_id, values.account_type) || selectedBridge(),
+    });
     const data = await api(`/api/status?${params.toString()}`);
     if (checkToken !== state.bindingQmtGuideCheckToken
         || state.bindingQmtGuideValues !== values) return;
@@ -1495,13 +1509,11 @@ function showBindingQmtGuide(values, deploy, options = {}) {
     `<div class="binding-qmt-status-row is-info"><strong>${esc(target.role)}</strong><span><code>${esc(target.qmt_dir || '未填写 QMT 目录')}</code></span></div>`
   ).join('');
   renderBindingQmtLoginCheck(null, null);
-  overlay.classList.remove('hidden');
-  overlay.setAttribute('aria-hidden', 'false');
+  openModalOverlay(overlay);
   const dialog = overlay.querySelector('.binding-qmt-guide-dialog');
   if (dialog) dialog.scrollTop = 0;
   const loginReminder = $('bindingQmtLoginReminder');
   if (loginReminder) loginReminder.textContent = QMT_LOGIN_REMINDER;
-  document.body.classList.add('binding-dialog-open');
   renderBindingQmtAutoLoginStatus(state.bindingQmtGuideAutoLogin);
   window.setTimeout(() => {
     const close = $('closeBindingQmtGuideBtn');
@@ -3999,9 +4011,7 @@ function returnFromBindingQmtGuide() {
   const values = state.bindingQmtGuideValues || {};
   const context = state.bindingQmtGuideContext || 'binding';
   if (!overlay || !values.account_id) return;
-  overlay.classList.add('hidden');
-  overlay.setAttribute('aria-hidden', 'true');
-  document.body.classList.remove('binding-dialog-open');
+  closeModalOverlay(overlay);
   state.bindingQmtGuideCheckToken += 1;
   setBindingQmtGuideCheckBusy(false);
   state.bindingQmtGuideContext = '';
@@ -6548,10 +6558,10 @@ function projectReloadProgressText(data, actionText) {
   return `${actionText}${version}。${installText}${deployText} 请完全退出并重启 QMT 加载新版本。`;
 }
 
-function uploadProjectUpdateZip(formData, onProgress) {
+function uploadZipViaXhr(url, errPrefix, formData, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/project-updates/upload');
+    xhr.open('POST', url);
     Object.entries(authHeaders()).forEach(([key, value]) => {
       if (value !== undefined && value !== null && value !== '') xhr.setRequestHeader(key, value);
     });
@@ -6564,7 +6574,7 @@ function uploadProjectUpdateZip(formData, onProgress) {
       try {
         payload = JSON.parse(xhr.responseText || '{}');
       } catch (error) {
-        reject(new Error(`项目更新接口返回无法解析：${error.message}`));
+        reject(new Error(`${errPrefix}接口返回无法解析：${error.message}`));
         return;
       }
       if (xhr.status === 401 && webAuthEnabled()) {
@@ -6577,10 +6587,14 @@ function uploadProjectUpdateZip(formData, onProgress) {
       }
       resolve(payload.data);
     };
-    xhr.onerror = () => reject(new Error('上传项目 zip 更新请求失败'));
-    xhr.onabort = () => reject(new Error('上传项目 zip 更新请求已中断'));
+    xhr.onerror = () => reject(new Error(`上传${errPrefix}请求失败`));
+    xhr.onabort = () => reject(new Error(`上传${errPrefix}请求已中断`));
     xhr.send(formData);
   });
+}
+
+function uploadProjectUpdateZip(formData, onProgress) {
+  return uploadZipViaXhr('/api/project-updates/upload', '项目 zip 更新', formData, onProgress);
 }
 
 async function refreshProjectUpdateStatus(options = {}) {
@@ -6622,16 +6636,12 @@ function showUpdateConfirm(message, title = '确认更新', accept = '确认更�
   $('updateConfirmTitle').textContent = title;
   $('updateConfirmMessage').textContent = message;
   $('updateConfirmAcceptBtn').textContent = accept;
-  overlay.classList.remove('hidden');
-  overlay.setAttribute('aria-hidden', 'false');
-  document.body.classList.add('binding-dialog-open');
+  openModalOverlay(overlay);
   return new Promise((resolve) => { state.updateConfirmResolver = resolve; });
 }
 
 function closeUpdateConfirm(result) {
-  const overlay = $('updateConfirmOverlay');
-  if (overlay) { overlay.classList.add('hidden'); overlay.setAttribute('aria-hidden', 'true'); }
-  document.body.classList.remove('binding-dialog-open');
+  closeModalOverlay($('updateConfirmOverlay'));
   const resolver = state.updateConfirmResolver;
   state.updateConfirmResolver = null;
   if (resolver) resolver(!!result);
@@ -6960,38 +6970,7 @@ async function refreshUpdateStatus(options = {}) {
 }
 
 function uploadQmtCoreZip(formData, onProgress) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/updates/upload');
-    Object.entries(authHeaders()).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') xhr.setRequestHeader(key, value);
-    });
-    xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable || typeof onProgress !== 'function') return;
-      onProgress(event.loaded, event.total);
-    };
-    xhr.onload = () => {
-      let payload = null;
-      try {
-        payload = JSON.parse(xhr.responseText || '{}');
-      } catch (error) {
-        reject(new Error(`更新接口返回无法解析：${error.message}`));
-        return;
-      }
-      if (xhr.status === 401 && webAuthEnabled()) {
-        clearWebAuthToken();
-        showWebAuthOverlay('请先登录');
-      }
-      if (!payload.ok) {
-        reject(new Error((payload && payload.error) || `HTTP ${xhr.status}`));
-        return;
-      }
-      resolve(payload.data);
-    };
-    xhr.onerror = () => reject(new Error('上传 zip 更新请求失败'));
-    xhr.onabort = () => reject(new Error('上传 zip 更新请求已中断'));
-    xhr.send(formData);
-  });
+  return uploadZipViaXhr('/api/updates/upload', 'zip 更新', formData, onProgress);
 }
 
 async function runGithubUpdateFromUi() {
@@ -9495,9 +9474,7 @@ function closeBindingDialog() {
   const overlay = $('bindingDialogOverlay');
   if (!overlay) return;
   closeHelpTooltips();
-  overlay.classList.add('hidden');
-  overlay.setAttribute('aria-hidden', 'true');
-  document.body.classList.remove('binding-dialog-open');
+  closeModalOverlay(overlay);
 }
 
 function fillBindingForm(values = {}) {
@@ -9570,9 +9547,7 @@ function openBindingDialog(options = {}) {
   if (hint) {
     hint.textContent = bridgeId ? `内部通道：${bridgeId}` : '保存后自动分配内部通道';
   }
-  overlay.classList.remove('hidden');
-  overlay.setAttribute('aria-hidden', 'false');
-  document.body.classList.add('binding-dialog-open');
+  openModalOverlay(overlay);
   window.setTimeout(() => form.account_id && form.account_id.focus(), 0);
 }
 
@@ -9727,12 +9702,7 @@ async function checkBindingQmtProcesses(targets = bindingQmtProcessTargetsFromFo
 }
 
 function closeBindingQmtProcessPrompt(result) {
-  const overlay = $('bindingQmtProcessOverlay');
-  if (overlay) {
-    overlay.classList.add('hidden');
-    overlay.setAttribute('aria-hidden', 'true');
-  }
-  document.body.classList.remove('binding-dialog-open');
+  closeModalOverlay($('bindingQmtProcessOverlay'));
   const resolver = state.bindingQmtProcessResolver;
   state.bindingQmtProcessResolver = null;
   state.bindingQmtProcessPromptResults = [];
@@ -9756,9 +9726,7 @@ function showBindingQmtProcessPrompt(results, options = {}) {
   if (cancelButton) cancelButton.textContent = updating ? '取消更新' : '取消保存';
   state.bindingQmtProcessPromptResults = results || [];
   if (status) status.textContent = results.filter((item) => item.running).map((item) => `${item.label || 'QMT'}：PID ${item.pids.join(', ')}`).join('；');
-  overlay.classList.remove('hidden');
-  overlay.setAttribute('aria-hidden', 'false');
-  document.body.classList.add('binding-dialog-open');
+  openModalOverlay(overlay);
   return new Promise((resolve) => { state.bindingQmtProcessResolver = resolve; });
 }
 
@@ -10761,11 +10729,7 @@ async function refreshStatus() {
   const lttxPromise = refreshLttxStatus({ log: false });
   const transportPromise = refreshTransport();
   try {
-    const params = new URLSearchParams();
-    params.set('account_id', selectedAccount());
-    params.set('account_type', selectedAccountType());
-    params.set('account_key', selectedAccountKey());
-    params.set('bridge_id', selectedBridge());
+    const params = accountQueryParams();
     const data = await api(`/api/status?${params.toString()}`);
     state.bridgeStatus = data;
     const lttx = await lttxPromise;
@@ -10895,6 +10859,21 @@ function selectedBridge() {
   localStorage.setItem('cfquant.bridge_id', bridgeId);
   state.bridgeId = bridgeId;
   return bridgeId;
+}
+
+function accountQueryParams(extra = {}) {
+  const params = new URLSearchParams();
+  params.set('bridge_id', extra.bridgeId !== undefined ? extra.bridgeId : selectedBridge());
+  params.set('account_id', extra.accountId !== undefined ? extra.accountId : selectedAccount());
+  params.set('account_type', extra.accountType !== undefined ? extra.accountType : selectedAccountType());
+  const accountKey = extra.accountKey !== undefined ? extra.accountKey : selectedAccountKey();
+  if (accountKey) params.set('account_key', accountKey);
+  Object.entries(extra).forEach(([key, value]) => {
+    if (['bridgeId', 'accountId', 'accountType', 'accountKey'].includes(key)) return;
+    if (value === undefined || value === null || value === false) return;
+    params.set(key, value === true ? '1' : String(value));
+  });
+  return params;
 }
 
 function selectedChannel() {
@@ -11671,12 +11650,7 @@ function connectOrderCallbackSocket(options = {}) {
   if (!options.force && state.orderCallbackSocket && state.orderCallbackKey === socketKey) return;
   closeOrderCallbackSocket();
 
-  const params = new URLSearchParams();
-  params.set('bridge_id', bridgeId);
-  params.set('account_id', accountId);
-  params.set('account_type', accountType);
-  if (accountKey) params.set('account_key', accountKey);
-  params.set('event_prefix', 'trader:');
+  const params = accountQueryParams({ bridgeId, accountId, accountType, accountKey, event_prefix: 'trader:' });
   const socket = new WebSocket(apiWsUrl(`/ws/callbacks?${params.toString()}`));
   state.orderCallbackSocket = socket;
   state.orderCallbackKey = socketKey;
@@ -11719,15 +11693,7 @@ function restartOrderCallbackSocket() {
 
 async function refreshCallbacks() {
   try {
-    const params = new URLSearchParams();
-    params.set('bridge_id', selectedBridge());
-    params.set('account_id', selectedAccount());
-    params.set('account_type', selectedAccountType());
-    const accountKey = selectedAccountKey();
-    if (accountKey) params.set('account_key', accountKey);
-    params.set('event_prefix', 'trader:');
-    params.set('since', state.callbackSeq);
-    params.set('limit', 200);
+    const params = accountQueryParams({ event_prefix: 'trader:', since: state.callbackSeq, limit: 200 });
     const payload = await api(`/api/callbacks?${params.toString()}`);
     const events = payload.events || [];
     if (!events.length) return;
@@ -11810,17 +11776,17 @@ async function refreshAccount(sections = 'asset,positions', options = {}) {
     log('账号为空');
     return;
   }
-  const params = new URLSearchParams();
-  params.set('bridge_id', selectedBridge());
-  params.set('account_id', accountId);
-  params.set('account_type', accountType);
-  if (accountKey) params.set('account_key', accountKey);
-  params.set('channel', channel);
-  params.set('sections', sections);
-  if (options.force) params.set('force', '1');
-  if (options.subscribe === false) params.set('subscribe', '0');
-  // orders/trades 全表查询在大委托表下可超过默认 30s，允许调用方指定更宽松的超时。
-  if (options.timeout) params.set('timeout', String(options.timeout));
+  const params = accountQueryParams({
+    accountId,
+    accountType,
+    accountKey,
+    channel,
+    sections,
+    force: options.force ? '1' : undefined,
+    subscribe: options.subscribe === false ? '0' : undefined,
+    // orders/trades 全表查询在大委托表下可超过默认 30s，允许调用方指定更宽松的超时。
+    timeout: options.timeout || undefined,
+  });
   const data = await api(`/api/account?${params.toString()}`);
   if (selectedAccount() !== accountId || selectedAccountType() !== accountType || selectedAccountKey() !== accountKey) return;
   if (data.asset) {
@@ -12763,11 +12729,12 @@ async function refreshOnboardingBridge() {
       );
       syncOnboardingBindingFlowControls();
       try {
-        const params = new URLSearchParams();
-        params.set('account_id', values.account_id);
-        params.set('account_type', values.account_type);
-        if (values.account_key) params.set('account_key', values.account_key);
-        params.set('bridge_id', bridgeIdForAccount(values.account_id, values.account_type) || selectedBridge());
+        const params = accountQueryParams({
+          accountId: values.account_id,
+          accountType: values.account_type,
+          accountKey: values.account_key || '',
+          bridgeId: bridgeIdForAccount(values.account_id, values.account_type) || selectedBridge(),
+        });
         const data = await api(`/api/status?${params.toString()}`);
         if (!state.onboardingBindingFlowActive || token !== state.onboardingBridgeCheckToken) return;
         state.bridgeStatus = data;
@@ -12852,15 +12819,15 @@ async function verifyOnboardingData() {
   setOnboardingStatus('onboardingDataStatus', '正在查询资金和持仓...', 'busy');
   try {
     const channel = selectedChannel();
-    const bridgeId = bridgeIdForAccount(values.account_id, values.account_type) || selectedBridge();
-    const params = new URLSearchParams();
-    params.set('bridge_id', bridgeId);
-    params.set('account_id', values.account_id);
-    params.set('account_type', values.account_type);
-    if (values.account_key) params.set('account_key', values.account_key);
-    params.set('channel', channel);
-    params.set('sections', 'asset,positions');
-    params.set('force', '1');
+    const params = accountQueryParams({
+      accountId: values.account_id,
+      accountType: values.account_type,
+      accountKey: values.account_key || '',
+      bridgeId: bridgeIdForAccount(values.account_id, values.account_type) || selectedBridge(),
+      channel,
+      sections: 'asset,positions',
+      force: '1',
+    });
     const data = await api(`/api/account?${params.toString()}`);
     renderOnboardingDataSummary(data);
     if (data.asset && data.asset.ok) renderAsset(data.asset);
