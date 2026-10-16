@@ -16212,6 +16212,73 @@ def download_financial_data(body):
 class CfquantWebHandler(BaseHTTPRequestHandler):
     server_version = WEB_VERSION
 
+    # 纯直通 POST 路由：请求体处理后 ok() 回包，无额外副作用。
+    # 函数引用在类定义时求值；处理器内部再按模块名调用下游函数，
+    # 因此测试 monkeypatch 模块级函数仍然生效。
+    POST_HANDLERS = {
+        "/api/order": submit_order,
+        "/api/order_async": submit_async_order,
+        "/api/credit/order": submit_credit_order,
+        "/api/credit/order_async": submit_credit_async_order,
+        "/api/future/order": submit_future_order,
+        "/api/future/order_async": lambda body: submit_typed_async_order(body, "FUTURE"),
+        "/api/future-option/order": submit_future_option_order,
+        "/api/future-option/order_async": lambda body: submit_typed_async_order(body, "FUTURE_OPTION"),
+        "/api/stock-option/order": submit_stock_option_order,
+        "/api/stock-option/order_async": lambda body: submit_typed_async_order(body, "STOCK_OPTION"),
+        "/api/orders/batch": submit_batch_orders,
+        "/api/credit/orders/batch": submit_credit_batch_orders,
+        "/api/future/orders/batch": submit_future_batch_orders,
+        "/api/future-option/orders/batch": submit_future_option_batch_orders,
+        "/api/stock-option/orders/batch": submit_stock_option_batch_orders,
+        "/api/cancel": cancel_order,
+        "/api/credit/query": query_credit_account,
+        "/api/credit/probe": probe_credit_account,
+        "/api/apikey": save_api_key,
+        "/api/user-profile": save_user_profile,
+        "/api/transport": save_transport,
+        "/api/pipe-hub/start": lambda body: start_pipe_hub(),
+        "/api/pipe-hub/stop": lambda body: stop_pipe_hub(),
+        "/api/log-cleanup": save_log_cleanup_settings,
+        "/api/qmt-log-language": save_qmt_log_language,
+        "/api/python-environment": save_python_environment,
+        "/api/log-cleanup/run": run_log_cleanup,
+        "/api/updates/github": bridge_update_github,
+        "/api/updates/official": bridge_update_official,
+        "/api/updates/rollback": bridge_update_rollback,
+        "/api/quotes/whole/subscribe": subscribe_whole_quote,
+        "/api/quotes/subscribe": subscribe_single_quote,
+        "/api/quotes/unsubscribe": unsubscribe_quote,
+        "/api/data/full-tick": get_full_tick,
+        "/api/data/market": lambda body: get_market_data(body, ex=False),
+        "/api/data/market-ex": lambda body: get_market_data(body, ex=True),
+        "/api/data/instrument": get_instrument_detail,
+        "/api/data/sector": get_stock_list_in_sector,
+        "/api/data/divid-factors": get_divid_factors,
+        "/api/data/trading-dates": get_trading_dates,
+        "/api/python/xtdata": python_xtdata_request,
+        "/api/data/history/download": download_history_data,
+        "/api/data/financial": get_financial_data,
+        "/api/data/financial/download": download_financial_data,
+        "/api/trade/export-data": export_trade_data,
+        "/api/lttx/start": lambda body: start_lttx_server(),
+        "/api/lttx/stop": lambda body: stop_lttx_server(full_exit=parse_bool(body.get("full_exit"))),
+        "/api/web-auth/reset-password": lambda body: WEB_CONFIG.reset_web_auth_password(),
+        "/api/bridges": save_bridge_config,
+        "/api/bridges/delete": delete_bridge_config,
+        "/api/account-pairs": save_account_pair,
+        "/api/account-pairs/delete": delete_account_pair,
+        "/api/account-pairs/verify": verify_account_pair,
+        "/api/account-config": save_account_runtime_config,
+        "/api/qmt/processes/stop": stop_qmt_processes_for_request,
+        "/api/qmt/processes/start": start_qmt_processes_for_request,
+        "/api/qmt-auto-login/complete": complete_qmt_auto_login,
+        "/api/account-config/update-core": update_account_qmt_core,
+        "/api/account-config/delete": delete_account_runtime_config,
+        "/api/setup/reset": reset_web_setup,
+        "/api/setup/data-provider": set_data_provider,
+    }
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if not self._request_allowed():
@@ -16296,45 +16363,12 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path.startswith("/api/cftrader/"):
                 self._write_json(ok(submit_cftrader_order(body, parsed.path.rsplit("/", 1)[-1])))
-            elif parsed.path == "/api/order":
-                self._write_json(ok(submit_order(body)))
-            elif parsed.path == "/api/order_async":
-                self._write_json(ok(submit_async_order(body)))
-            elif parsed.path == "/api/credit/order":
-                self._write_json(ok(submit_credit_order(body)))
-            elif parsed.path == "/api/credit/order_async":
-                self._write_json(ok(submit_credit_async_order(body)))
-            elif parsed.path == "/api/future/order":
-                self._write_json(ok(submit_future_order(body)))
-            elif parsed.path == "/api/future/order_async":
-                self._write_json(ok(submit_typed_async_order(body, "FUTURE")))
-            elif parsed.path == "/api/future-option/order":
-                self._write_json(ok(submit_future_option_order(body)))
-            elif parsed.path == "/api/future-option/order_async":
-                self._write_json(ok(submit_typed_async_order(body, "FUTURE_OPTION")))
-            elif parsed.path == "/api/stock-option/order":
-                self._write_json(ok(submit_stock_option_order(body)))
-            elif parsed.path == "/api/stock-option/order_async":
-                self._write_json(ok(submit_typed_async_order(body, "STOCK_OPTION")))
-            elif parsed.path == "/api/orders/batch":
-                self._write_json(ok(submit_batch_orders(body)))
-            elif parsed.path == "/api/credit/orders/batch":
-                self._write_json(ok(submit_credit_batch_orders(body)))
-            elif parsed.path == "/api/future/orders/batch":
-                self._write_json(ok(submit_future_batch_orders(body)))
-            elif parsed.path == "/api/future-option/orders/batch":
-                self._write_json(ok(submit_future_option_batch_orders(body)))
-            elif parsed.path == "/api/stock-option/orders/batch":
-                self._write_json(ok(submit_stock_option_batch_orders(body)))
-            elif parsed.path == "/api/cancel":
-                self._write_json(ok(cancel_order(body)))
-            elif parsed.path == "/api/credit/query":
-                self._write_json(ok(query_credit_account(body)))
-            elif parsed.path == "/api/credit/probe":
-                self._write_json(ok(probe_credit_account(body)))
-            elif parsed.path == "/api/apikey":
-                self._write_json(ok(save_api_key(body)))
-            elif parsed.path == "/api/server-access":
+                return
+            handler = self.POST_HANDLERS.get(parsed.path)
+            if handler is not None:
+                self._write_json(ok(handler(body)))
+                return
+            if parsed.path == "/api/server-access":
                 result = save_server_access(body)
                 reload_requested = parse_bool(body.get("reload"))
                 if reload_requested:
@@ -16342,30 +16376,6 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(result))
                 if reload_requested:
                     schedule_web_reload(self.server, result["reload"])
-            elif parsed.path == "/api/web-auth/reset-password":
-                self._write_json(ok(WEB_CONFIG.reset_web_auth_password()))
-            elif parsed.path == "/api/user-profile":
-                self._write_json(ok(save_user_profile(body)))
-            elif parsed.path == "/api/transport":
-                self._write_json(ok(save_transport(body)))
-            elif parsed.path == "/api/pipe-hub/start":
-                self._write_json(ok(start_pipe_hub()))
-            elif parsed.path == "/api/pipe-hub/stop":
-                self._write_json(ok(stop_pipe_hub()))
-            elif parsed.path == "/api/log-cleanup":
-                self._write_json(ok(save_log_cleanup_settings(body)))
-            elif parsed.path == "/api/qmt-log-language":
-                self._write_json(ok(save_qmt_log_language(body)))
-            elif parsed.path == "/api/python-environment":
-                self._write_json(ok(save_python_environment(body)))
-            elif parsed.path == "/api/log-cleanup/run":
-                self._write_json(ok(run_log_cleanup(body)))
-            elif parsed.path == "/api/updates/github":
-                self._write_json(ok(bridge_update_github(body)))
-            elif parsed.path == "/api/updates/official":
-                self._write_json(ok(bridge_update_official(body)))
-            elif parsed.path == "/api/updates/rollback":
-                self._write_json(ok(bridge_update_rollback(body)))
             elif parsed.path == "/api/project-updates/github":
                 result = project_update_github(body)
                 reload_requested = parse_bool(body.get("reload")) if "reload" in body else True
@@ -16401,50 +16411,6 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(result))
                 if reload_requested:
                     schedule_web_reload(self.server, result["reload"])
-            elif parsed.path == "/api/quotes/whole/subscribe":
-                self._write_json(ok(subscribe_whole_quote(body)))
-            elif parsed.path == "/api/quotes/subscribe":
-                self._write_json(ok(subscribe_single_quote(body)))
-            elif parsed.path == "/api/quotes/unsubscribe":
-                self._write_json(ok(unsubscribe_quote(body)))
-            elif parsed.path == "/api/data/full-tick":
-                self._write_json(ok(get_full_tick(body)))
-            elif parsed.path == "/api/data/market":
-                self._write_json(ok(get_market_data(body, ex=False)))
-            elif parsed.path == "/api/data/market-ex":
-                self._write_json(ok(get_market_data(body, ex=True)))
-            elif parsed.path == "/api/data/instrument":
-                self._write_json(ok(get_instrument_detail(body)))
-            elif parsed.path == "/api/data/sector":
-                self._write_json(ok(get_stock_list_in_sector(body)))
-            elif parsed.path == "/api/data/divid-factors":
-                self._write_json(ok(get_divid_factors(body)))
-            elif parsed.path == "/api/data/trading-dates":
-                self._write_json(ok(get_trading_dates(body)))
-            elif parsed.path == "/api/python/xtdata":
-                self._write_json(ok(python_xtdata_request(body)))
-            elif parsed.path == "/api/data/history/download":
-                self._write_json(ok(download_history_data(body)))
-            elif parsed.path == "/api/data/financial":
-                self._write_json(ok(get_financial_data(body)))
-            elif parsed.path == "/api/data/financial/download":
-                self._write_json(ok(download_financial_data(body)))
-            elif parsed.path == "/api/trade/export-data":
-                self._write_json(ok(export_trade_data(body)))
-            elif parsed.path == "/api/lttx/start":
-                self._write_json(ok(start_lttx_server()))
-            elif parsed.path == "/api/lttx/stop":
-                self._write_json(ok(stop_lttx_server(full_exit=parse_bool(body.get("full_exit")))))
-            elif parsed.path == "/api/bridges":
-                self._write_json(ok(save_bridge_config(body)))
-            elif parsed.path == "/api/bridges/delete":
-                self._write_json(ok(delete_bridge_config(body)))
-            elif parsed.path == "/api/account-pairs":
-                self._write_json(ok(save_account_pair(body)))
-            elif parsed.path == "/api/account-pairs/delete":
-                self._write_json(ok(delete_account_pair(body)))
-            elif parsed.path == "/api/account-pairs/verify":
-                self._write_json(ok(verify_account_pair(body)))
             elif parsed.path in ("/api/management/restart", "/api/management/stop"):
                 if PROJECT_UPDATER.is_busy():
                     raise ProjectUpdateBusyError("Project update in progress; wait before restarting or stopping")
@@ -16460,26 +16426,10 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 else:
                     self._write_json(ok({"stopping": True, "boot_id": MANAGEMENT_BOOT_ID}))
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
-            elif parsed.path == "/api/account-config":
-                self._write_json(ok(save_account_runtime_config(body)))
-            elif parsed.path == "/api/qmt/processes/stop":
-                self._write_json(ok(stop_qmt_processes_for_request(body)))
-            elif parsed.path == "/api/qmt/processes/start":
-                self._write_json(ok(start_qmt_processes_for_request(body)))
-            elif parsed.path == "/api/qmt-auto-login/complete":
-                self._write_json(ok(complete_qmt_auto_login(body)))
-            elif parsed.path == "/api/account-config/update-core":
-                self._write_json(ok(update_account_qmt_core(body)))
-            elif parsed.path == "/api/account-config/delete":
-                self._write_json(ok(delete_account_runtime_config(body)))
             elif parsed.path == "/api/setup/initialize":
                 result = initialize_web_setup(body)
                 token = ((result.get("web_auth") or {}).get("token") or "")
                 self._write_json(ok(result), extra_headers=self._web_auth_cookie_headers(token))
-            elif parsed.path == "/api/setup/reset":
-                self._write_json(ok(reset_web_setup()))
-            elif parsed.path == "/api/setup/data-provider":
-                self._write_json(ok(set_data_provider(body)))
             elif parsed.path == "/api/web-auth/logout":
                 self._write_json(
                     ok(web_auth_logout(self._provided_web_token(parsed))),
@@ -16753,19 +16703,32 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 fields[name] = payload.decode(charset, errors="replace")
         return fields, files
 
+    # 纯直通 GET 路由：handler(query, self) → 结果（query 为解析后的参数表）。
+    GET_HANDLERS = {
+        "/api/health": lambda query, handler: {"status": "ok"},
+        "/api/management/status": lambda query, handler: management_status(),
+        "/api/internal/runtime-route": lambda query, handler: internal_runtime_route_info(),
+        "/api/apikey": lambda query, handler: api_key_info(),
+        "/api/server-access": lambda query, handler: server_access_info(),
+        "/api/user-profile": lambda query, handler: user_profile_response(),
+        "/api/transport": lambda query, handler: transport_info(),
+        "/api/pipe-hub": lambda query, handler: pipe_hub_info(),
+        "/api/credit/actions": lambda query, handler: credit_actions_info(),
+        "/api/order/actions": lambda query, handler: order_actions_info(),
+        "/api/log-cleanup": lambda query, handler: log_cleanup_info(),
+        "/api/qmt-log-language": lambda query, handler: qmt_log_language_info(),
+        "/api/quotes/status": lambda query, handler: quote_status(),
+        "/api/lttx": lambda query, handler: lttx_status(),
+        "/api/bindings/status": lambda query, handler: binding_status_snapshot(),
+    }
+
     def _handle_api_get(self, parsed):
         if not self._authorized(parsed):
             self._write_json(fail("invalid credentials", 401), status=401)
             return
         query = urllib.parse.parse_qs(parsed.query)
         try:
-            if parsed.path == "/api/health":
-                self._write_json(ok({"status": "ok"}))
-            elif parsed.path == "/api/management/status":
-                self._write_json(ok(management_status()))
-            elif parsed.path == "/api/internal/runtime-route":
-                self._write_json(ok(internal_runtime_route_info()))
-            elif parsed.path == "/api/config":
+            if parsed.path == "/api/config":
                 has_access = self._has_access_token(parsed)
                 auth_required = WEB_CONFIG.web_auth_enabled() and not has_access
                 if auth_required:
@@ -16803,30 +16766,12 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     "version": project_version_info(include_remote=False),
                     "system_info": project_system_info(),
                 }))
-            elif parsed.path == "/api/apikey":
-                self._write_json(ok(api_key_info()))
-            elif parsed.path == "/api/server-access":
-                self._write_json(ok(server_access_info()))
-            elif parsed.path == "/api/user-profile":
-                self._write_json(ok(user_profile_response()))
-            elif parsed.path == "/api/transport":
-                self._write_json(ok(transport_info()))
-            elif parsed.path == "/api/pipe-hub":
-                self._write_json(ok(pipe_hub_info()))
-            elif parsed.path == "/api/credit/actions":
-                self._write_json(ok(credit_actions_info()))
-            elif parsed.path == "/api/order/actions":
-                self._write_json(ok(order_actions_info()))
             elif parsed.path == "/api/web-auth/status":
                 self._write_json(ok(web_auth_status(self._provided_web_token(parsed))))
-            elif parsed.path == "/api/log-cleanup":
-                self._write_json(ok(log_cleanup_info()))
             elif parsed.path == "/api/log-files":
                 self._write_json(ok({"files": list_log_files(LOG_DIR, (query.get("date") or [time.strftime("%Y-%m-%d")])[0])}))
             elif parsed.path == "/api/log-file":
                 self._write_json(ok(read_managed_log(LOG_DIR, (query.get("name") or [""])[0])))
-            elif parsed.path == "/api/qmt-log-language":
-                self._write_json(ok(qmt_log_language_info()))
             elif parsed.path == "/api/qmt-scripts/source":
                 raw_names = []
                 for key in ("name", "names", "script"):
@@ -16876,8 +16821,6 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 )
                 version_info["system_info"] = project_system_info(version_info)
                 self._write_json(ok(version_info))
-            elif parsed.path == "/api/quotes/status":
-                self._write_json(ok(quote_status()))
             elif parsed.path == "/api/quotes/latest":
                 since = int((query.get("since") or ["0"])[0] or 0)
                 limit = int((query.get("limit") or ["200"])[0] or 200)
@@ -16886,8 +16829,6 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     "events": QUOTES.latest(since=since, limit=limit, subscribe_id=subscribe_id),
                     "status": QUOTES.status(),
                 }))
-            elif parsed.path == "/api/lttx":
-                self._write_json(ok(lttx_status()))
             elif parsed.path == "/api/status":
                 account_id = str((query.get("account_id") or [""])[0] or "").strip()
                 account_type = normalize_account_type((query.get("account_type") or [configured_default_account_type()])[0])
@@ -16906,8 +16847,6 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/qmt/processes":
                 qmt_dir = (query.get("qmt_dir") or query.get("path") or [""])[0]
                 self._write_json(ok(qmt_process_snapshot(qmt_dir)))
-            elif parsed.path == "/api/bindings/status":
-                self._write_json(ok(binding_status_snapshot()))
             elif parsed.path == "/api/callbacks":
                 account_id = (query.get("account_id") or [""])[0]
                 account_type = normalize_account_type((query.get("account_type") or ["STOCK"])[0]) if query.get("account_type") else ""
@@ -16984,7 +16923,11 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 )
                 self._write_json(ok(account_result))
             else:
-                self._write_json(fail("not found", 404), status=404)
+                handler = self.GET_HANDLERS.get(parsed.path)
+                if handler is not None:
+                    self._write_json(ok(handler(query, self)))
+                else:
+                    self._write_json(fail("not found", 404), status=404)
         except Exception as e:
             self._write_json(fail(e, 400), status=400)
 
