@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 import json
-import queue
 import socket
 import threading
 import time
 
 from .config import get_config
-from .callback_dispatcher import CallbackDispatcher, dispatch_callbacks
 from ._fastjson import loads_message_typed
 from .errors import CfquantError, CfquantTimeout
-from .protocol import decode_value, dumps_message, new_id, pack_request
+from .protocol import dumps_message, new_id
+from .rpc_base import BaseRpcClient
 
 
 PIPE_TRANSPORTS = ("pipe", "ctypes", "named_pipe", "named-pipe")
@@ -84,7 +83,7 @@ def load_lttx_registry(cfg=None):
                 pass
 
 
-class LTtxRpcClient(object):
+class LTtxRpcClient(BaseRpcClient):
     """
     cfquant 外部端 LTtx/TX RPC 客户端。
 
@@ -103,13 +102,7 @@ class LTtxRpcClient(object):
         self.client_id = client_id or cfg.get("client_id") or new_id("client")
         self.reply_channel = self.client_id
         self._tx = None
-        self._pending = {}
-        self._callbacks = {}
-        self._lock = threading.RLock()
-        self._pending_lock = threading.RLock()
-        self._started = False
-        self._recv_thread = None
-        self._event_dispatcher = CallbackDispatcher(self._dispatch_event)
+        super(LTtxRpcClient, self).__init__()
 
     def start(self):
         with self._lock:
@@ -141,60 +134,12 @@ class LTtxRpcClient(object):
                     tx.close()
                 except Exception:
                     pass
-            with self._pending_lock:
-                for q in list(self._pending.values()):
-                    try:
-                        q.put_nowait({"ok": False, "error": {"message": "cfquant client closed"}})
-                    except Exception:
-                        pass
-                self._pending.clear()
-
-    def request(self, action, params=None, timeout=None, request_channel=None):
-        effective_timeout = float(timeout or self.timeout)
-        request_id = new_id("req")
-        raw = pack_request(
-            action,
-            params=params,
-            reply_channel=self.reply_channel,
-            client_id=self.client_id,
-            request_id=request_id,
-            timeout=effective_timeout,
-        )
-        q = queue.Queue(maxsize=1)
-        try:
-            with self._lock:
-                self.start()
-                with self._pending_lock:
-                    self._pending[request_id] = q
-                self._push("request", raw, request_channel or self.request_channel)
-            try:
-                msg = q.get(timeout=effective_timeout)
-            except queue.Empty:
-                raise CfquantTimeout("cfquant request timeout: %s" % action)
-            if not msg.get("ok"):
-                err = msg.get("error") or {}
-                raise CfquantError(err.get("message") or str(err))
-            if msg.pop("_cf_typed", True):
-                return decode_value(msg.get("result"))
-            return msg.get("result")
-        finally:
-            with self._pending_lock:
-                self._pending.pop(request_id, None)
+            self._fail_pending("cfquant client closed")
 
     def publish_event(self, channel, payload):
         raw = dumps_message(payload)
         self.start()
         self._push("event", raw, channel)
-
-    def add_callback(self, event, callback):
-        if callback is None:
-            return
-        self._callbacks.setdefault(event, []).append(callback)
-
-    def remove_callback(self, event, callback):
-        callbacks = self._callbacks.get(event) or []
-        if callback in callbacks:
-            callbacks.remove(callback)
 
     def _recv_loop(self, expected_tx, generation):
         while self._started:
@@ -211,14 +156,7 @@ class LTtxRpcClient(object):
                 with self._lock:
                     if not self._started or tx is not self._tx:
                         return
-                    msg_type = msg.get("type")
-                    if msg_type == "response":
-                        with self._pending_lock:
-                            q = self._pending.pop(msg.get("id"), None)
-                        if q:
-                            q.put(msg)
-                    elif msg_type == "event":
-                        self._event_dispatcher.submit(generation, msg)
+                    self._dispatch_message(msg, generation)
             except Exception:
                 time.sleep(0.05)
                 if not self._started:
@@ -227,8 +165,8 @@ class LTtxRpcClient(object):
             if self._tx is expected_tx:
                 self.close()
 
-    def _dispatch_event(self, msg):
-        dispatch_callbacks(self._callbacks, msg, self._event_dispatcher.is_current_callback)
+    def _send_request(self, payload, request_channel, request_id=None, action=None):
+        self._push("request", payload, request_channel)
 
     def _push(self, key, payload, channel):
         tx = self._tx
