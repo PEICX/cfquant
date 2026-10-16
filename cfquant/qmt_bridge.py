@@ -7,7 +7,7 @@ import threading
 import time
 
 from .config import get_config
-from .order_identity import prepare_order_remark, order_remark_key, original_order_remark, restore_order_remark, is_unique_order_remark
+from .order_identity import prepare_order_remark, order_remark_key, original_order_remark, restore_order_remark, is_unique_order_remark, OrderCallbackCache
 from .stock_connect import connect_account_type, validate_connect_order, validate_connect_market, query_connect_exchange_rate
 from .logging_i18n import get_log_enabled, get_log_language, set_log_enabled, set_log_language, translate_log
 from .protocol import loads_message, pack_event, pack_response
@@ -23,10 +23,12 @@ from .level2 import (
     thousand_price,
 )
 from .qmt_trade_ops import QmtTradeOpsMixin
-from .xttype import _exchange_suffix, _is_zero_time_value, filter_cancelable_orders
+from .order_request_cache import OrderRequestMetadataMixin
+from .auto_trade_callback import AutoTradeCallbackMixin
+from .xttype import _exchange_suffix, _is_zero_time_value, filter_cancelable_orders, normalize_order_price_type
 
 
-class CfquantQmtBridge(QmtTradeOpsMixin):
+class CfquantQmtBridge(OrderRequestMetadataMixin, AutoTradeCallbackMixin, QmtTradeOpsMixin):
     """
     大 QMT 内置端 LTtx/TX 桥接器。
 
@@ -70,7 +72,14 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
         self.pending_async_orders_lock = threading.RLock()
         self._pending_async_orders_last_prune = 0.0
         self.order_request_metadata = {}
+        # order_id(str) -> metadata key：_enrich_order_request_fields 原先对每一行
+        # 全量扫描 order_request_metadata(上限 1000) 做备注兜底匹配，2000 行委托时
+        # 是 O(rows x 1000) 且全程持锁，实测格式化阶段因此耗时数十秒。用 order_id
+        # 建立索引后，正常路径（能拿到 order_id）退化为 O(1) 查表；拿不到 order_id
+        # 的行仍回退到原有备注匹配，语义不变。
+        self.order_request_metadata_by_id = {}
         self.order_request_metadata_lock = threading.RLock()
+        self.order_callback_cache = OrderCallbackCache()
 
     def start(self):
         if self.running:
@@ -627,6 +636,16 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
                 previous_order_id,
                 params,
             )
+        if not self._is_failed_order_result(result):
+            # Re-register with the resolved order id so later query rows can hit
+            # the O(1) order_id index instead of the remark fallback scan.
+            self._remember_order_request(
+                account_id,
+                params.get("stock_code", params.get("code", "")),
+                user_order_id,
+                strategy_name,
+                order_id=order_id,
+            )
         return {
             "order_id": order_id if order_id is not None else -1,
             "request_result": result,
@@ -670,35 +689,6 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
         with self.pending_async_orders_lock:
             self._prune_pending_async_orders_locked()
             self.pending_async_orders.append(record)
-
-    def _remember_order_request(self, account_id, stock_code, order_remark, strategy_name):
-        key = (
-            str(account_id or "").strip(),
-            str(stock_code or "").strip().upper().split(".", 1)[0],
-            str(order_remark or ""),
-        )
-        if not key[0] or not key[2]:
-            return
-        with self.order_request_metadata_lock:
-            self.order_request_metadata[key] = str(strategy_name or "")
-            while len(self.order_request_metadata) > 1000:
-                self.order_request_metadata.pop(next(iter(self.order_request_metadata)))
-
-    def _enrich_order_request_fields(self, order):
-        if not isinstance(order, dict):
-            return order
-        key = (
-            str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip(),
-            str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
-            order_remark_key(order),
-        )
-        with self.order_request_metadata_lock:
-            strategy_name = self.order_request_metadata.get(key)
-        if strategy_name is not None and not order.get("strategy_name"):
-            order["strategy_name"] = strategy_name
-            if not order.get("m_strStrategyName"):
-                order["m_strStrategyName"] = strategy_name
-        return restore_order_remark(order)
 
     def _prune_pending_async_orders_locked(self):
         now = time.time()
@@ -763,6 +753,13 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
                 order["m_strRemark"] = record.get("order_remark", "")
             if not order.get("m_strStrategyName"):
                 order["m_strStrategyName"] = record.get("strategy_name", "")
+        self._remember_order_request(
+            record.get("account_id"),
+            record.get("stock_code"),
+            record.get("order_remark"),
+            record.get("strategy_name"),
+            order_id=order_id,
+        )
         self._send_async_order_response(record, order_id)
         restore_order_remark(order)
         return True
@@ -844,15 +841,22 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
             str(datatype).lower(),
         )
         rows = self._format_trade_detail_rows(result, datatype)
+        datatype_upper = str(datatype).upper()
         for row in rows:
             if isinstance(row, dict):
                 if not row.get("account_id"):
                     row["account_id"] = account.get("account_id", "")
                 if row.get("account_type") in (None, ""):
                     row["account_type"] = account.get("account_type") or self._account_type_name(None).upper()
-                if str(datatype).upper() in ("ORDER", "DEAL"):
-                    self._enrich_order_request_fields(row)
-        if str(datatype).upper() == "ORDER" and self._truthy_param(params.get("cancelable_only")):
+                if datatype_upper in ("ORDER", "DEAL"):
+                    # 历史旧单跳过富化（元数据早已被上限淘汰，逐行扫描必落空）。
+                    # _remember_order_callback_fields 保持无条件执行：查询结果
+                    # 是回调缓存的主要种子来源（先查后收成交流水是常见时序）。
+                    if self._order_metadata_known(row):
+                        self._enrich_order_request_fields(row)
+                    if datatype_upper == "ORDER":
+                        self._remember_order_callback_fields(row)
+        if datatype_upper == "ORDER" and self._truthy_param(params.get("cancelable_only")):
             rows = filter_cancelable_orders(rows)
         return rows
 
@@ -916,7 +920,10 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
                 "direction": self._get_value(obj, "m_nDirection"),
                 "offset_flag": self._get_value(obj, "m_nOffsetFlag"),
                 "order_volume": self._get_value(obj, "m_nVolumeTotalOriginal"),
-                "price_type": self._first_value(obj, ("m_nPriceType", "m_nOrderPriceType")),
+                "price_type": normalize_order_price_type(
+                    self._first_value(obj, ("price_type", "m_nPriceType", "m_nOrderPriceType")),
+                    self._get_value(obj, "m_strExchangeID"),
+                ),
                 "price": self._first_value(obj, ("m_dLimitPrice", "m_dOrderPrice", "m_dPrice")),
                 "traded_price": self._get_value(obj, "m_dTradedPrice"),
                 "traded_volume": self._get_value(obj, "m_nVolumeTraded"),
@@ -1362,37 +1369,6 @@ class CfquantQmtBridge(QmtTradeOpsMixin):
             if callable(func):
                 return func
         return None
-
-    def _enable_auto_trade_callback(self):
-        if self.context is None or self.auto_trade_callback_enabled:
-            return
-        func = getattr(self.context, "set_auto_trade_callback", None)
-        if callable(func):
-            try:
-                result = func(True)
-                self.auto_trade_callback_enabled = True
-                self._log("auto trade callback enabled result=%s" % result)
-                return
-            except Exception as e:
-                self._log("auto trade callback enable failed:%s" % e)
-                return
-        func = self._get_callable("set_auto_trade_callback")
-        if not callable(func):
-            self._log("auto trade callback enable skipped: set_auto_trade_callback not found")
-            return
-        try:
-            result = func(self.context, True)
-            self.auto_trade_callback_enabled = True
-            self._log("auto trade callback enabled result=%s" % result)
-        except TypeError:
-            try:
-                result = func(True)
-                self.auto_trade_callback_enabled = True
-                self._log("auto trade callback enabled result=%s" % result)
-            except Exception as e:
-                self._log("auto trade callback enable failed:%s" % e)
-        except Exception as e:
-            self._log("auto trade callback enable failed:%s" % e)
 
     def _get_global_func(self, name):
         func = self.globals_dict.get(name)

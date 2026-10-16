@@ -218,7 +218,7 @@ def test_old_qmt_bridge_uses_documented_contract():
     bridge.context = SimpleNamespace(passorder=lambda *args: calls.append(args) or 2001)
     bridge.globals_dict = {}
     bridge._get_last_order_id = lambda *args: None
-    bridge._remember_order_request = lambda *args: None
+    bridge._remember_order_request = lambda *args, **kwargs: None
     bridge._get_global_func = lambda name: None
     params = dict(order(stock_code='00700.HGT'), account=dict(account_id='TEST_ONLY', account_type='7'))
     bridge._order_stock(params, resolve_order_id=False)
