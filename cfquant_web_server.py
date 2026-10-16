@@ -7569,7 +7569,108 @@ def _rmtree_onerror(func, failed_path, exc_info):
         raise
 
 
-class CfquantUpdater(object):
+class BaseCfquantUpdater(object):
+    """Shared pipeline helpers for the QMT core and project updaters.
+
+    Holds only behaviour that is byte-for-byte identical (or a strict
+    superset) across both updaters: timestamp/short-commit formatting,
+    directory-tree removal, zip extraction with traversal guards, the
+    relative-path helpers, the JSON read/write helpers and the backup
+    pruning loop.  Anything that depends on *what* is being updated
+    (target resolution, install sources, metadata payloads, backup info
+    shape) stays in the concrete subclasses.
+    """
+
+    BACKUP_KEEP = 2
+
+    def _timestamp(self):
+        return time.strftime("%Y%m%d_%H%M%S")
+
+    def _short_commit(self, commit):
+        commit = str(commit or "").strip()
+        return commit[:7] if len(commit) >= 7 else commit
+
+    def _remove_tree(self, path):
+        if not path or not os.path.exists(path):
+            return
+        shutil.rmtree(path, onerror=_rmtree_onerror)
+
+    def _remove_path(self, path):
+        if not path or not os.path.lexists(path):
+            return
+        if os.path.islink(path) or os.path.isfile(path):
+            os.remove(path)
+            return
+        if os.path.isdir(path):
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+
+    def _safe_extract_zip(self, zip_path, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        root = os.path.abspath(output_dir)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                name = info.filename.replace("\\", "/")
+                if not name or name.endswith("/"):
+                    continue
+                if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+                    raise RuntimeError("zip contains absolute path: %s" % info.filename)
+                target = os.path.abspath(os.path.join(root, name))
+                if not target.startswith(root + os.sep) and target != root:
+                    raise RuntimeError("zip path escapes target: %s" % info.filename)
+            zf.extractall(root)
+
+    def _normalize_rel(self, path):
+        rel = str(path or "").replace("\\", "/").strip("/")
+        rel = posixpath.normpath(rel)
+        return "" if rel == "." else rel
+
+    def _relpath(self, root, path):
+        rel = os.path.relpath(path, root)
+        return "" if rel == "." else self._normalize_rel(rel)
+
+    def _join_rel(self, rel_root, name):
+        return self._normalize_rel(os.path.join(rel_root, name) if rel_root else name)
+
+    def _read_json_file(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_json_file(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _read_core_version(self, core_dir):
+        for filename in ("version.py", "__init__.py"):
+            path = os.path.join(core_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(8192)
+                match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
+                if match:
+                    return match.group(1)
+            except Exception:
+                continue
+        return ""
+
+    def _prune_backup_rows(self, rows, remove, log_prefix):
+        removed = []
+        for row in rows[self.BACKUP_KEEP:]:
+            try:
+                remove(row["path"])
+                removed.append(row)
+            except Exception as e:
+                safe_print("%s %s: %s" % (log_prefix, row.get("path"), e))
+        return removed
+
+
+class CfquantUpdater(BaseCfquantUpdater):
     BACKUP_KEEP = 2
 
     def __init__(self, config):
@@ -8037,48 +8138,6 @@ class CfquantUpdater(object):
             )
             return result
 
-    def _rollback_legacy(self, bridge_id, backup_name=None):
-        with self._lock:
-            target = self._require_ready_target(bridge_id)
-            backups = self._list_backups(target["backup_dir"])
-            if not backups:
-                raise RuntimeError("没有可回滚的备份")
-            if backup_name:
-                backup_name = os.path.basename(str(backup_name))
-                selected = next((row for row in backups if row["name"] == backup_name), None)
-                if selected is None:
-                    raise RuntimeError("backup not found: %s" % backup_name)
-            else:
-                selected = backups[0]
-            current = target["current_core"]
-            rollback_backup = self._backup_current_core(target, label="rollback")
-            restored = False
-            try:
-                if os.path.isdir(current):
-                    self._remove_tree(current)
-                shutil.copytree(selected["path"], current, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-                restored = True
-            except Exception:
-                if not restored:
-                    self._restore_backup_dir(rollback_backup, current)
-                raise
-            removed = self._prune_backups(target["backup_dir"])
-            entry_info = qmt_entry_manual_update_info(reason="QMT 核心包回滚未检测入口脚本变更")
-            return {
-                "bridge_id": target["bridge_id"],
-                "python_dir": target["python_dir"],
-                "restored_backup": selected,
-                "rollback_backup": rollback_backup,
-                "removed_backups": removed,
-                "current_version": self._read_version(current),
-                "backups": self._list_backups(target["backup_dir"]),
-                "qmt_restart_required": qmt_restart_required_info(
-                    reason="QMT 核心包已回滚",
-                    entry_info=entry_info,
-                ),
-                "entry_manual_update": entry_info,
-            }
-
     def rollback(self, bridge_id, backup_name=None):
         with self._lock:
             targets = self._require_ready_targets(bridge_id)
@@ -8326,70 +8385,6 @@ class CfquantUpdater(object):
                 raise RuntimeError("核心代码目录不存在: %s" % target["current_core"])
             targets.append(target)
         return targets
-
-    def _require_ready_target(self, bridge_id):
-        return self._require_ready_targets(bridge_id)[0]
-
-    def _require_ready_target_legacy(self, bridge_id):
-        bridge_id = normalize_bridge_id(bridge_id or DEFAULT_BRIDGE_ID)
-        bridge = bridge_config(bridge_id)
-        python_dir = normalize_optional_path(bridge.get("python_dir"))
-        if not python_dir:
-            raise RuntimeError("桥接端未设置 QMT 核心目录")
-        target = self._target_paths(python_dir)
-        target["bridge_id"] = bridge_id
-        if not os.path.isdir(target["python_dir"]):
-            raise RuntimeError("QMT 核心目录不存在: %s" % target["python_dir"])
-        if not os.path.isdir(target["project_dir"]):
-            raise RuntimeError("项目目录不存在: %s" % target["project_dir"])
-        if not os.path.isdir(target["current_core"]):
-            raise RuntimeError("核心代码目录不存在: %s" % target["current_core"])
-        return target
-
-    def _install_source_legacy(self, bridge_id, source_dir, meta):
-        target = self._require_ready_target(bridge_id)
-        source_core = self._find_source_core(source_dir)
-        if not source_core:
-            raise RuntimeError("源码中未找到 cfquant 核心目录")
-        self._validate_core_dir(source_core)
-        entry_info = self._entry_update_info(source_dir)
-        os.makedirs(target["backup_dir"], exist_ok=True)
-        backup = self._backup_current_core(target)
-        temp_new = os.path.join(target["updates_dir"], "new_core_%s" % self._timestamp())
-        current = target["current_core"]
-        installed = False
-        try:
-            self._copy_core(source_core, temp_new)
-            if os.path.isdir(current):
-                self._remove_tree(current)
-            os.replace(temp_new, current)
-            installed = True
-            self._write_install_meta(target, meta, source_core, backup)
-            removed = self._prune_backups(target["backup_dir"])
-            return {
-                "bridge_id": target["bridge_id"],
-                "layout": target.get("layout"),
-                "python_dir": target["python_dir"],
-                "updated": True,
-                "source": meta,
-                "source_core": source_core,
-                "backup": backup,
-                "removed_backups": removed,
-                "current_version": self._read_version(current),
-                "backups": self._list_backups(target["backup_dir"]),
-                "qmt_restart_required": qmt_restart_required_info(
-                    reason="QMT 核心包已更新",
-                    entry_info=entry_info,
-                ),
-                "entry_manual_update": entry_info,
-            }
-        except Exception:
-            if not installed:
-                self._remove_tree(temp_new)
-            else:
-                self._remove_tree(temp_new)
-            self._restore_backup_dir(backup, current)
-            raise
 
     def _install_source(self, bridge_id, source_dir, meta):
         targets = self._require_ready_targets(bridge_id)
@@ -8680,10 +8675,6 @@ class CfquantUpdater(object):
             current = parent
         return ""
 
-    def _short_commit(self, commit):
-        commit = str(commit or "").strip()
-        return commit[:7] if len(commit) >= 7 else commit
-
     def _fetch_github(self, repo_url, ref, output_dir):
         errors = []
         clone_cmd = ["git", "clone", "--depth", "1"]
@@ -8828,21 +8819,6 @@ class CfquantUpdater(object):
 
     def _parse_github_repo(self, repo_url):
         return _parse_github_repo_name(repo_url)
-
-    def _safe_extract_zip(self, zip_path, output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-        root = os.path.abspath(output_dir)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for info in zf.infolist():
-                name = info.filename.replace("\\", "/")
-                if not name or name.endswith("/"):
-                    continue
-                if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
-                    raise RuntimeError("zip contains absolute path: %s" % info.filename)
-                target = os.path.abspath(os.path.join(root, name))
-                if not target.startswith(root + os.sep) and target != root:
-                    raise RuntimeError("zip path escapes target: %s" % info.filename)
-            zf.extractall(root)
 
     def _find_source_core(self, source_dir):
         source_dir = os.path.abspath(source_dir)
@@ -9046,45 +9022,21 @@ class CfquantUpdater(object):
         }
 
     def _prune_backups(self, backup_dir):
-        rows = self._list_backups(backup_dir)
-        removed = []
-        for row in rows[self.BACKUP_KEEP:]:
-            try:
-                self._remove_tree(row["path"])
-                removed.append(row)
-            except Exception as e:
-                safe_print("backup prune failed %s: %s" % (row.get("path"), e))
-        return removed
+        return self._prune_backup_rows(
+            self._list_backups(backup_dir),
+            self._remove_tree,
+            "backup prune failed",
+        )
 
     def _read_version(self, core_dir):
-        for filename in ("version.py", "__init__.py"):
-            path = os.path.join(core_dir, filename)
-            if not os.path.isfile(path):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    text = f.read(8192)
-                match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
-                if match:
-                    return match.group(1)
-            except Exception:
-                continue
-        return ""
-
-    def _remove_tree(self, path):
-        if not path or not os.path.exists(path):
-            return
-        shutil.rmtree(path, onerror=_rmtree_onerror)
-
-    def _timestamp(self):
-        return time.strftime("%Y%m%d_%H%M%S")
+        return self._read_core_version(core_dir)
 
 
 class ProjectUpdateBusyError(RuntimeError):
     pass
 
 
-class CfquantProjectUpdater(object):
+class CfquantProjectUpdater(BaseCfquantUpdater):
     BACKUP_KEEP = PROJECT_UPDATE_BACKUP_KEEP
     EXCLUDED_DIR_NAMES = {
         ".git",
@@ -9874,33 +9826,14 @@ class CfquantProjectUpdater(object):
         }
 
     def _prune_backups(self):
-        rows = self._list_backups()
-        removed = []
-        for row in rows[self.BACKUP_KEEP:]:
-            try:
-                self._remove_path(row["path"])
-                removed.append(row)
-            except Exception as e:
-                safe_print("project backup prune failed %s: %s" % (row.get("path"), e))
-        return removed
+        return self._prune_backup_rows(
+            self._list_backups(),
+            self._remove_path,
+            "project backup prune failed",
+        )
 
     def _read_project_version(self, project_dir):
-        candidates = [
-            os.path.join(project_dir, "cfquant", "version.py"),
-            os.path.join(project_dir, "cfquant", "__init__.py"),
-        ]
-        for path in candidates:
-            if not os.path.isfile(path):
-                continue
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    text = f.read(8192)
-                match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
-                if match:
-                    return match.group(1)
-            except Exception:
-                continue
-        return ""
+        return self._read_core_version(os.path.join(project_dir, "cfquant"))
 
     def _is_excluded_path(self, rel_path, is_dir=False):
         rel_path = self._normalize_rel(rel_path)
@@ -9978,42 +9911,8 @@ class CfquantProjectUpdater(object):
                 self._remove_path(parent)
             os.makedirs(parent, exist_ok=True)
 
-    def _remove_path(self, path):
-        if not path or not os.path.lexists(path):
-            return
-        if os.path.islink(path) or os.path.isfile(path):
-            os.remove(path)
-            return
-        if os.path.isdir(path):
-            shutil.rmtree(path, onerror=_rmtree_onerror)
-
     def _backup_root(self):
         return os.path.join(PROJECT_UPDATE_DIR, "backups")
-
-    def _relpath(self, root, path):
-        rel = os.path.relpath(path, root)
-        return "" if rel == "." else self._normalize_rel(rel)
-
-    def _join_rel(self, rel_root, name):
-        return self._normalize_rel(os.path.join(rel_root, name) if rel_root else name)
-
-    def _normalize_rel(self, path):
-        rel = str(path or "").replace("\\", "/").strip("/")
-        rel = posixpath.normpath(rel)
-        return "" if rel == "." else rel
-
-    def _read_json_file(self, path):
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
-    def _write_json_file(self, path, data):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 UPDATER = CfquantUpdater(WEB_CONFIG)
