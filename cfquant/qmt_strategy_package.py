@@ -33,8 +33,16 @@ def _cipher():
     return AES.new(material[:32], AES.MODE_CFB, iv=material[32:48], segment_size=128)
 
 
-def build_package(name, source, stock="SH000300", period=86400, description=""):
-    if not re.fullmatch(r"CFQ_[A-Z0-9_]{1,59}", name):
+def build_package(name, source, stock="SH000300", period=86400, description="",
+                  name_pattern=None):
+    """Create a QMT .rzrk package.
+
+    name_pattern is a re.fullmatch pattern for the strategy name. The
+    default guards cfquant's managed CFQ_ namespace; standalone lab
+    strategies outside the deployer's control pass their own pattern
+    (e.g. tools/deploy_npsh_lab.py for NPSH_LAB).
+    """
+    if not re.fullmatch(name_pattern if name_pattern is not None else r"CFQ_[A-Z0-9_]{1,59}", name):
         raise ValueError("Invalid managed QMT strategy name")
     if not source or "\x00" in source or len(source.encode("utf-8")) > 16 * 1024 * 1024:
         raise ValueError("Invalid QMT strategy source")

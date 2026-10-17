@@ -14,6 +14,16 @@ python -X utf8 -m pytest "cfquant/tests/17_大QMT接口适配测试.py" -q
 
 覆盖旧名称详情、可转债部分字段、除权因子日期筛选、板块管理、批量模型、期货持仓统计、三类两融查询及交易桥优先路由。通过自动化回归不代表券商终端数据和权限已验证。
 
+## 单跳命名管道自动化回归
+
+[`34_单跳命名管道测试.py`](34_单跳命名管道测试.py)加载真实 QMT 侧策略文件 `qmt_scripts/NPSH_LAB.py`，注入假内建函数与假 ContextInfo（schedule_run 10ms 泵线程），从外部 client 走完整链路。不要求启动 QMT、PipeHub 或网页，不执行真实交易。设计说明见 [`docs/单跳命名管道实验.md`](../docs/单跳命名管道实验.md)。
+
+```powershell
+python -X utf8 -m pytest "cfquant/tests/34_单跳命名管道测试.py" -q
+```
+
+覆盖查询直执行（serve 线程身份断言）、passorder 线程亲和（泵线程身份断言与位置参数映射）、超时不断线、远端异常、白名单拒绝、并发在途请求、断线重挂、单实例拒绝第二客户端、事件推送（含跨线程 overlapped 并发写）、协议垃圾容错、管道名与 hub 隔离、内嵌传输块同步校验。
+
 ## 手工脚本环境
 
 Level2 专项：[`29_Level2行情测试.py`](29_Level2行情测试.py) 是只读手工测试，修改顶部 `STOCK_CODE/PERIODS/SECONDS/TEST_THOUSAND` 后直接运行，不添加参数。覆盖六类周期的查询和订阅，记录有效/异常回调、查询样本及退订结果，报告写入 `log/level2_test_时间.json`。无回调或查询为空标记为待确认，不判成功；不包含任何交易操作。
