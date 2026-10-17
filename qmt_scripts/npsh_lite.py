@@ -7,9 +7,8 @@ process, no two-segment pipes, no rx/tx connection pair. The external
 process runs NpshClient: one full-duplex connection with a resident
 reader thread.
 
-Design notes (architecture mirrors qmt_scripts/afunix_lite.py, transport
-swapped from AF_UNIX sockets to named pipes - same framing and wire
-protocol as the afunix lab):
+Design notes (architecture mirrors the AF_UNIX experiment afunix_lite /
+IOPV_LAB, tag v0.1 - since removed; same framing and wire protocol):
   - stdlib only (ctypes / json / struct / threading); no cfquant imports
   - pure-ASCII source so the QMT terminal can safely recode it (coding:gbk)
   - compatible with the QMT embedded Python 3.6 and repo venv Python 3.12
@@ -242,7 +241,7 @@ def kernel32():
         if _kernel32 is None:
             # 1 ms sleep granularity for pump timers and deadline waits
             # (default Windows timer resolution is 15.6 ms; the lite bridge
-            # and the afunix lab do the same)
+            # and the retired afunix lab did the same)
             try:
                 ctypes.WinDLL("winmm").timeBeginPeriod(1)
             except Exception:

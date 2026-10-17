@@ -44,9 +44,8 @@ process, no two-segment pipes, no rx/tx connection pair. The external
 process runs NpshClient: one full-duplex connection with a resident
 reader thread.
 
-Design notes (architecture mirrors qmt_scripts/afunix_lite.py, transport
-swapped from AF_UNIX sockets to named pipes - same framing and wire
-protocol as the afunix lab):
+Design notes (architecture mirrors the AF_UNIX experiment afunix_lite /
+IOPV_LAB, tag v0.1 - since removed; same framing and wire protocol):
   - stdlib only (ctypes / json / struct / threading); no cfquant imports
   - pure-ASCII source so the QMT terminal can safely recode it (coding:gbk)
   - compatible with the QMT embedded Python 3.6 and repo venv Python 3.12
@@ -279,7 +278,7 @@ def kernel32():
         if _kernel32 is None:
             # 1 ms sleep granularity for pump timers and deadline waits
             # (default Windows timer resolution is 15.6 ms; the lite bridge
-            # and the afunix lab do the same)
+            # and the retired afunix lab did the same)
             try:
                 ctypes.WinDLL("winmm").timeBeginPeriod(1)
             except Exception:
@@ -1050,7 +1049,8 @@ def _nps_tune_gil():
     # Shrink the GIL switch interval (default 5 ms). After the serve thread
     # wakes from overlapped IO it must re-acquire the GIL to run the request;
     # with several 10 ms timers in this process (our pump, the LITE bridge
-    # pump, the IOPV_LAB pump) responses quantize into ~10-30 ms steps - the
+    # pump; during measurement also the since-removed IOPV_LAB pump)
+    # responses quantize into ~10-30 ms steps - the
     # same mechanism as the LITE note where a 500 ms timer quantized
     # responses to 0.5 s multiples. Measured: real-QMT query p50 drops well
     # below 30 ms with a 1 ms switch interval. Process-wide, so the LITE

@@ -16,11 +16,12 @@
                                                             # 查看当前登记状态
 
 策略名 NPSH_LAB 故意不带 CFQ_ 前缀：CFQ_* 是 cfquant 网页部署器的托管命名空间
-（会被自动改写/下线），单跳实验策略不归它管，与 IOPV_LAB 同一模式。
+（会被自动改写/下线），单跳实验策略不归它管。
 
-登记条目抄 IOPV_LAB（其次 CFQ_10110148_LITE）：catalog 条目加进 IOPV_LAB 所在
-FormulaCatalog 分组；strategyTrade item 克隆后改 name（NPSH_LAB）、id（现有最大
-id + 1，不重复）、FromulaExpandData、备注，并置 startupAutorun=1。写入前备份到
+登记条目模板用 CFQ_10110148_LITE（IOPV_LAB 已随 AF_UNIX 实验下线，仅作历史
+兜底）：catalog 条目加进 NPSH_LAB 所在 FormulaCatalog 分组；strategyTrade item
+克隆后改 name（NPSH_LAB）、id（现有最大 id + 1，不重复）、FromulaExpandData、
+备注，并置 startupAutorun=1。写入前备份到
 <qmt_root>/cfquant_managed/backups/，写回用 minidom.parseString 复验。
 
 真机部署顺序（详见 docs/single-hop-named-pipe.md）:
@@ -227,7 +228,7 @@ def register(qmt_root):
         changed = True
         print("已添加 catalog 条目: %s" % STRATEGY_NAME)
 
-    # 2) strategyTrade item（抄 IOPV_LAB / CFQ_10110148_LITE 条目）
+    # 2) strategyTrade item（模板：CFQ_10110148_LITE，IOPV_LAB 仅历史兜底）
     section, items = _strategy_items(document)
     mine = [item for item in items if item.getAttribute("name") == STRATEGY_NAME]
     if mine:
@@ -236,11 +237,11 @@ def register(qmt_root):
     else:
         template = None
         for item in items:
-            if item.getAttribute("name") in ("IOPV_LAB", "CFQ_10110148_LITE"):
+            if item.getAttribute("name") in ("CFQ_10110148_LITE", "IOPV_LAB"):
                 template = item
                 break
         if template is None:
-            raise SystemExit("未找到 IOPV_LAB / CFQ_10110148_LITE 模板条目，请人工登记")
+            raise SystemExit("未找到 CFQ_10110148_LITE 模板条目，请人工登记")
         item = template.cloneNode(deep=True)
         ids = [int(node.getAttribute("id")) for node in items if node.getAttribute("id").isdigit()]
         item.setAttribute("id", str(max(ids or [0]) + 1))
