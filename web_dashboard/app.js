@@ -135,6 +135,7 @@ const state = {
   bindingQmtProcessResolver: null,
   bindingQmtProcessPromptResults: [],
   bindingQmtRestartTargets: [],
+  bindingQmtUpdateNoticeShown: null,
   updateQmtRestartTargets: [],
 };
 
@@ -1345,6 +1346,11 @@ function bindingQmtAutoLoginStatusHtml(autoLogin) {
     <strong>运行状态</strong>
     <span><b>${esc(label)}</b>${autoLogin.message ? ` <small>${esc(autoLogin.message)}</small>` : ''}</span>
   </div>`);
+  if (autoLogin.update_skipped && autoLogin.update_message) {
+    rows.push(`<div class="binding-qmt-status-row is-warn">
+      <strong>QMT 更新</strong><span>${esc(autoLogin.update_message)}</span>
+    </div>`);
+  }
   const binDir = autoLogin.bin_dir || autoLogin.qmt_dir || '';
   if (binDir) {
     rows.push(`<div class="binding-qmt-status-row is-info">
@@ -3431,6 +3437,36 @@ function renderProjectVersion(info) {
       <button type="button" data-version-action="open-update">更新设置</button>
     </div>
     <div class="version-action-status">${esc(projectUpdateBusy() ? '正在更新完整版本并同步已绑定 QMT 目录...' : '更新完成后，请完全退出并重启 QMT 加载新版本。')}</div>`;
+  renderQmtLatestStatus();
+}
+
+function renderQmtLatestStatus() {
+  const node = $('qmtLatestStatus');
+  if (!node) return;
+  const data = state.versionInfo || {};
+  const comparison = data.qmt_version_comparison
+    || data.qmt_runtime_comparison
+    || data.qmt_saved_comparison
+    || '';
+  if (!comparison) {
+    node.classList.add('hidden');
+    node.classList.remove('online', 'offline');
+    node.title = '';
+    node.removeAttribute('data-tooltip');
+    node.removeAttribute('tabindex');
+    return;
+  }
+  const latest = comparison === 'same';
+  node.classList.remove('hidden');
+  node.classList.toggle('online', latest);
+  node.classList.toggle('offline', !latest);
+  const detail = latest
+    ? 'QMT 核心已是最新版本'
+    : (comparison === 'unknown' ? 'QMT 核心版本未确认最新（尚未检查到远端版本）' : 'QMT 核心有更新可用，请及时更新');
+  node.title = detail;
+  node.setAttribute('data-tooltip', detail);
+  node.setAttribute('tabindex', '0');
+  node.setAttribute('aria-label', `QMT最新：${latest ? '是' : '否'}，${detail}`);
 }
 
 function setSystemInfoText(id, value) {
@@ -6703,6 +6739,10 @@ async function restartUpdatedQmtProcesses() {
     setQmtUpdateProgressStep('restart', failed.length
       ? `QMT 自动启动未完成：${failed.map((item) => item.qmt_dir).join('、')}`
       : `已确认 ${targets.length} 个绑定 QMT 启动`, 99);
+    const updateNotices = qmtRestartUpdateNotices(data);
+    if (updateNotices.length) {
+      setBindingNotice(updateNotices.join('；'), 'warn', { autoHide: false });
+    }
     return data;
   } catch (error) {
     setQmtUpdateProgressStep('restart', `QMT 自动启动失败：${error.message}`, 97);
@@ -9762,19 +9802,27 @@ async function stopBindingQmtProcessesAndContinue() {
 async function restartBindingQmtProcessesAfterSave() {
   const targets = state.bindingQmtRestartTargets || [];
   state.bindingQmtRestartTargets = [];
-  if (!targets.length) return null;
+  if (!targets.length) return [];
   try {
     const data = await api('/api/qmt/processes/start', {
       method: 'POST',
       body: JSON.stringify({ targets }),
     });
     log('QMT 已自动重启', { targets: data.targets || [] });
-    return data;
+    return qmtRestartUpdateNotices(data);
   } catch (error) {
     setBindingNotice(`绑定已保存，但 QMT 自动重启失败：${error.message}`, 'warn', { autoHide: false });
     log('QMT 自动重启失败', { error: error.message });
-    return null;
+    return [];
   }
+}
+
+function qmtRestartUpdateNotices(data) {
+  // A target whose update check was force-skipped (XtUpdate.exe blocked the
+  // auto-login flow) carries the notice to surface on the web page.
+  return (data && data.targets || []).map((item) => (
+    item && item.update_skipped ? String(item.update_message || '').trim() : ''
+  )).filter(Boolean);
 }
 
 async function recheckBindingQmtProcesses() {
@@ -9931,7 +9979,7 @@ async function submitBindingForm(event) {
       log('绑定状态刷新失败', { error: error.message });
     }
     closeBindingDialog();
-    await restartBindingQmtProcessesAfterSave();
+    const updateNotices = await restartBindingQmtProcessesAfterSave();
     const deployIssue = qmtCoreDeployHasIssues(data.qmt_core_deploy);
     const noticeLevel = refreshError || deployIssue || data.legacy_fallback || bindingMarketRouteHasMissingDir(marketRoutingEnabled, marketBridges) ? 'warn' : 'success';
     const noticeMessage = bindingSaveSummary({
@@ -9950,7 +9998,14 @@ async function submitBindingForm(event) {
       qmtCoreDeploy: data.qmt_core_deploy,
       qmtStrategyDeploy: data.qmt_strategy_deploy,
     });
-    setBindingNotice(refreshError ? `${noticeMessage}，连接状态刷新失败：${refreshError.message}` : noticeMessage, noticeLevel);
+    const pendingUpdateNotice = updateNotices.length
+      ? `${noticeMessage}；${updateNotices.join('；')}`
+      : noticeMessage;
+    setBindingNotice(
+      refreshError ? `${pendingUpdateNotice}，连接状态刷新失败：${refreshError.message}` : pendingUpdateNotice,
+      updateNotices.length ? 'warn' : noticeLevel,
+      updateNotices.length ? { autoHide: false } : undefined
+    );
     renderBindingDeployStatus([data.qmt_core_deploy, data.qmt_strategy_deploy]);
     log('账号配置已保存', { account_id: accountId, display_name: displayName, account_type: accountType, mode, data_provider: dataProvider, qmt_dir_configured: !!qmtDir });
     showBindingQmtGuide({
@@ -10069,6 +10124,20 @@ async function savePythonEnvironmentFromUi(event) {
   }
 }
 
+function surfacePendingQmtUpdateNotice(rows) {
+  // The background update guard kills a late-appearing XtUpdate.exe and the
+  // next binding-status poll sees the event; pop the persistent notice once
+  // per skipped update so the user knows QMT needs a manual update.
+  const pending = (rows || []).find((row) => (
+    row.autoLogin && row.autoLogin.update_skipped && row.autoLogin.update_message
+  ));
+  if (!pending) return;
+  const key = `${String(pending.item.accountKey || '').trim()}:${pending.autoLogin.update_message}`;
+  if (state.bindingQmtUpdateNoticeShown === key) return;
+  state.bindingQmtUpdateNoticeShown = key;
+  setBindingNotice(String(pending.autoLogin.update_message), 'warn', { autoHide: false });
+}
+
 async function refreshBindingStatuses() {
   const entries = bindingEntriesFromState();
   if (!entries.length) {
@@ -10110,9 +10179,10 @@ async function refreshBindingStatuses() {
     if (snapshot.error) return { item, error: snapshot.error };
     if (!row) return { item, error: new Error('绑定状态未返回') };
     if (row.error) return { item, error: new Error(row.error) };
-    return { item, status: row.status || null };
+    return { item, status: row.status || null, autoLogin: row.qmt_auto_login || null };
   });
   renderBindingRows(rows);
+  surfacePendingQmtUpdateNotice(rows);
   const monitorWarmingUp = rows.some(({ status }) => {
     const selected = status && status.status ? status.status : status;
     return !!(selected && selected.monitor && selected.monitor.ready === false);

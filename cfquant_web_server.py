@@ -540,6 +540,20 @@ QMT_AUTO_LOGIN_CAPTURE_SCRIPT_NAME = os.environ.get(
     "cfquant_capture_linkMini.bat",
 )
 QMT_AUTO_LOGIN_RESTART_ARG = os.environ.get("CFQUANT_QMT_AUTO_LOGIN_RESTART_ARG", "linkMini")
+QMT_AUTO_LOGIN_UPDATE_PROCESS_NAMES = tuple(
+    item.strip().lower()
+    for item in os.environ.get("CFQUANT_QMT_AUTO_LOGIN_UPDATE_PROCESSES", "XtUpdate.exe").split(",")
+    if item.strip()
+)
+QMT_AUTO_LOGIN_UPDATE_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("CFQUANT_QMT_AUTO_LOGIN_UPDATE_DELAY_SECONDS", "20"))
+)
+QMT_AUTO_LOGIN_UPDATE_POLL_SECONDS = max(
+    0.05, float(os.environ.get("CFQUANT_QMT_AUTO_LOGIN_UPDATE_POLL_SECONDS", "0.5"))
+)
+QMT_AUTO_LOGIN_UPDATE_GUARD_SECONDS = max(
+    0.0, float(os.environ.get("CFQUANT_QMT_AUTO_LOGIN_UPDATE_GUARD_SECONDS", "300"))
+)
 ACCOUNT_CACHE_REFRESH_SECONDS = max(1.0, float(os.environ.get("CFQUANT_WEB_ACCOUNT_CACHE_INTERVAL", "30")))
 ACCOUNT_CACHE_IDLE_SECONDS = max(1.0, float(os.environ.get("CFQUANT_WEB_ACCOUNT_CACHE_IDLE_SECONDS", "90")))
 ACCOUNT_CACHE_EVENT_REFRESH_SECONDS = 2.0
@@ -5257,11 +5271,28 @@ def account_route_status(account_id, bridge_id=None, account_type=None, account_
     }
 
 
+def _qmt_auto_login_snapshot_event(qmt_dir):
+    """Return the pending update-skipped event for a configured QMT directory."""
+    try:
+        paths = _qmt_auto_login_paths(qmt_dir)
+        key = os.path.normcase(os.path.abspath(paths["bin_dir"]))
+    except Exception:
+        return {}
+    with QMT_UPDATE_GUARDS_LOCK:
+        event = QMT_UPDATE_EVENTS.get(key) or {}
+    return {
+        "update_skipped": bool(event.get("update_skipped")),
+        "update_message": event.get("update_message") or "",
+        "update_check": event.get("update_check") or {},
+    }
+
+
 def binding_status_snapshot():
     configs = WEB_CONFIG.account_configs() if WEB_CONFIG is not None else {}
     pairs = WEB_CONFIG.account_pairs() if WEB_CONFIG is not None else {}
     entries = []
     known_keys = set()
+    qmt_dirs = {}
 
     def append_entry(account_key, account_id, account_type, bridge_id, enabled=True):
         account_key = str(account_key or "").strip()
@@ -5288,7 +5319,9 @@ def binding_status_snapshot():
         account_id = str(config.get("account_id") or raw_key or "").strip()
         account_type = normalize_account_type(config.get("account_type") or "STOCK")
         bridge_id = str(config.get("bridge_id") or DEFAULT_BRIDGE_ID).strip()
-        append_entry(config.get("account_key") or raw_key, account_id, account_type, bridge_id, account_config_is_enabled(config))
+        account_key = str(config.get("account_key") or raw_key or "").strip()
+        qmt_dirs[account_key] = config.get("qmt_dir") or config.get("python_dir")
+        append_entry(account_key, account_id, account_type, bridge_id, account_config_is_enabled(config))
 
     for raw_key, pair in pairs.items():
         if isinstance(pair, dict):
@@ -5316,6 +5349,7 @@ def binding_status_snapshot():
         except Exception as error:
             rows.append(dict(entry, error=str(error)))
         rows[-1]["qmt_strategy_deploy"] = QMT_STRATEGIES.status(entry["account_key"])
+        rows[-1]["qmt_auto_login"] = _qmt_auto_login_snapshot_event(qmt_dirs.get(entry["account_key"]) or "")
     now = time.time()
     return {
         "bindings": rows,
@@ -10504,6 +10538,9 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
 
 
 QMT_AUTO_LOGIN_LOCK = threading.RLock()
+QMT_UPDATE_GUARDS_LOCK = threading.RLock()
+QMT_UPDATE_GUARDS = {}
+QMT_UPDATE_EVENTS = {}
 
 
 def qmt_auto_login_supported_for_row(row):
@@ -10703,6 +10740,56 @@ $target = %s
     return run_powershell_json(script, timeout=3.0)
 
 
+def _qmt_auto_login_update_processes():
+    """Return resident QMT update-check processes (``XtUpdate.exe``).
+
+    QMT launches ``XtUpdate.exe`` when it triggers an update check; while the
+    process stays resident the automatic login flow is blocked by the update
+    dialog. The restart flow watches it right after launch and force-closes it
+    when it outlives the grace window, so a pending update cannot stall login.
+    Matching is by process name only: the updater may be spawned from the QMT
+    directory or from a temporary extraction location, and any resident copy
+    can block a login window.
+    """
+    names = set(QMT_AUTO_LOGIN_UPDATE_PROCESS_NAMES)
+    rows = []
+    if psutil is not None:
+        for process in psutil.process_iter(["pid", "name"]):
+            try:
+                name = str(process.info.get("name") or "").strip().lower()
+                if not name or name not in names:
+                    continue
+                exe = ""
+                try:
+                    exe = process.exe() or ""
+                except Exception:
+                    exe = ""
+                rows.append({
+                    "pid": int(process.info.get("pid") or process.pid),
+                    "name": process.info.get("name") or "XtUpdate.exe",
+                    "executable_path": exe,
+                })
+            except (
+                getattr(psutil, "NoSuchProcess", Exception),
+                getattr(psutil, "AccessDenied", Exception),
+                getattr(psutil, "ZombieProcess", Exception),
+            ):
+                continue
+            except Exception:
+                continue
+    if rows:
+        return rows
+    script = r"""
+$names = @(%s)
+@(Get-CimInstance Win32_Process | ForEach-Object {
+  if ($names -contains $_.Name) {
+    [pscustomobject]@{ pid=$_.ProcessId; name=$_.Name; executable_path=$_.ExecutablePath }
+  }
+}) | ConvertTo-Json -Compress
+""" % ",".join(json.dumps(name) for name in names)
+    return run_powershell_json(script, timeout=3.0)
+
+
 def qmt_process_snapshot(qmt_dir):
     """Return QMT processes whose executable belongs to the configured directory."""
     configured = normalize_optional_path(qmt_dir)
@@ -10871,9 +10958,15 @@ def start_qmt_processes_for_request(body):
         paths = _qmt_auto_login_paths(configured)
         before = qmt_process_snapshot(configured)
         launch = {"started": False, "reason": "target QMT is already running"}
+        update_guard = {}
         if not before.get("running"):
             launch = _qmt_auto_login_start_xtitclient(paths, use_link=False)
             time.sleep(0.5)
+            # A resident XtUpdate.exe blocks automatic login. Normal launches
+            # also spawn it briefly and it exits on its own, so the background
+            # guard leaves it alone for the first delay seconds and only
+            # force-closes it when it still lingers.
+            update_guard = _qmt_auto_login_start_update_guard(paths["bin_dir"])
         after = qmt_process_snapshot(configured)
         results.append({
             "qmt_dir": configured,
@@ -10883,6 +10976,10 @@ def start_qmt_processes_for_request(body):
             "launch": launch,
             "after": after,
             "started": bool((launch or {}).get("pid")) or bool(after.get("running")),
+            "update_check": {},
+            "update_skipped": False,
+            "update_message": "",
+            "update_guard": update_guard,
         })
     return {"targets": results}
 
@@ -11017,6 +11114,120 @@ def _qmt_auto_login_wait_processes_exit(bin_dir, timeout=30.0, interval=0.5):
         if not remaining or time.monotonic() >= deadline:
             return remaining
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+
+def _qmt_auto_login_guard_update(bin_dir, row=None, delay=None, wait=None):
+    """Background guard for a launched QMT: kill XtUpdate.exe only if it lingers.
+
+    Every normal QMT launch briefly spawns ``XtUpdate.exe`` which exits on its
+    own, so the guard does not touch it for the first ``delay`` seconds (20s by
+    default). From that point on it keeps checking for a bounded window: if
+    ``XtUpdate.exe`` is still resident, the update dialog is blocking the
+    automatic login, so it is force-closed (including respawns) and the event
+    is recorded for the web page to prompt a manual QMT update.
+    """
+    delay = QMT_AUTO_LOGIN_UPDATE_DELAY_SECONDS if delay is None else max(0.0, float(delay))
+    wait = QMT_AUTO_LOGIN_UPDATE_GUARD_SECONDS if wait is None else max(0.0, float(wait))
+    start = time.monotonic()
+    delay_deadline = start + delay
+    deadline = start + wait
+    # First delay seconds: leave the normal quick update check alone.
+    while True:
+        now = time.monotonic()
+        if now >= delay_deadline:
+            break
+        time.sleep(min(QMT_AUTO_LOGIN_UPDATE_POLL_SECONDS, max(0.0, delay_deadline - now)))
+    last_message = ""
+    while time.monotonic() < deadline:
+        present = _qmt_auto_login_update_processes()
+        if present:
+            event = _qmt_auto_login_kill_update_processes(present)
+            if event["killed"] and event["message"] != last_message:
+                last_message = event["message"]
+                _qmt_auto_login_record_update_event(bin_dir, row, event)
+        elif last_message:
+            last_message = ""
+        time.sleep(QMT_AUTO_LOGIN_UPDATE_POLL_SECONDS)
+
+
+def _qmt_auto_login_kill_update_processes(rows):
+    """Force-close resident XtUpdate.exe processes and return the kill event."""
+    pids = []
+    for row in rows:
+        try:
+            pid = int(row.get("pid") or 0)
+        except Exception:
+            pid = 0
+        if pid > 0 and pid not in pids:
+            pids.append(pid)
+    results = []
+    for pid in pids:
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"] if os.name == "nt" else ["kill", "-TERM", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8.0,
+            **(_hidden_subprocess_kwargs() if os.name == "nt" else {})
+        )
+        results.append({
+            "pid": pid,
+            "returncode": completed.returncode,
+            "stdout": (completed.stdout or "").strip(),
+            "stderr": (completed.stderr or "").strip(),
+        })
+    return {
+        "detected": True,
+        "auto_exited": False,
+        "killed": bool(pids),
+        "pids": pids,
+        "results": results,
+        "message": (
+            "检测到 QMT 更新进程 XtUpdate.exe 阻塞自动登录，已强制结束；"
+            "为保证流程不阻塞，本次更新已跳过，请及时手动更新 QMT"
+        ),
+    }
+
+
+def _qmt_auto_login_record_update_event(bin_dir, row, event):
+    key = os.path.normcase(os.path.abspath(bin_dir))
+    with QMT_UPDATE_GUARDS_LOCK:
+        QMT_UPDATE_EVENTS[key] = {
+            "update_skipped": bool(event.get("killed")),
+            "update_message": event.get("message") or "",
+            "update_check": {
+                name: event.get(name) for name in ("detected", "auto_exited", "killed", "pids", "message")
+            },
+            "updated_at": time.time(),
+        }
+    if isinstance(row, dict):
+        try:
+            _qmt_auto_login_update_session(row, {
+                "update_check": QMT_UPDATE_EVENTS[key]["update_check"],
+                "update_skipped": bool(event.get("killed")),
+                "update_message": event.get("message") or "",
+            })
+        except Exception:
+            pass
+
+
+def _qmt_auto_login_start_update_guard(bin_dir, row=None):
+    key = os.path.normcase(os.path.abspath(bin_dir))
+    with QMT_UPDATE_GUARDS_LOCK:
+        existing = QMT_UPDATE_GUARDS.get(key)
+        if existing and existing.is_alive():
+            return {"started": False, "reason": "already watching", "key": key}
+        thread = threading.Thread(
+            target=_qmt_auto_login_guard_update,
+            args=(bin_dir, row),
+            name="qmt-update-guard-%s" % os.path.basename(key),
+            daemon=True,
+        )
+        QMT_UPDATE_GUARDS[key] = thread
+        thread.start()
+        return {"started": True, "key": key}
 
 
 def _qmt_auto_login_copy_current_link(paths):
@@ -11267,9 +11478,15 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
                 remaining = _qmt_auto_login_processes(paths["bin_dir"])
             running = remaining
             launch = None
+            update_guard = {}
             if not running:
                 launch = _qmt_auto_login_start_xtitclient(paths, use_link=False)
                 running = _qmt_auto_login_processes(paths["bin_dir"])
+                # A resident XtUpdate.exe blocks automatic login. Normal
+                # launches also spawn it briefly and it exits on its own, so
+                # the background guard leaves it alone for the first delay
+                # seconds and only force-closes it when it still lingers.
+                update_guard = _qmt_auto_login_start_update_guard(paths["bin_dir"], row)
             pid = _qmt_auto_login_first_pid(running, launch)
             started = bool(launch)
             result.update({
@@ -11284,6 +11501,10 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
                 "processes": running,
                 "launch": launch or {},
                 "stop": stop,
+                "update_check": {},
+                "update_skipped": False,
+                "update_message": "",
+                "update_guard": update_guard,
             })
             if restart:
                 result["message"] = (
@@ -11312,6 +11533,10 @@ def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="s
                 "restart_times": list(settings["restart_times"]),
                 "last_reason": reason,
                 "last_stop": stop,
+                "update_check": {},
+                "update_skipped": False,
+                "update_message": "",
+                "update_guard": update_guard,
                 "message": result["message"],
                 "error": "",
             })

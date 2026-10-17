@@ -433,8 +433,10 @@ def test_scheduled_restart_waits_for_exit_then_relaunches(web_config, monkeypatc
                         lambda paths, use_link=False: events.append("launch") or {"pid": 4321, "bin_dir": paths["bin_dir"]})
     monkeypatch.setattr(web, "_qmt_auto_login_processes",
                         lambda path: [] if "launch" in events else [{"pid": 1, "name": "XtItClient.exe"}])
+    monkeypatch.setattr(web, "_qmt_auto_login_start_update_guard",
+                        lambda bin_dir, row=None: events.append("guard") or {"started": True, "key": bin_dir})
     result = web.qmt_auto_login_restart_for_account(row, reason="scheduled:08:00")
-    assert events == ["stop", "wait", "launch"]
+    assert events == ["stop", "wait", "launch", "guard"]
     assert result["restarted"] is True
     assert result["restart_pid"] == 4321
 
@@ -478,3 +480,195 @@ def test_qmt_process_snapshot_request_uses_saved_row_when_body_has_only_account_
         row={"qmt_dir": str(tmp_path / "QMT")},
     )
     assert captured == [web.normalize_optional_path(str(tmp_path / "QMT"))]
+
+
+def test_update_processes_matches_xtupdate_by_name(web_config, monkeypatch):
+    web, _ = web_config
+    class FakeProcess:
+        def __init__(self, pid, name, exe):
+            self.info = {"pid": pid, "name": name}
+            self._exe = exe
+
+        def exe(self):
+            return self._exe
+
+    processes = [
+        FakeProcess(1, "XtItClient.exe", r"C:\QMT\bin.x64\XtItClient.exe"),
+        FakeProcess(2, "XtUpdate.exe", r"C:\QMT\bin.x64\XtUpdate.exe"),
+        FakeProcess(3, "XtUpdate.exe", ""),
+        FakeProcess(4, "explorer.exe", r"C:\Windows\explorer.exe"),
+    ]
+    monkeypatch.setattr(web.psutil, "process_iter", lambda *args, **kwargs: iter(processes))
+    rows = web._qmt_auto_login_update_processes()
+    assert [row["pid"] for row in rows] == [2, 3]
+
+
+def test_update_kill_helper_force_closes_resident_updater(web_config, monkeypatch):
+    web, _ = web_config
+    killed = []
+    def fake_run(command, **kwargs):
+        killed.append(command)
+        return web.subprocess.CompletedProcess(args=command, returncode=0, stdout="SUCCESS", stderr="")
+    monkeypatch.setattr(web.subprocess, "run", fake_run)
+    event = web._qmt_auto_login_kill_update_processes([{"pid": 7788, "name": "XtUpdate.exe"}])
+    assert event["killed"] is True
+    assert event["pids"] == [7788]
+    assert "跳过" in event["message"] and "更新" in event["message"]
+    assert killed == [["taskkill", "/PID", "7788", "/T", "/F"]]
+
+
+def test_update_guard_does_not_touch_updater_before_delay(web_config, monkeypatch):
+    web, _ = web_config
+    # Every normal launch briefly spawns XtUpdate.exe and it exits on its own:
+    # the guard must not scan or kill anything during the delay window.
+    calls = {"n": 0}
+    def fake_update_processes():
+        calls["n"] += 1
+        return []
+    monkeypatch.setattr(web, "_qmt_auto_login_update_processes", fake_update_processes)
+    monkeypatch.setattr(web.subprocess, "run",
+                        lambda command, **kwargs: pytest.fail("must not kill before delay window"))
+    monkeypatch.setattr(web, "_qmt_auto_login_record_update_event",
+                        lambda *a, **k: pytest.fail("must not record event before delay window"))
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(web.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+    web._qmt_auto_login_guard_update(r"C:\QMT\bin.x64", {}, delay=2.0, wait=6.0)
+    # No scan happens during the delay window; judging starts only after it.
+    assert calls["n"] > 0
+
+
+def test_update_guard_kills_updater_still_resident_after_delay(web_config, monkeypatch):
+    web, _ = web_config
+    snapshots = [[], [{"pid": 7799, "name": "XtUpdate.exe"}], [], []]
+    calls = {"n": 0}
+    def fake_update_processes():
+        index = min(calls["n"], len(snapshots) - 1)
+        calls["n"] += 1
+        return snapshots[index]
+    monkeypatch.setattr(web, "_qmt_auto_login_update_processes", fake_update_processes)
+    killed = []
+    monkeypatch.setattr(web, "_qmt_auto_login_kill_update_processes", lambda rows: (
+        killed.append(rows)
+        or {"detected": True, "auto_exited": False, "killed": True, "pids": [7799],
+            "results": [], "message": "检测到 QMT 更新进程 XtUpdate.exe 阻塞自动登录，已强制结束；为保证流程不阻塞，本次更新已跳过，请及时手动更新 QMT"}
+    ))
+    recorded = []
+    monkeypatch.setattr(web, "_qmt_auto_login_record_update_event",
+                        lambda bin_dir, row, event: recorded.append(event))
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(web.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+    web._qmt_auto_login_guard_update(r"C:\QMT\bin.x64", {}, delay=2.0, wait=6.0)
+    assert len(killed) >= 1
+    assert recorded and recorded[0]["killed"] is True
+    assert recorded[0]["pids"] == [7799]
+
+
+def test_apply_for_account_starts_update_guard_and_records_event(web_config, monkeypatch, tmp_path):
+    web, config = web_config
+    qmt_bin = tmp_path / "QMT" / "bin.x64"
+    qmt_bin.mkdir(parents=True)
+    (qmt_bin / "XtItClient.exe").write_bytes(b"")
+    row = config.save_account_config(
+        "8885060548",
+        qmt_dir=str(qmt_bin.parent),
+        qmt_auto_login={"enabled": True, "restart_times": ["08:00"]},
+    )
+    monkeypatch.setattr(web, "_qmt_auto_login_stop_xtitclient",
+                        lambda row, paths, session=None: {"requested_pids": [1]})
+    monkeypatch.setattr(web, "_qmt_auto_login_wait_processes_exit", lambda bin_dir, **kwargs: [])
+    monkeypatch.setattr(web, "_qmt_auto_login_start_xtitclient",
+                        lambda paths, use_link=False: {"pid": 4321, "bin_dir": paths["bin_dir"]})
+    monkeypatch.setattr(web, "_qmt_auto_login_processes",
+                        lambda path: [{"pid": 4321, "name": "XtItClient.exe"}])
+    monkeypatch.setattr(web, "_qmt_auto_login_start_update_guard",
+                        lambda bin_dir, row=None: {"started": True, "key": bin_dir})
+    monkeypatch.setattr(web, "QMT_UPDATE_EVENTS", {})
+    result = web.qmt_auto_login_restart_for_account(row, reason="manual")
+    assert result["restarted"] is True
+    assert result["update_guard"]["started"] is True
+    # The launch response is async now: the skipped-update event arrives from
+    # the background guard through the recorded event/session path.
+    event = {
+        "detected": True, "auto_exited": False, "killed": True, "pids": [7788],
+        "results": [{"pid": 7788, "returncode": 0}],
+        "message": "检测到 QMT 更新进程 XtUpdate.exe 阻塞自动登录，已强制结束；为保证流程不阻塞，本次更新已跳过，请及时手动更新 QMT",
+    }
+    web._qmt_auto_login_record_update_event(str(qmt_bin), row, event)
+    session = web._qmt_auto_login_saved_session(row)
+    assert session.get("update_skipped") is True
+    assert "跳过" in (session.get("update_message") or "")
+
+
+def test_start_qmt_processes_for_request_reports_update_notice(web_config, monkeypatch, tmp_path):
+    web, _ = web_config
+    qmt_bin = tmp_path / "QMT" / "bin.x64"
+    qmt_bin.mkdir(parents=True)
+    (qmt_bin / "XtItClient.exe").write_bytes(b"")
+    monkeypatch.setattr(web, "_qmt_auto_login_start_xtitclient",
+                        lambda paths, use_link=False: {"pid": 4321, "bin_dir": paths["bin_dir"]})
+    monkeypatch.setattr(web, "qmt_process_snapshot", lambda path: {
+        "qmt_dir": str(qmt_bin.parent), "running": False, "pids": [], "processes": [],
+    })
+    monkeypatch.setattr(web, "_qmt_auto_login_start_update_guard",
+                        lambda bin_dir, row=None: {"started": True, "key": bin_dir})
+    data = web.start_qmt_processes_for_request({"targets": [{"qmt_dir": str(qmt_bin.parent)}]})
+    target = data["targets"][0]
+    assert target["update_guard"]["started"] is True
+    # The skip decision is async (background guard); the start response does
+    # not carry it yet.
+    assert target["update_skipped"] is False
+
+
+def test_start_update_guard_starts_once_and_dedups(web_config, monkeypatch):
+    web, _ = web_config
+    bin_dir = r"C:\QMT\bin.x64"
+    started = []
+    class FakeThread:
+        alive = False
+        def __init__(self, target, args, name=None, daemon=False):
+            self._target = target
+            self._args = args
+
+        def is_alive(self):
+            return FakeThread.alive
+
+        def start(self):
+            FakeThread.alive = True
+            started.append(1)
+
+    monkeypatch.setattr(web.threading, "Thread", FakeThread)
+    first = web._qmt_auto_login_start_update_guard(bin_dir)
+    assert first["started"] is True
+    second = web._qmt_auto_login_start_update_guard(bin_dir)
+    assert second["started"] is False
+    assert second["reason"] == "already watching"
+    assert len(started) == 1
+
+
+def test_binding_status_snapshot_surfaces_update_skipped_event(web_config, monkeypatch, tmp_path):
+    web, config = web_config
+    qmt_bin = tmp_path / "QMT" / "bin.x64"
+    qmt_bin.mkdir(parents=True)
+    (qmt_bin / "XtItClient.exe").write_bytes(b"")
+    config._data["account_configs"] = {
+        "one": {
+            "account_id": "1001",
+            "account_type": "STOCK",
+            "enabled": True,
+            "qmt_dir": str(qmt_bin.parent),
+        },
+    }
+    monkeypatch.setattr(web, "account_route_status", lambda *args, **kwargs: {"monitor": {"ready": True}})
+    monkeypatch.setattr(web, "QMT_UPDATE_EVENTS", {
+        os.path.normcase(os.path.abspath(str(qmt_bin))): {
+            "update_skipped": True,
+            "update_message": "检测到 QMT 更新进程 XtUpdate.exe 阻塞自动登录，已强制结束；为保证流程不阻塞，本次更新已跳过，请及时手动更新 QMT",
+            "update_check": {"detected": True, "auto_exited": False, "killed": True, "pids": [7799], "message": "skip"},
+        },
+    })
+    snapshot = web.binding_status_snapshot()
+    row = snapshot["bindings"][0]
+    assert row["qmt_auto_login"]["update_skipped"] is True
+    assert "跳过" in row["qmt_auto_login"]["update_message"]

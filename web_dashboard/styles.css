@@ -2128,6 +2128,10 @@ h2 {
   background: #8792a0;
 }
 
+.status-pill.hidden {
+  display: none;
+}
+
 .topbar-logout {
   height: 32px;
   border-color: rgba(255, 255, 255, 0.28);
