@@ -9,6 +9,9 @@
     python tools/deploy_npsh_lab.py --build --qmt-root PATH # 生成 <qmt_root>/formulas/NPSH_LAB.rzrk
     python tools/deploy_npsh_lab.py --register --qmt-root PATH
                                                             # 登记 indexUserConfig.xml（QMT 必须已停止）
+    python tools/deploy_npsh_lab.py --redeploy --qmt-root PATH
+                                                            # 更新已导入策略：重建 rzrk + 清 catalog/py，
+                                                            # 下次启动 QMT 重新导入（QMT 必须已停止）
     python tools/deploy_npsh_lab.py --status --qmt-root PATH
                                                             # 查看当前登记状态
 
@@ -153,6 +156,48 @@ def _strategy_items(document):
     return section, list(section.getElementsByTagName("item"))
 
 
+def _remove_catalog_entry(document, name):
+    changed = False
+    for group in document.getElementsByTagName("FormulaCatalog"):
+        for entry in list(group.getElementsByTagName("catalog")):
+            if entry.getAttribute("name") == name:
+                parent = entry.parentNode
+                if parent is not None:
+                    parent.removeChild(entry)
+                    changed = True
+    return changed
+
+
+def redeploy(qmt_root):
+    """更新已导入的策略：重建 rzrk、删除 python/ 文件与 catalog 条目，
+    下次启动 QMT 时重新 importFormula。要求 QMT 已停止。"""
+    from cfquant.qmt_strategy_deploy import qmt_is_running, qmt_root as normalize_root
+
+    root = normalize_root(qmt_root, validate=True)
+    if qmt_is_running(root):
+        raise SystemExit("QMT 正在运行（XtItClient.exe），停止后再 redeploy")
+
+    build_rzrk(str(root))
+    py = root / "python" / (STRATEGY_NAME + ".py")
+    if py.exists():
+        py.unlink()
+        print("已删除 %s（触发重导入）" % py)
+
+    config = root / "config" / "indexUserConfig.xml"
+    document, original = _read_document(config)
+    if _remove_catalog_entry(document, STRATEGY_NAME):
+        backup = root / "cfquant_managed" / "backups" / ("npsh_lab_%s.xml" % uuid.uuid4().hex[:12])
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(original)
+        updated = document.toxml(encoding="utf-8")
+        minidom.parseString(updated)
+        _atomic_write(config, updated)
+        print("已移除 catalog 条目（备份: %s），strategyTrade item 保留待重导后生效" % backup)
+    else:
+        print("catalog 条目不存在（首次部署无需移除）")
+    print("下次启动 QMT 时将重新导入 %s.rzrk 并按 startupAutorun 自启" % STRATEGY_NAME)
+
+
 def register(qmt_root):
     from cfquant.qmt_strategy_deploy import qmt_is_running, qmt_root as normalize_root
 
@@ -270,12 +315,13 @@ def main(argv=None):
     parser.add_argument("--sync", action="store_true", help="重新拼接内嵌传输块")
     parser.add_argument("--build", action="store_true", help="生成 .rzrk 包")
     parser.add_argument("--register", action="store_true", help="登记 indexUserConfig.xml")
+    parser.add_argument("--redeploy", action="store_true", help="更新已导入策略（重建 rzrk + 触发重导入，QMT 须停止）")
     parser.add_argument("--status", action="store_true", help="查看登记状态")
     parser.add_argument("--qmt-root", default=None, help="QMT 安装根目录")
     parser.add_argument("--out", default=None, help="--build 的输出路径（默认 qmt_root/formulas）")
     args = parser.parse_args(argv)
 
-    if not (args.check or args.sync or args.build or args.register or args.status):
+    if not (args.check or args.sync or args.build or args.register or args.redeploy or args.status):
         parser.print_help()
         return 0
 
@@ -292,6 +338,8 @@ def main(argv=None):
         return 0
     if not args.qmt_root:
         parser.error("需要 --qmt-root")
+    if args.redeploy:
+        redeploy(args.qmt_root)
     if args.register:
         register(args.qmt_root)
     if args.status:

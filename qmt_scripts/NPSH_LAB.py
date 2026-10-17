@@ -1046,9 +1046,25 @@ def _nps_handler(action, args, kwargs):
     return func(*args, **kwargs)
 
 
+def _nps_tune_gil():
+    # Shrink the GIL switch interval (default 5 ms). After the serve thread
+    # wakes from overlapped IO it must re-acquire the GIL to run the request;
+    # with several 10 ms timers in this process (our pump, the LITE bridge
+    # pump, the IOPV_LAB pump) responses quantize into ~10-30 ms steps - the
+    # same mechanism as the LITE note where a 500 ms timer quantized
+    # responses to 0.5 s multiples. Measured: real-QMT query p50 drops well
+    # below 30 ms with a 1 ms switch interval. Process-wide, so the LITE
+    # bridge benefits too.
+    try:
+        sys.setswitchinterval(0.001)
+    except Exception:
+        pass
+
+
 def init(ContextInfo):
     global _nps_server, _nps_context, _nps_main_queue
 
+    _nps_tune_gil()
     _nps_context = ContextInfo
     if _nps_main_queue is None:
         _nps_main_queue = queue.Queue(maxsize=10000)
