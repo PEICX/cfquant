@@ -33,6 +33,7 @@ test_dir/
 *.tmp
 *.bak
 .tmp_*.py
+*.sock
 
 cfquant_web_config.db
 cfquant_web_config.json
